@@ -1,3 +1,26 @@
+Summary of Accomplishments
+sdkconfig.defaults Optimization: Fixed configuration typos (CONFIG_ESP_DL_MULTICORE), tuned 200MHz PSRAM and 128KB L2 Cache settings, enabled target-specific P4 Ethernet flags, and decoupled partition table handling to .cargo/config.toml.
+
+ESP32-P4 Ethernet Pin Routing & Pinout Fix:
+
+Resolved hardware IOMUX constraint errors on the ESP32-P4 silicon.
+
+Correctly routed the 50MHz RMII Reference Clock to the dedicated clock input pad (GPIO 50).
+
+Wired SMI MDC (GPIO 31) and MDIO (GPIO 27) with internal pull-up enabled.
+
+PHY Hardware Discovery & Initialization: Identified and verified the IP101GRI PHY responding at Address 1 (OUI 0x0243), successfully attaching the netif driver and assigning the MAC address (80:f1:b2:d2:da:2e).
+
+Complete System & Hardware Bring-Up: Achieved a clean end-to-end boot in under 6.6 seconds with all core subsystems active:
+
+Memory & AI: 32MB PSRAM @ 200MHz verified; ESP-DL MobileFaceNet model loaded directly from flash (0x401d5760).
+
+Display & Imaging: MIPI-DSI display (720x1280 HX8394) streaming and MIPI-CSI camera (OV5647) ready.
+
+Peripherals & Power: I2S MEMS microphone capture, GT911 touch controller, and the 15-second inactivity deep-sleep watchdog.
+
+
+
 esp32-biometric-system/
 ├── .cargo/                     # Cargo runner & cross-compilation configs
 ├── .github/
