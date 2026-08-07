@@ -5,6 +5,7 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-changed=components/biometrics_wrapper/biometrics_wrapper.cpp");
     println!("cargo:rerun-if-changed=components/biometrics_wrapper/include/bindings.h");
+    println!("cargo:rerun-if-changed=components/biometrics_wrapper/biometrics_wrapper.h");
 
     // Propagate ESP-IDF build flags and linker scripts
     LinkArgs::output_propagated("ESP_IDF").expect("Failed to propagate link args");
