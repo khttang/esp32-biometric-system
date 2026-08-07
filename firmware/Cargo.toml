@@ -1,0 +1,67 @@
+[package]
+name = "firmware"
+version = "0.1.0"
+authors = ["ktang <khttang@gmail.com>"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.90"
+
+# 1.82, 1.85
+
+[[bin]]
+name = "firmware"
+path = "src/main.rs"       # Or "src/lib.rs"
+
+[profile.release]
+opt-level = "s"         # Optimize for size (use "3" if you need raw math speed over binary size)
+lto = true              # Link-Time Optimization
+codegen-units = 1 
+panic = "abort" 
+
+[profile.dev]
+debug = true 
+opt-level = "z"        # Optimize for size in dev to prevent overflowing Flash during debugging
+
+[dependencies]
+libc = "0.2"
+log = "0.4"
+anyhow = "1.0.104"
+# Updated to match typical ecosystem pairings for modern esp-idf-svc versions
+env_logger = "0.11"    
+
+# --- Essential Espressif Ecosystem ---
+# esp-idf-sys provides the actual C bindings and triggers the ESP-IDF CMake build system
+esp-idf-sys = { version = "0.37.2", features = ["binstart"] }
+esp-idf-svc = { version = "0.52.1", features = ["alloc", "std", "critical-section", "embassy-time-driver", "embassy-sync"] }
+embassy-time = { version = "0.5.1", features = ["generic-queue-8"] }
+tokio = { version = "1.38", default-features = false, features = ["rt", "sync", "time", "macros"] }
+arc-swap = "1.9.2"
+
+# --- Serialization for Biometric Templates ---
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[package.metadata.esp-idf-sys]
+sdkconfig_defaults = ["sdkconfig.defaults"]
+esp_idf_tools_install_dir = "workspace"
+
+# --- LOCAL C WRAPPER COMPONENT ---
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = ["components"]
+
+# --- CRITICAL AUTOMATION HOOK ---
+
+# --- ESP32-P4 MANAGED COMPONENTS ---
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp-dl", version = "^3.3.0" }
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp_video", version = "^2.3.0" }
+
+# --- PHYSICAL HARDWARE PERIPHERALS (Audio & Touch Screen) ---
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/es8311", version = "^1.0.0" }
+
+[build-dependencies]
+embuild = { version = "0.33", features = ["espidf"] }
+bindgen = "0.72.1"

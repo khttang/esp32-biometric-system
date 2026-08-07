@@ -1,0 +1,15 @@
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x10000,  # 64 KB for Wi-Fi credentials & enrolled user profiles
+otadata,    data, ota,     0x19000,  0x2000,   # 8 KB OTA state tracking
+phy_init,   data, phy,     0x1B000,  0x1000,   # 4 KB PHY RF calibration
+# -----------------------------------------------------------------
+# 64 KB Alignment Offset for App Partitions (0x20000)
+# -----------------------------------------------------------------
+ota_0,      app,  ota_0,   0x20000, 0x380000, # 3.5 MB Application Binary (A-bank)
+ota_1,      app,  ota_1,          , 0x380000, # 3.5 MB Application Binary (B-bank)
+# -----------------------------------------------------------------
+# Dedicated ML Model Partition (Matches main.rs subtype 0x82 search)
+# -----------------------------------------------------------------
+model,      data, spiffs,          , 0x300000, # 3.0 MB Model Storage (face_net.espdl)
+storage,    data, spiffs,          , 0x5E0000, # ~5.8 MB Extra storage / Image dumps
+
