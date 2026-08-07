@@ -26,6 +26,10 @@ typedef struct {
     uint16_t height;
 } p4_camera_frame_t;
 
+typedef struct {
+    float values[512];
+} FaceEmbedding;
+
 // -----------------------------------------------------------------------------
 // I2C & Touch Peripherals
 // -----------------------------------------------------------------------------
