@@ -14,6 +14,9 @@ mod storage;
 mod ota;
 mod thingsboard;
 mod power;
+mod touch_test;
+mod mic_test;
+mod speaker_test;
 
 use anyhow::{Context, Result};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -21,7 +24,6 @@ use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
 use esp_idf_svc::http::Method;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::sys::{MALLOC_CAP_8BIT, MALLOC_CAP_SPIRAM};
 use esp_idf_svc::timer::EspTaskTimerService;
 use esp_idf_sys::{esp_pm_config_t, esp_pm_configure};
 use log::{info, error};
@@ -32,7 +34,7 @@ use hdmi_audio::HdmiAudioPlayer;
 
 
 const MIC_I2S_PORT: i32 = 0;         // I2S0 for microphone input
-const HDMI_I2S_PORT: i32 = 1;        // I2S1 for HDMI audio output
+const HDMI_I2S_PORT: i32 = 0;        // I2S1 for HDMI audio output
 const MIC_SAMPLE_RATE: u32 = 16_000; // e.g., 16kHz for biometrics/voice
 const MIC_BCLK_PIN: i32 = 4;         // Bit Clock GPIO
 const MIC_WS_PIN: i32 = 5;           // Word Select / LRCLK GPIO
@@ -67,8 +69,7 @@ fn main() -> anyhow::Result<()>{
         .context("Failed to take ESP32-P4 peripherals")?;
 
     // 4. Initialize HDMI Audio Player
-    let hdmi_player = HdmiAudioPlayer::new(HDMI_I2S_PORT)
-        .context("Failed to initialize HDMI Audio Player")?;
+    let hdmi_player = HdmiAudioPlayer::new(0);
 
     // Bundle touch pins
     let pins = system::HardwarePins {
