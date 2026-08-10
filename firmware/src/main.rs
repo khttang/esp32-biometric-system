@@ -9,12 +9,10 @@ mod ffi {
 mod system;
 mod audio_worker;
 mod hdmi_audio;
-mod touch;
 mod storage;
 mod ota;
 mod thingsboard;
 mod power;
-mod touch_test;
 mod mic_test;
 mod speaker_test;
 
@@ -73,10 +71,7 @@ fn main() -> anyhow::Result<()>{
 
     // Bundle touch pins
     let pins = system::HardwarePins {
-        i2c0: peripherals.i2c0,
-        sda: peripherals.pins.gpio7,
-        scl: peripherals.pins.gpio8,
-        int_pin: peripherals.pins.gpio0,
+        int_pin: peripherals.pins.gpio0
     };
 
     // 5. Instantiate SystemResources container (InactivityTimer is initialized automatically inside)
