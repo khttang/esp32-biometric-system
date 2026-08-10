@@ -72,7 +72,7 @@ namespace BoardPins {
 }
 
 namespace BoardAddr {
-    constexpr uint8_t TCA9554_EXPANDER   = 0x45;
+    constexpr uint8_t TCA9554_EXPANDER   = 0x18;
     constexpr uint8_t DISPLAY_BACKLIGHT  = 0x45;
     constexpr uint8_t OV5647_SCCB         = 0x36;
     constexpr uint8_t GT911_TOUCH         = 0x5D;
@@ -84,6 +84,8 @@ namespace BoardAddr {
 #define TAG_SCAN    "i2c_scanner"
 #define TAG_OTA     "p4_ota"
 #define TAG_FACENET "ESP_DL_FACENET"
+#define TAG_I2S     "I2S_WRAPPER"
+#define TAG_LCD     "p4_lcd"
 
 // Global Handles
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
@@ -101,11 +103,43 @@ static esp_cam_ctlr_handle_t s_csi_cam_handle = NULL;
 static uint8_t *s_cam_frame_buffer = NULL;
 static size_t s_cam_fb_size = 0;
 
-static i2s_chan_handle_t rx_handle = NULL;
-static i2s_chan_handle_t tx_handle = NULL;
+static i2s_chan_handle_t g_i2s_tx_handle = NULL;
+static i2s_chan_handle_t g_i2s_rx_handle = NULL;
 
 static bool s_hardware_initialized = false;
 static dl::Model *g_mobilefacenet_model = NULL;
+
+static esp_err_t reset_hx8394_display(void) {
+    if (s_tca9554_handle == NULL) {
+        ESP_LOGE(TAG_LCD, "Cannot reset HX8394: TCA9554 handle is NULL!");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG_LCD, "Asserting HX8394 hardware reset via TCA9554 (P0 LOW)...");
+    
+    // Drive P0 LOW (0x0E = 0000 1110)
+    uint8_t rst_low_cmd[2] = {0x01, 0x0E};
+    esp_err_t err = i2c_master_transmit(s_tca9554_handle, rst_low_cmd, sizeof(rst_low_cmd), 1000);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_LCD, "TCA9554 transmit failed (LOW): 0x%x", err);
+        return err;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20)); // Hold RESET LOW 20ms
+
+    ESP_LOGI(TAG_LCD, "De-asserting HX8394 hardware reset (P0 HIGH)...");
+    
+    // Drive P0 HIGH (0x0F = 0000 1111)
+    uint8_t rst_high_cmd[2] = {0x01, 0x0F};
+    err = i2c_master_transmit(s_tca9554_handle, rst_high_cmd, sizeof(rst_high_cmd), 1000);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_LCD, "TCA9554 transmit failed (HIGH): 0x%x", err);
+        return err;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(120)); // Wait 120ms for HX8394 power-on state machine
+    return ESP_OK;
+}
 
 // -----------------------------------------------------------------------------
 // Ethernet Event Handlers
@@ -147,85 +181,116 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
     ESP_LOGI(TAG_ETH, "  GW     : " IPSTR, IP2STR(&ip_info->gw));
 }
 
+int init_i2s_tx_c(int i2s_port, uint32_t sample_rate, int bclk_gpio, int ws_gpio, int dout_gpio) {
+    return init_i2s_duplex_c(sample_rate, bclk_gpio, ws_gpio, -1, dout_gpio);
+}
+
 // -----------------------------------------------------------------------------
 // Audio Peripheral Drivers
 // -----------------------------------------------------------------------------
 int init_i2s_mic_c(int i2s_port, uint32_t sample_rate, int bclk_gpio, int ws_gpio, int din_gpio) {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG((i2s_port_t)i2s_port, I2S_ROLE_MASTER);
-    chan_cfg.auto_clear = true;
+    return init_i2s_duplex_c(sample_rate, bclk_gpio, ws_gpio, din_gpio, -1);
+}
 
-    esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &rx_handle);
-    if (err != ESP_OK) return (int)err;
+int init_i2s_duplex_c(
+    uint32_t sample_rate, 
+    int bclk_gpio, 
+    int ws_gpio, 
+    int din_gpio, 
+    int dout_gpio
+) {
+    // 1. Teardown previous handles if re-initializing
+    if (g_i2s_tx_handle) {
+        i2s_channel_disable(g_i2s_tx_handle);
+        i2s_del_channel(g_i2s_tx_handle);
+        g_i2s_tx_handle = NULL;
+    }
+    if (g_i2s_rx_handle) {
+        i2s_channel_disable(g_i2s_rx_handle);
+        i2s_del_channel(g_i2s_rx_handle);
+        g_i2s_rx_handle = NULL;
+    }
 
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = (gpio_num_t)bclk_gpio,
-            .ws   = (gpio_num_t)ws_gpio,
-            .dout = I2S_GPIO_UNUSED,
-            .din  = (gpio_num_t)din_gpio,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv   = false,
+    // 2. Determine which handles to allocate based on pin passed
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    
+    i2s_chan_handle_t *p_tx = (dout_gpio >= 0) ? &g_i2s_tx_handle : NULL;
+    i2s_chan_handle_t *p_rx = (din_gpio >= 0)  ? &g_i2s_rx_handle : NULL;
+
+    esp_err_t ret = i2s_new_channel(&chan_cfg, p_tx, p_rx);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_I2S, "i2s_new_channel failed: 0x%x", ret);
+        return (int)ret;
+    }
+
+    // 3. Configure and Enable TX Channel (if requested)
+    if (g_i2s_tx_handle && dout_gpio >= 0) {
+        i2s_std_config_t tx_cfg = {
+            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
+            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+            .gpio_cfg = {
+                .mclk = I2S_GPIO_UNUSED,
+                .bclk = (gpio_num_t)bclk_gpio,
+                .ws   = (gpio_num_t)ws_gpio,
+                .dout = (gpio_num_t)dout_gpio,
+                .din  = I2S_GPIO_UNUSED,
             },
-        },
-    };
+        };
+        ret = i2s_channel_init_std_mode(g_i2s_tx_handle, &tx_cfg);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG_I2S, "TX init failed: 0x%x", ret);
+            return (int)ret;
+        }
+        ret = i2s_channel_enable(g_i2s_tx_handle);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG_I2S, "TX enable failed: 0x%x", ret);
+            return (int)ret;
+        }
+        ESP_LOGI(TAG_I2S, "TX Channel enabled successfully");
+    }
 
-    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
-    err = i2s_channel_init_std_mode(rx_handle, &std_cfg);
-    if (err != ESP_OK) return (int)err;
+    // 4. Configure and Enable RX Channel (if requested)
+    if (g_i2s_rx_handle && din_gpio >= 0) {
+        i2s_std_config_t rx_cfg = {
+            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
+            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+            .gpio_cfg = {
+                .mclk = I2S_GPIO_UNUSED,
+                .bclk = (gpio_num_t)bclk_gpio,
+                .ws   = (gpio_num_t)ws_gpio,
+                .dout = I2S_GPIO_UNUSED,
+                .din  = (gpio_num_t)din_gpio,
+            },
+        };
+        ret = i2s_channel_init_std_mode(g_i2s_rx_handle, &rx_cfg);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG_I2S, "RX init failed: 0x%x", ret);
+            return (int)ret;
+        }
+        ret = i2s_channel_enable(g_i2s_rx_handle);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG_I2S, "RX enable failed: 0x%x", ret);
+            return (int)ret;
+        }
+        ESP_LOGI(TAG_I2S, "RX Channel enabled successfully");
+    }
 
-    return (int)i2s_channel_enable(rx_handle);
+    return 0;
 }
 
 int read_i2s_mic_c(int i2s_port, int16_t *out_buffer, uint32_t samples_to_read, uint32_t *bytes_read, uint32_t timeout_ms) {
-    if (!rx_handle) return -1;
-    size_t length_bytes = samples_to_read * sizeof(int16_t);
-    size_t read_bytes = 0;
-
-    esp_err_t err = i2s_channel_read(rx_handle, out_buffer, length_bytes, &read_bytes, timeout_ms / portTICK_PERIOD_MS);
-    if (bytes_read) *bytes_read = (uint32_t)read_bytes;
-    return (int)err;
-}
-
-int init_i2s_tx_c(int i2s_port, uint32_t sample_rate, int bclk_gpio, int ws_gpio, int dout_gpio) {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG((i2s_port_t)i2s_port, I2S_ROLE_MASTER);
-    chan_cfg.auto_clear = true;
-
-    esp_err_t err = i2s_new_channel(&chan_cfg, &tx_handle, NULL);
-    if (err != ESP_OK) return (int)err;
-
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = GPIO_NUM_NC,
-            .bclk = (gpio_num_t)bclk_gpio,
-            .ws   = (gpio_num_t)ws_gpio,
-            .dout = (gpio_num_t)dout_gpio,
-            .din  = GPIO_NUM_NC,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv   = false,
-            },
-        },
-    };
-
-    err = i2s_channel_init_std_mode(tx_handle, &std_cfg);
-    if (err != ESP_OK) return (int)err;
-
-    return (int)i2s_channel_enable(tx_handle);
+    if (!g_i2s_rx_handle) return -1;
+    size_t r_bytes = 0;
+    esp_err_t ret = i2s_channel_read(g_i2s_rx_handle, out_buffer, samples_to_read * sizeof(int16_t), &r_bytes, pdMS_TO_TICKS(timeout_ms));
+    if (bytes_read) *bytes_read = (uint32_t)r_bytes;
+    return (int)ret;
 }
 
 int write_i2s_tx_c(int i2s_port, const int16_t *buffer, uint32_t sample_count, uint32_t timeout_ms) {
-    if (!tx_handle) return -1;
-    size_t length_bytes = sample_count * sizeof(int16_t);
-    size_t bytes_written = 0;
-    return (int)i2s_channel_write(tx_handle, buffer, length_bytes, &bytes_written, timeout_ms / portTICK_PERIOD_MS);
+    if (!g_i2s_tx_handle) return -1;
+    size_t w_bytes = 0;
+    esp_err_t ret = i2s_channel_write(g_i2s_tx_handle, buffer, sample_count * sizeof(int16_t), &w_bytes, pdMS_TO_TICKS(timeout_ms));
+    return (int)ret;
 }
 
 // -----------------------------------------------------------------------------
@@ -289,8 +354,9 @@ void scan_i2c_bus(i2c_master_bus_handle_t bus_handle) {
 }
 
 static esp_err_t enable_board_power_rails(void) {
-    ESP_LOGI(TAG_HW, "Configuring LEDC PWM for Waveshare Backlight Driver...");
+    ESP_LOGI(TAG_LCD, "Configuring LEDC PWM on GPIO 6 for Backlight Driver...");
 
+    // 1. Configure LEDC Timer
     ledc_timer_config_t ledc_timer = {};
     ledc_timer.speed_mode       = LEDC_LOW_SPEED_MODE;
     ledc_timer.timer_num        = LEDC_TIMER_0;
@@ -299,31 +365,22 @@ static esp_err_t enable_board_power_rails(void) {
     ledc_timer.clk_cfg          = LEDC_AUTO_CLK;
     ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
 
-    // Excluded GPIO 27 to avoid conflict with Ethernet MDIO
-    const gpio_num_t bl_candidate_gpios[] = {
-        BoardPins::Display::PWM_BL, // GPIO 6
-        GPIO_NUM_39,
-        GPIO_NUM_40,
-        GPIO_NUM_41
-    };
+    // 2. Configure ONLY GPIO 6 for Backlight PWM (Do NOT touch GPIO 39/40 I2C pins!)
+    ledc_channel_config_t ledc_channel = {};
+    ledc_channel.speed_mode     = LEDC_LOW_SPEED_MODE;
+    ledc_channel.channel        = LEDC_CHANNEL_0;
+    ledc_channel.timer_sel      = LEDC_TIMER_0;
+    ledc_channel.intr_type      = LEDC_INTR_DISABLE;
+    ledc_channel.gpio_num       = BoardPins::Display::PWM_BL; // GPIO 6
+    ledc_channel.duty           = 0; // 100% duty cycle    KT:255
+    ledc_channel.hpoint         = 0;
+    
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
 
-    for (size_t i = 0; i < sizeof(bl_candidate_gpios) / sizeof(bl_candidate_gpios[0]); i++) {
-        ledc_channel_config_t ledc_channel = {};
-        ledc_channel.speed_mode     = LEDC_LOW_SPEED_MODE;
-        ledc_channel.channel        = (ledc_channel_t)i;
-        ledc_channel.timer_sel      = LEDC_TIMER_0;
-        ledc_channel.intr_type      = LEDC_INTR_DISABLE;
-        ledc_channel.gpio_num       = bl_candidate_gpios[i];
-        ledc_channel.duty           = 255;
-        ledc_channel.hpoint         = 0;
-        
-        esp_err_t ret = ledc_channel_config(&ledc_channel);
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG_HW, "LEDC PWM active on GPIO %d (Channel %d)", bl_candidate_gpios[i], i);
-        }
-    }
+    ESP_LOGI(TAG_LCD, "Backlight PWM initialized on GPIO 6 at 100%% brightness.");
 
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(50));
     return ESP_OK;
 }
 
@@ -381,12 +438,15 @@ static esp_err_t hx8394_init_vendor_registers(esp_lcd_panel_io_handle_t io) {
 }
 
 static esp_err_t init_display(uint16_t width, uint16_t height) {
-    ESP_LOGI(TAG_HW, "Initializing HX8394 MIPI-DSI Display (%dx%d)...", width, height);
+    ESP_LOGI(TAG_LCD, "Initializing HX8394 MIPI-DSI Display (%dx%d)...", width, height);
 
     ESP_ERROR_CHECK(init_internal_ldo());
     ESP_ERROR_CHECK(init_i2c_bus());
     ESP_ERROR_CHECK(init_tca9554());
     ESP_ERROR_CHECK(enable_board_power_rails());
+
+    // Execute hardware reset pulse unconditionally
+    ESP_ERROR_CHECK(reset_hx8394_display());
 
     esp_lcd_dsi_bus_config_t bus_config = {};
     bus_config.bus_id = 0;
@@ -402,6 +462,8 @@ static esp_err_t init_display(uint16_t width, uint16_t height) {
     dbi_config.lcd_param_bits = 8;
 
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_dbi(s_dsi_bus_handle, &dbi_config, &s_lcd_io));
+    
+    // HX8394 will now accept vendor DCS commands!
     ESP_ERROR_CHECK(hx8394_init_vendor_registers(s_lcd_io));
 
     esp_lcd_dpi_panel_config_t dpi_config = {};
@@ -425,7 +487,7 @@ static esp_err_t init_display(uint16_t width, uint16_t height) {
     ESP_ERROR_CHECK(esp_lcd_new_panel_dpi(s_dsi_bus_handle, &dpi_config, &s_lcd_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_lcd_panel));
 
-    ESP_LOGI(TAG_HW, "HX8394 MIPI-DSI Panel Active & Streaming!");
+    ESP_LOGI(TAG_LCD, "HX8394 MIPI-DSI Panel Active & Streaming!");
     return ESP_OK;
 }
 
@@ -518,40 +580,68 @@ int init_i2c_bus(void) {
     bus_config.flags.enable_internal_pullup = true;
 
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &s_i2c_bus));
-    scan_i2c_bus(s_i2c_bus);
+    //scan_i2c_bus(s_i2c_bus);
 
     return ESP_OK;
 }
 
 int init_tca9554(void) {
     if (s_i2c_bus == NULL) {
-        ESP_LOGE(TAG_HW, "Cannot init TCA9554: I2C bus is NULL!");
+        ESP_LOGE("p4_lcd", "Cannot init TCA9554: I2C bus is NULL!");
         return -1;
     }
     if (s_tca9554_handle != NULL) return ESP_OK;
 
-    ESP_LOGI(TAG_HW, "Attaching TCA9554 I/O Expander to I2C bus...");
+    ESP_LOGI(TAG_LCD, "Attaching TCA9554 at address 0x%02X to I2C bus...", BoardAddr::TCA9554_EXPANDER);
 
     i2c_device_config_t dev_cfg = {};
     dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
     dev_cfg.device_address = BoardAddr::TCA9554_EXPANDER;
-    dev_cfg.scl_speed_hz = 400000;
+    dev_cfg.scl_speed_hz = 100000; // 100 kHz Standard Mode for reliable bring-up
 
     esp_err_t err = i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_tca9554_handle);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG_HW, "Failed to add TCA9554 device to bus: 0x%x", err);
+        ESP_LOGE(TAG_LCD, "Failed to add TCA9554 device to bus: 0x%x", err);
         return (int)err;
     }
 
+    // 1. Configure Reg 0x03: P0-P3 as OUTPUT (0), P4-P7 as INPUT (1)
     uint8_t config_cmd[2] = {0x03, 0xF0};
     err = i2c_master_transmit(s_tca9554_handle, config_cmd, sizeof(config_cmd), 1000);
-    if (err != ESP_OK) return (int)err;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_LCD, "TCA9554 config reg write failed: 0x%x. Cleaning up device handle.", err);
+        i2c_master_bus_rm_device(s_tca9554_handle);
+        s_tca9554_handle = NULL;
+        return (int)err;
+    }
 
-    uint8_t output_cmd[2] = {0x01, 0x0F};
-    err = i2c_master_transmit(s_tca9554_handle, output_cmd, sizeof(output_cmd), 1000);
-    if (err != ESP_OK) return (int)err;
+    // 2. Assert Reset: Drive P0 LOW (0x0E = 0000 1110)
+    ESP_LOGI("p4_lcd", "Asserting HX8394 hardware reset (P0 LOW)...");
+    uint8_t rst_low_cmd[2] = {0x01, 0x0E};
+    err = i2c_master_transmit(s_tca9554_handle, rst_low_cmd, sizeof(rst_low_cmd), 1000);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_LCD, "TCA9554 reset LOW write failed: 0x%x", err);
+        i2c_master_bus_rm_device(s_tca9554_handle);
+        s_tca9554_handle = NULL;
+        return (int)err;
+    }
 
-    ESP_LOGI(TAG_HW, "TCA9554 I/O Expander initialized successfully.");
+    vTaskDelay(pdMS_TO_TICKS(20)); // Hold RESET LOW for 20ms
+
+    // 3. De-assert Reset: Drive P0 HIGH (0x0F = 0000 1111)
+    ESP_LOGI(TAG_LCD, "De-asserting HX8394 hardware reset (P0 HIGH, P1 LOW)...");
+    uint8_t rst_high_cmd[2] = {0x01, 0x0D};
+    err = i2c_master_transmit(s_tca9554_handle, rst_high_cmd, sizeof(rst_high_cmd), 1000);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_LCD, "TCA9554 reset HIGH write failed: 0x%x", err);
+        i2c_master_bus_rm_device(s_tca9554_handle);
+        s_tca9554_handle = NULL;
+        return (int)err;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(120)); // Wait 120ms for HX8394 internal power-on reset
+
+    ESP_LOGI(TAG_LCD, "TCA9554 I/O Expander & HX8394 Hardware Reset complete.");
     return (int)ESP_OK;
 }
 

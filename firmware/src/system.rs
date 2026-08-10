@@ -28,6 +28,13 @@ const INACTIVITY_TIMEOUT_SECS: u64 = 15;
 const TEMPLATE_ENDPOINT: &str = "http://192.168.1.100:8080/api/v1/members";
 const MODEL_ENDPOINT: &str = "http://192.168.1.100/models/face_v1.bin";
 
+// Shared Pin Definitions for I2S_NUM_0
+const SAMPLE_RATE: u32 = 16_000;
+const BCLK_GPIO: i32 = 12;
+const WS_GPIO: i32 = 13;
+const DIN_GPIO: i32 = 11; // INMP441 Mic
+const DOUT_GPIO: i32 = 14; // Speaker / HDMI Audio
+
 // 1. Force 16-byte alignment required by ESP32-P4 ESP-DL hardware acceleration
 #[repr(C, align(16))]
 struct AlignedModel<const N: usize>([u8; N]);
@@ -250,17 +257,28 @@ pub fn new(
     pub fn handle_initialize(&mut self, model_server_url: &str) -> Result<SystemState> {
         info!("State: Initialize - Bringing up Ethernet & Camera hardware...");
 
+        // 1. Initialize audio subsystem FIRST
+        let audio_ret = unsafe {
+            ffi::init_i2s_duplex_c(
+                16_000, // sample_rate
+                12,     // bclk_gpio
+                13,     // ws_gpio
+                11,     // din_gpio (INMP441 Mic)
+                14,     // dout_gpio (Speaker)
+            )
+        };
+
+        if audio_ret != 0 {
+            log::error!("[Audio] Duplex I2S failed to initialize! Code: {}", audio_ret);
+            return Err(anyhow::anyhow!("I2S Init Failed"));
+        }
+
+        log::info!("[Audio] Duplex I2S hardware ready.");
+
         // 1. Create channel for audio stream processing
         // Spawn audio capture thread (e.g. I2S Port 0, 16kHz, BCLK, WS, DIN pins)
         let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<Vec<i16>>();
-        crate::audio_worker::spawn_audio_capture_thread(
-            0,     // I2S port
-            16000, // 16kHz sample rate for voice biometrics
-            15,    // BCLK GPIO
-            16,    // WS GPIO
-            17,    // DIN GPIO
-            audio_tx,
-        );
+        crate::audio_worker::spawn_audio_capture_thread(0, audio_tx);
 
         // 2. Initialize P4 EMAC Ethernet
         let eth_err = unsafe { ffi::init_p4_ethernet() };
@@ -323,6 +341,11 @@ pub fn new(
         if let Err(e) = setup_admin_button() {
             warn!("Failed to init Admin Button GPIO: {}", e);
         }
+
+        // Testing
+        //crate::mic_test::run_inmp441_mic_bringup_test();
+        //crate::touch_test::run_gt911_bringup_test();
+        //crate::speaker_test::run_speaker_bringup_test();
 
         Ok(SystemState::RetrieveRuntimeData)
     }
@@ -494,6 +517,26 @@ pub fn bring_up_hardware() -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("Hardware bring-up failed with code {}", ret))
+    }
+}
+
+pub fn init_audio_subsystem() -> Result<(), i32> {
+    let ret = unsafe {
+        ffi::init_i2s_duplex_c(
+            SAMPLE_RATE,
+            BCLK_GPIO,
+            WS_GPIO,
+            DIN_GPIO,
+            DOUT_GPIO,
+        )
+    };
+
+    if ret == 0 {
+        log::info!("[Audio] Duplex I2S audio subsystem initialized.");
+        Ok(())
+    } else {
+        log::error!("[Audio] Duplex I2S init failed: {}", ret);
+        Err(ret)
     }
 }
 
