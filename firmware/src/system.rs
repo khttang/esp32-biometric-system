@@ -2,13 +2,11 @@ use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::*;
-use esp_idf_svc::hal::i2c::I2C0;
+use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection, Method};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::sys::esp_err_t;
 use esp_idf_svc::timer::EspTaskTimerService;
 use log::{error, info, warn};
-use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -16,14 +14,15 @@ use std::sync::atomic::AtomicBool;
 use std::thread::sleep;
 use std::time::Duration;
 
-use crate::ffi;
 use crate::hdmi_audio::HdmiAudioPlayer;
 use crate::power::InactivityTimer;
+use crate::video::{FaceBox, VideoPipeline};
+use crate::biometrics::{GroupMember, SystemState};
 
 // Hardware LP GPIO Configuration & Sleep Parameters
 const GT911_INT_LP_GPIO: i32 = 0;
 const ADMIN_BUTTON_LP_GPIO: i32 = 1;
-const INACTIVITY_TIMEOUT_SECS: u64 = 15;
+const INACTIVITY_TIMEOUT_SECS: u64 = 180;  // 3 mins
 const TEMPLATE_ENDPOINT: &str = "http://192.168.1.100:8080/api/v1/members";
 const MODEL_ENDPOINT: &str = "http://192.168.1.100/models/face_v1.bin";
 
@@ -60,6 +59,18 @@ pub struct P4CameraFrame {
     pub data_len: usize,
     pub width: u16,
     pub height: u16,
+    pub buffer_index: u32,
+}
+impl Default for P4CameraFrame {
+    fn default() -> Self {
+        Self {
+            data: std::ptr::null_mut(),
+            data_len: 0,
+            width: 0,
+            height: 0,
+            buffer_index: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -72,50 +83,25 @@ pub struct P4TouchData {
     pub touched: bool,
 }
 
-extern "C" {
-    fn init_admin_button_gpio() -> i32;
-    fn is_admin_button_pressed() -> bool;
-    fn p4_hardware_init_all(config: *const P4HardwareConfig) -> i32;
-    fn p4_camera_capture_frame(frame: *mut P4CameraFrame, timeout_ms: u32) -> i32;
-    fn p4_perform_ota_update(url: *const libc::c_char) -> esp_err_t;
-    fn p4_mark_app_valid();
-    fn dl_mobilefacenet_init(model_buf: *const u8, model_size: usize) -> i32;
-    fn dl_mobilefacenet_run(
-        crop_rgb888: *const u8,
-        out_embedding: *mut f32,
-        embedding_len: usize,
-    ) -> i32;
-    fn init_touch_with_bsp() -> i32;
-    fn p4_touch_read(touch_data: *mut P4TouchData) -> bool;
-}
+mod ffi {
+    use esp_idf_svc::sys::esp_err_t;
+    use super::{ P4CameraFrame, P4HardwareConfig, P4TouchData };
 
-// -----------------------------------------------------------------------------
-// System State & Domain Models
-// -----------------------------------------------------------------------------
-#[derive(Debug)]
-pub enum SystemState {
-    Initialize,
-    RetrieveRuntimeData,
-    DetectionValidation,
-    UpdatingRuntimeData { force_full_resync: bool },
-    ActionExecuted { member: GroupMember },
-    Error(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Role {
-    ADMIN,
-    USER,
-    GUEST,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GroupMember {
-    pub id: u8,
-    pub name: String,
-    pub role: Role,
-    pub face_embedding: Vec<f32>,
+    extern "C" {
+        pub fn init_p4_ethernet() -> i32;
+        pub fn init_admin_button_gpio() -> i32;
+        pub fn is_admin_button_pressed() -> bool;
+        pub fn p4_eth_is_link_up() -> bool;
+        pub fn p4_hardware_init_all(config: *const P4HardwareConfig) -> i32;
+        pub fn p4_camera_capture_frame(frame: *mut P4CameraFrame, timeout_ms: u32) -> i32;
+        pub fn p4_perform_ota_update(url: *const libc::c_char) -> esp_err_t;
+        pub fn p4_mark_app_valid();
+        pub fn dl_mobilefacenet_init(model_buf: *const u8, model_size: usize) -> i32;
+        pub fn dl_mobilefacenet_run(crop_rgb888: *const u8, out_embedding: *mut f32, embedding_len: usize) -> i32;
+        pub fn init_touch_with_bsp() -> i32;
+        pub fn p4_touch_read(touch_data: *mut P4TouchData) -> bool;
+        pub fn init_i2s_duplex_c(sample_rate: u32, bclk_gpio: i32, ws_gpio: i32, din_gpio: i32, dout_gpio: i32) -> i32;
+    }
 }
 
 pub struct EthernetSession {
@@ -139,6 +125,7 @@ pub struct SystemResources {
     pub model_ptr: *mut u8,
     pub model_size: usize,
     pub model_weights: Option<Vec<u8>>,
+    pub video_pipeline: VideoPipeline,
     pins: Option<HardwarePins>,
 
     // Inactivity watchdog timer handle
@@ -152,30 +139,37 @@ pub struct SystemResources {
     pub net_session: EthernetSession,
     pub update_trigger_received: bool,
     pub pending_template_download: bool,
+
+    // Zero-copy camera metadata struct passed to C
+    raw_frame: P4CameraFrame,
+    frame_valid: bool,
 }
 
 impl SystemResources {
-    pub fn new(
-        nvs: EspDefaultNvsPartition,
-        event_loop: EspSystemEventLoop,
-        timer_service: EspTaskTimerService,
-        hdmi_player: HdmiAudioPlayer,
-        pins: HardwarePins,
-    ) -> Self {
+    pub fn new() -> Result<Self> {
+        let nvs = EspDefaultNvsPartition::take()
+            .context("SystemResources Failed to take default NVS partition")?;
+        let event_loop = EspSystemEventLoop::take()
+            .context("SystemResources Failed to take system event loop")?;
+        let timer_service = EspTaskTimerService::new()
+            .context("SystemResources Failed to create task timer service")?;
+        let peripherals = Peripherals::take()
+            .context("SystemResources Failed to take ESP32-P4 peripherals")?;
+
+        let hdmi_player = HdmiAudioPlayer::new(0);
+        let pins = HardwarePins { int_pin: peripherals.pins.gpio0 };
         let model_ptr = MODEL_WEIGHTS.0.as_ptr();
         let model_size = MODEL_WEIGHTS.0.len();
-        info!(
-            "[ESP-DL] MobileFaceNet model mapped at flash addr {:p} (Size: {} bytes)",
-            model_ptr, model_size
-        );
+        info!("[ESP-DL] MobileFaceNet model mapped at flash addr {:p} (Size: {} bytes)", model_ptr, model_size);
 
-        Self {
+        Ok(Self {
             nvs,
             event_loop,
             timer_service,
             hdmi_player,
             inactivity_timer: InactivityTimer::new(),
             pins: Some(pins),
+            video_pipeline: VideoPipeline::new(640, 360),
             model_ptr: model_ptr as *mut u8,
             model_size,
             model_weights: None,
@@ -186,129 +180,47 @@ impl SystemResources {
             },
             update_trigger_received: false,
             pending_template_download: false,
-        }
+            raw_frame: P4CameraFrame::default(),
+            frame_valid: false,
+        })
     }
 
-    /// Master State Machine Handler Method
-    pub fn process_state_machine(&mut self, current_state: SystemState) -> Result<SystemState> {
-        match current_state {
-            SystemState::Initialize => self.handle_initialize(MODEL_ENDPOINT),
-
-            SystemState::RetrieveRuntimeData => {
-                self.inactivity_timer.reset();
-                info!("State: RetrieveRuntimeData - Fetching user biometric profiles...");
-
-                let members_guard = self.group_members.load();
-                if members_guard.is_empty() && check_ethernet_link_status() {
-                    if let Err(e) = self.fetch_runtime_templates(TEMPLATE_ENDPOINT) {
-                        warn!("Failed to load runtime templates: {:?}", e);
-                    }
-                }
-                Ok(SystemState::DetectionValidation)
-            }
-
-            SystemState::DetectionValidation => {
-                if check_admin_button() {
-                    self.inactivity_timer.reset();
-
-                    let mut hold_counter = 0;
-                    while check_admin_button() && hold_counter < 50 {
-                        sleep(Duration::from_millis(100));
-                        hold_counter += 1;
-                    }
-
-                    let force_full = hold_counter >= 30; // Held > 3 seconds
-                    info!("Triggering manual update (Full Model Resync: {})", force_full);
-                    return Ok(SystemState::UpdatingRuntimeData {
-                        force_full_resync: force_full,
-                    });
-                }
-
-                // Poll touch events
-                let mut touch = P4TouchData::default();
-                if unsafe { p4_touch_read(&mut touch) } {
-                    self.inactivity_timer.reset();
-                    info!("[Touch] Screen touched at X: {}, Y: {}", touch.x, touch.y);
-                }
-
-                Ok(SystemState::DetectionValidation)
-            }
-
-            SystemState::UpdatingRuntimeData { force_full_resync } => {
-                self.inactivity_timer.reset();
-                info!(
-                    "State: UpdatingRuntimeData (Force Full Resync: {})",
-                    force_full_resync
-                );
-
-                if !check_ethernet_link_status() {
-                    error!("Cannot sync: Ethernet cable is disconnected!");
-                    return Ok(SystemState::DetectionValidation);
-                } else {
-                    info!("Ethernet link verified. Starting outbound HTTP sync...");
-
-                    if force_full_resync {
-                        info!("Fetching biometric templates over Ethernet...");
-                        if let Err(e) = self.fetch_runtime_templates(TEMPLATE_ENDPOINT) {
-                            warn!("Failed to load runtime templates: {:?}", e);
-                        }
-                    }
-
-                    return Ok(SystemState::DetectionValidation);
-                }
-            }
-
-            SystemState::ActionExecuted { member } => {
-                self.inactivity_timer.reset();
-                info!(
-                    "State: ActionExecuted for Member: {} ({:?})",
-                    member.name, member.role
-                );
-                Ok(SystemState::DetectionValidation)
-            }
-
-            SystemState::Error(err_msg) => {
-                error!("State Machine Error: {}", err_msg);
-                Ok(SystemState::Error(err_msg))
-            }
-        }
-    }
-
-    /// Handler for SystemState::Initialize
-    pub fn handle_initialize(&mut self, _model_server_url: &str) -> Result<SystemState> {
-        info!("State: Initialize - Bringing up Ethernet & Hardware...");
-
-        // 1. Initialize Audio Subsystem
-        if let Err(e) = init_audio_subsystem() {
-            return Ok(SystemState::Error(format!("Audio Init Failed ({})", e)));
-        }
+    pub fn init(&mut self) -> Result<()> {
+    
+        init_audio_subsystem()
+            .context("SystemResources initializes audio system")?;
 
         // Spawn audio capture worker thread
         let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<Vec<i16>>();
         crate::audio_worker::spawn_audio_capture_thread(0, audio_tx);
 
-        // 2. Initialize P4 EMAC Ethernet
+        // Initialize P4 EMAC Ethernet
         let eth_err = unsafe { ffi::init_p4_ethernet() };
         if eth_err != 0 {
-            error!("Ethernet hardware initialization failed with code: {}", eth_err);
-            return Ok(SystemState::Error(format!("Ethernet Init Failed ({})", eth_err)));
+            bail!("SystemResources Ethernet Init Failed: {}", eth_err);
         }
 
-        // 3. Initialize ESP-DL MobileFaceNet Neural Model from Flash Memory
+        // Initialize ESP-DL MobileFaceNet Neural Model from Flash Memory
         if let Err(e) = self.init_mobilefacenet() {
-            return Ok(SystemState::Error(format!("ESP-DL Model Init Failed: {:?}", e)));
+            bail!("SystemResources MobileFaceNet Init Failed: {:?}", e);
         }
 
         // 4. Bring up Unified Board Hardware (Display, Camera, I2C, Power) via BSP
-        if let Err(e) = bring_up_hardware() {
-            error!("BSP Display and Camera initialization failed: {:?}", e);
-            return Ok(SystemState::Error(format!("Hardware Bring-Up Failed ({})", e)));
+        let config = P4HardwareConfig {
+            display_width: 720,
+            display_height: 1280,
+            camera_width: 1280,
+            camera_height: 720,
+        };
+        let init_ret = unsafe { ffi::p4_hardware_init_all(&config) };
+        if init_ret != 0 {
+            bail!("SystemResources Hardware bring-up failed with code {}", init_ret);
         }
 
         let _pins = self
             .pins
             .take()
-            .context("Hardware pins already consumed")?;
+            .context("SystemResources Hardware pins already consumed")?;
 
         // 5. Initialize Inactivity Watchdog
         crate::power::spawn_inactivity_watchdog(
@@ -317,21 +229,61 @@ impl SystemResources {
             GT911_INT_LP_GPIO,
             ADMIN_BUTTON_LP_GPIO,
         );
-        info!("[Power] Inactivity watchdog active (Timeout: {}s)", INACTIVITY_TIMEOUT_SECS);
+        info!("SystemResources Power Inactivity watchdog active (Timeout: {}s)", INACTIVITY_TIMEOUT_SECS);
 
         // 6. Configure Admin GPIO Button
         if let Err(e) = setup_admin_button() {
-            warn!("Failed to init Admin Button GPIO: {}", e);
+            bail!("SystemResources Failed to init Admin Button GPIO: {}", e);
         }
 
-        Ok(SystemState::RetrieveRuntimeData)
+        Ok(())
+    }
+
+    /// Captures the frame into the C driver buffer.
+    /// `&mut self` borrow ENDS instantly upon return.
+    pub fn capture_camera_frame(&mut self) -> bool {
+        let ret = unsafe { ffi::p4_camera_capture_frame(&mut self.raw_frame, 100) };
+
+        if ret == 0 && !self.raw_frame.data.is_null() {
+            self.frame_valid = true;
+            true
+        } else {
+            self.frame_valid = false;
+            false
+        }
+    }
+
+    /// Converts the C PSRAM pointer into a safe, immutable RGB565 Rust slice (&[u16]).
+    pub fn camera_frame<'a>(&self) -> Option<&'a[u16]> {
+        if !self.frame_valid || self.raw_frame.data.is_null() {
+            return None;
+        }
+
+        let pixel_count = (self.raw_frame.width as usize) * (self.raw_frame.height as usize);
+        
+        // Safety: Pointer is guaranteed non-null and valid for `pixel_count` u16 elements by C driver
+        unsafe {
+            Some(std::slice::from_raw_parts(
+                self.raw_frame.data as *const u16,
+                pixel_count,
+            ))
+        }
+    }
+
+    pub fn detect_faces(&self, _frame: &[u16]) -> Vec<FaceBox> {
+        // Run ESP-DL MobileFaceNet pass
+        vec![]
+    }
+
+    pub fn is_admin_pressed(&self) -> bool {
+        unsafe { ffi::is_admin_button_pressed() }
     }
 
     /// Fetch group members over network with local Flash fallback
-    pub fn fetch_runtime_templates(&mut self, endpoint_url: &str) -> Result<()> {
-        info!("Attempting HTTP template fetch from: {}", endpoint_url);
+    pub fn fetch_runtime_templates(&mut self) -> Result<()> {
+        info!("Attempting HTTP template fetch from: {}", TEMPLATE_ENDPOINT);
 
-        match self.download_members_http(endpoint_url) {
+        match self.download_members_http() {
             Ok(members) => {
                 info!("Successfully fetched {} members over network.", members.len());
                 let _ = Self::save_members_to_flash("/spiffs/members.json", &members);
@@ -348,7 +300,7 @@ impl SystemResources {
     }
 
     /// HTTP GET stream downloader using EspHttpConnection directly
-    pub fn download_members_http(&self, endpoint_url: &str) -> Result<Vec<GroupMember>> {
+    pub fn download_members_http(&self) -> Result<Vec<GroupMember>> {
         let mut connection = EspHttpConnection::new(&HttpConfig {
             use_global_ca_store: false,
             buffer_size: Some(1024),
@@ -358,7 +310,7 @@ impl SystemResources {
         .context("Failed to build HTTP connection handle")?;
 
         connection
-            .initiate_request(Method::Get, endpoint_url, &[])
+            .initiate_request(Method::Get, TEMPLATE_ENDPOINT, &[])
             .context("Failed to initiate GET request")?;
 
         connection
@@ -416,7 +368,7 @@ impl SystemResources {
             self.model_ptr, self.model_size
         );
 
-        let err_code = unsafe { dl_mobilefacenet_init(self.model_ptr as *const u8, self.model_size) };
+        let err_code = unsafe { ffi::dl_mobilefacenet_init(self.model_ptr as *const u8, self.model_size) };
 
         if err_code != 0 {
             bail!("dl_mobilefacenet_init failed with esp_err_t code: {}", err_code);
@@ -426,8 +378,45 @@ impl SystemResources {
         Ok(())
     }
 
-    /// Extracts a 512-element face feature embedding from a cropped 112x112 face frame
-    pub fn extract_face_embedding(&self, face_crop_112x112: &[u8]) -> Result<[f32; 512]> {
+/// Crops a face region from the raw RGB565 camera frame and resizes it to 112x112 RGB888 for ESP-DL
+    pub fn crop_face_112x112(&self, frame_rgb565: &[u16], face: &FaceBox) -> Option<Vec<u8>> {
+        let frame_w = 1280;
+        let frame_h = 720;
+
+        let bx = (face.x as usize).min(frame_w - 1);
+        let by = (face.y as usize).min(frame_h - 1);
+        let bw = (face.width as usize).min(frame_w - bx);
+        let bh = (face.height as usize).min(frame_h - by);
+
+        if bw == 0 || bh == 0 {
+            return None;
+        }
+
+        let mut crop_rgb888 = vec![0u8; 112 * 112 * 3];
+
+        // Nearest-neighbor crop and RGB565 -> RGB888 conversion
+        for dy in 0..112 {
+            let sy = by + (dy * bh) / 112;
+            for dx in 0..112 {
+                let sx = bx + (dx * bw) / 112;
+                let pixel_565 = frame_rgb565[sy * frame_w + sx];
+
+                // Extract RGB channels
+                let r = (((pixel_565 >> 11) & 0x1F) as u8) << 3;
+                let g = (((pixel_565 >> 5) & 0x3F) as u8) << 2;
+                let b = ((pixel_565 & 0x1F) as u8) << 3;
+
+                let out_idx = (dy * 112 + dx) * 3;
+                crop_rgb888[out_idx] = r;
+                crop_rgb888[out_idx + 1] = g;
+                crop_rgb888[out_idx + 2] = b;
+            }
+        }
+
+        Some(crop_rgb888)
+    }
+
+    pub fn extract_face_embedding(&self, face_crop_112x112: &[u8]) -> anyhow::Result<[f32; 512]> {
         if face_crop_112x112.len() != 112 * 112 * 3 {
             anyhow::bail!("Invalid face crop frame size");
         }
@@ -435,7 +424,7 @@ impl SystemResources {
         let mut embedding = [0.0f32; 512];
 
         let err = unsafe {
-            dl_mobilefacenet_run(
+            ffi::dl_mobilefacenet_run(
                 face_crop_112x112.as_ptr(),
                 embedding.as_mut_ptr(),
                 embedding.len(),
@@ -448,14 +437,19 @@ impl SystemResources {
 
         Ok(embedding)
     }
+
+    pub fn check_ethernet_link_status(&self) -> bool {
+        //TODO: KTANG unsafe { ffi::p4_eth_is_link_up() }
+        true
+    }
 }
 
 pub fn validate_running_app() {
-    unsafe { p4_mark_app_valid() };
+    unsafe { ffi::p4_mark_app_valid() };
 }
 
 pub fn setup_admin_button() -> Result<()> {
-    let err = unsafe { init_admin_button_gpio() };
+    let err = unsafe { ffi::init_admin_button_gpio() };
     if err != 0 {
         bail!("Failed to configure admin button GPIO, ESP-IDF err: {}", err);
     }
@@ -463,42 +457,20 @@ pub fn setup_admin_button() -> Result<()> {
 }
 
 pub fn check_admin_button() -> bool {
-    unsafe { is_admin_button_pressed() }
+    unsafe { ffi::is_admin_button_pressed() }
 }
 
-pub fn check_ethernet_link_status() -> bool {
-    true
-}
-
-pub fn bring_up_hardware() -> Result<(), String> {
-    let config = P4HardwareConfig {
-        display_width: 720,
-        display_height: 1280,
-        camera_width: 1280,
-        camera_height: 720,
+pub fn init_audio_subsystem() -> Result<()> {
+    let ret = unsafe { 
+        ffi::init_i2s_duplex_c(SAMPLE_RATE, BCLK_GPIO, WS_GPIO, DIN_GPIO, DOUT_GPIO) 
     };
-
-    let ret = unsafe { p4_hardware_init_all(&config as *const _) };
-    if ret == 0 {
-        info!("ESP32-P4 hardware initialized cleanly!");
-        Ok(())
-    } else {
-        Err(format!("Hardware bring-up failed with code {}", ret))
+    
+    if ret != 0 {
+        bail!("Failed to initialize audio subsystem: {}", ret); // Instantly returns Err
     }
-}
 
-pub fn init_audio_subsystem() -> Result<(), i32> {
-    let ret = unsafe {
-        ffi::init_i2s_duplex_c(SAMPLE_RATE, BCLK_GPIO, WS_GPIO, DIN_GPIO, DOUT_GPIO)
-    };
-
-    if ret == 0 {
-        info!("[Audio] Duplex I2S audio subsystem initialized.");
-        Ok(())
-    } else {
-        error!("[Audio] Duplex I2S init failed: {}", ret);
-        Err(ret)
-    }
+    info!("[Audio] Duplex I2S audio subsystem initialized.");
+    Ok(())
 }
 
 pub fn test_camera_capture() {
@@ -507,10 +479,11 @@ pub fn test_camera_capture() {
         data_len: 0,
         width: 0,
         height: 0,
+        buffer_index: 0
     };
 
     info!("Attempting to capture frame from OV5647 MIPI-CSI camera...");
-    let ret = unsafe { p4_camera_capture_frame(&mut frame as *mut _, 1000) };
+    let ret = unsafe { ffi::p4_camera_capture_frame(&mut frame as *mut _, 1000) };
 
     if ret == 0 {
         info!(

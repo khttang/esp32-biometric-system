@@ -8,12 +8,11 @@ idf_component_register(
         driver 
         esp_driver_i2c
         esp_eth 
-        esp_netif 
-        esp_driver_cam
-        esp_driver_isp
+        esp_netif
         esp_lcd
         esp_hw_support 
         esp_pm 
         hal
         esp32_p4_nano
+        esp_video
 )

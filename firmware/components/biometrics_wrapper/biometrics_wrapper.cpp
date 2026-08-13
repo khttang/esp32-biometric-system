@@ -1,21 +1,27 @@
 #include "driver/i2c_master.h"
 #include "bindings.h"
 
+#include "esp_video_init.h"
+#include "esp_video_ioctl.h"
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/videodev2.h>
 #include <stdio.h>
 #include <cstring>
 #include <memory>
 #include <cmath>
+#include <sys/mman.h>
 
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
-#include "driver/isp_core.h"
 #include "esp_err.h"
 #include "esp_check.h"
-#include "esp_cam_ctlr.h"
-#include "esp_cam_ctlr_csi.h"
-#include "esp_cam_ctlr_types.h"
-#include "esp_cam_sensor.h"
+#include "esp_cache.h"
+#include "esp_attr.h"
+
+#include "esp_cam_sensor_detect.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_io.h"
@@ -29,7 +35,6 @@
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_ldo_regulator.h"
 
 // Official Waveshare ESP32-P4-NANO BSP Headers
 #include "esp_lcd_touch.h"
@@ -41,7 +46,23 @@
 #include "dl_model_base.hpp"
 #include "dl_tensor_base.hpp"
 
+#include "sdkconfig.h"
+#include "esp_log.h"
 #include "biometrics_wrapper.h"
+
+// Access your custom Kconfig values directly!
+#ifndef CONFIG_BIOMETRICS_CAM_WIDTH
+#define CONFIG_BIOMETRICS_CAM_WIDTH 1280
+#endif
+
+#ifndef CONFIG_BIOMETRICS_CAM_HEIGHT
+#define CONFIG_BIOMETRICS_CAM_HEIGHT 720
+#endif
+
+struct v4l2_frame_buffer_t {
+    void  *start;
+    size_t length;
+};
 
 // -----------------------------------------------------------------------------
 // Hardware Pinout Definitions
@@ -62,6 +83,13 @@ namespace BoardPins {
             constexpr gpio_num_t RXD1   = GPIO_NUM_30;
         }
     }
+    namespace Camera {
+        constexpr gpio_num_t SDA      = GPIO_NUM_7;  // Waveshare P4-NANO Camera I2C SDA
+        constexpr gpio_num_t SCL      = GPIO_NUM_8;  // Waveshare P4-NANO Camera I2C SCL
+        constexpr gpio_num_t PWDN     = GPIO_NUM_5;  // Camera Power Down Pin (Active LOW)
+        constexpr gpio_num_t RESET    = GPIO_NUM_6;  // Camera Reset Pin (Active LOW)
+        constexpr i2c_port_num_t PORT = I2C_NUM_0;
+    }
     namespace System {
         constexpr gpio_num_t ADMIN_BTN = GPIO_NUM_0;
     }
@@ -72,27 +100,31 @@ namespace BoardAddr {
 }
 
 #define TAG_HW      "p4_hardware"
-#define TAG_ETH     "p4_ethernet"
 #define TAG_CAM     "p4_camera"
+#define TAG_ETH     "p4_ethernet"
 #define TAG_OTA     "p4_ota"
 #define TAG_FACENET "ESP_DL_FACENET"
 #define TAG_I2S     "I2S_WRAPPER"
 #define TAG_LCD     "p4_lcd"
 
+#define CAM_BUF_COUNT 2
+
 // Global Hardware Handles
 static esp_lcd_panel_handle_t s_lcd_panel = NULL;
 static esp_lcd_panel_io_handle_t s_lcd_io = NULL;
 static esp_lcd_touch_handle_t s_touch_handle = NULL;
-static esp_cam_ctlr_handle_t s_csi_cam_handle = NULL;
-
-static uint8_t *s_cam_frame_buffer = NULL;
-static size_t s_cam_fb_size = 0;
 
 static i2s_chan_handle_t g_i2s_tx_handle = NULL;
 static i2s_chan_handle_t g_i2s_rx_handle = NULL;
 
 static bool s_hardware_initialized = false;
 static dl::Model *g_mobilefacenet_model = NULL;
+
+static int s_video_fd = -1;
+static struct v4l2_frame_buffer_t s_v4l2_buffers[2] = {};
+static bool s_buffers_mapped = false;
+static void *s_cam_buffers[CAM_BUF_COUNT] = {NULL};
+static size_t s_cam_buf_lengths[CAM_BUF_COUNT] = {0};
 
 // -----------------------------------------------------------------------------
 // Display Initialization & Helper Functions
@@ -190,58 +222,6 @@ void p4_display_draw_test_pattern(void) {
         esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, 0, 720, 1280, test_buf);
         heap_caps_free(test_buf);
     }
-}
-
-// -----------------------------------------------------------------------------
-// MIPI-CSI Camera Initialization
-// -----------------------------------------------------------------------------
-static bool IRAM_ATTR csi_on_trans_finished_cb(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data) {
-    return false;
-}
-
-static esp_err_t init_camera(uint16_t width, uint16_t height) {
-    ESP_LOGI(TAG_HW, "Initializing MIPI-CSI Camera (%dx%d)...", width, height);
-
-    s_cam_fb_size = width * height * 2;
-    if (s_cam_frame_buffer == NULL) {
-        s_cam_frame_buffer = (uint8_t *)heap_caps_malloc(s_cam_fb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!s_cam_frame_buffer) {
-            ESP_LOGE(TAG_CAM, "Failed to allocate camera framebuffer in PSRAM!");
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (s_csi_cam_handle == NULL) {
-        esp_cam_ctlr_csi_config_t csi_config = {};
-        csi_config.ctlr_id = 0;
-        csi_config.clk_src = MIPI_CSI_PHY_CLK_SRC_DEFAULT;
-        csi_config.h_res = width;
-        csi_config.v_res = height;
-        csi_config.data_lane_num = 2;
-        csi_config.lane_bit_rate_mbps = 800;
-        csi_config.input_data_color_type = CAM_CTLR_COLOR_RAW10;
-        csi_config.output_data_color_type = CAM_CTLR_COLOR_RAW10;
-        csi_config.queue_items = 2;
-        csi_config.byte_swap_en = false;
-
-        esp_err_t ret = esp_cam_new_csi_ctlr(&csi_config, &s_csi_cam_handle);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG_CAM, "esp_cam_new_csi_ctlr failed: 0x%x (%s)", ret, esp_err_to_name(ret));
-            return ret;
-        }
-
-        esp_cam_ctlr_evt_cbs_t cbs = {
-            .on_get_new_trans = NULL,
-            .on_trans_finished = csi_on_trans_finished_cb,
-        };
-        ESP_ERROR_CHECK(esp_cam_ctlr_register_event_callbacks(s_csi_cam_handle, &cbs, NULL));
-
-        ESP_ERROR_CHECK(esp_cam_ctlr_enable(s_csi_cam_handle));
-        ESP_ERROR_CHECK(esp_cam_ctlr_start(s_csi_cam_handle));
-    }
-
-    ESP_LOGI(TAG_HW, "OV5647 MIPI-CSI Pipeline Active & Frame Buffer Ready!");
-    return ESP_OK;
 }
 
 // -----------------------------------------------------------------------------
@@ -366,6 +346,178 @@ int write_i2s_tx_c(int i2s_port, const int16_t *buffer, uint32_t sample_count, u
 // -----------------------------------------------------------------------------
 extern "C" {
 
+esp_cam_sensor_device_t *ov5647_detect(void *config);
+
+int32_t p4_camera_init_v4l2_default(void) {
+    // Uses the values defined in Kconfig / sdkconfig.defaults
+    return p4_camera_init_v4l2(CONFIG_BIOMETRICS_CAM_WIDTH, CONFIG_BIOMETRICS_CAM_HEIGHT);
+}
+
+int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
+    if (s_video_fd >= 0) return 0; // Already initialized
+
+    ESP_LOGI(TAG_CAM, "Initializing OV5647 via esp_video (Shared I2C Bus)...");
+
+    // 1. Get Shared I2C Bus Handle from BSP
+    i2c_master_bus_handle_t shared_i2c_bus = bsp_i2c_get_handle();
+    if (!shared_i2c_bus) {
+        ESP_LOGE(TAG_CAM, "bsp_i2c_get_handle() returned NULL!");
+        return -1;
+    }
+
+    // 2. Hardware Probe Test on I2C 0x36
+    esp_err_t probe_ret = i2c_master_probe(shared_i2c_bus, 0x36, 100);
+    if (probe_ret == ESP_OK) {
+        ESP_LOGI(TAG_CAM, "SUCCESS: OV5647 Camera ACKed on I2C address 0x36!");
+    } else {
+        ESP_LOGE(TAG_CAM, "ERROR: OV5647 did NOT respond on I2C 0x36! (err: %s)", esp_err_to_name(probe_ret));
+        return -1;
+    }
+
+    // Force link of ov5647_detect so the object file is retained by linker
+    (void)ov5647_detect;
+
+    // 3. Configure esp_video CSI parameters with explicit BoardPins
+    esp_video_init_csi_config_t csi_cfg = {};
+    csi_cfg.sccb_config.init_sccb = false;
+    csi_cfg.sccb_config.i2c_handle = shared_i2c_bus;
+    csi_cfg.sccb_config.freq = 100000;
+
+    csi_cfg.reset_pin = static_cast<gpio_num_t>(BoardPins::Camera::RESET); // GPIO 6
+    csi_cfg.pwdn_pin  = static_cast<gpio_num_t>(BoardPins::Camera::PWDN);  // GPIO 5
+    csi_cfg.dont_init_ldo = false;
+
+    esp_video_init_config_t cam_cfg = {};
+    cam_cfg.csi = &csi_cfg;
+
+    // 4. Initialize esp_video
+    esp_err_t ret = esp_video_init(&cam_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_CAM, "esp_video_init failed: %s (0x%x)", esp_err_to_name(ret), ret);
+        return ret;
+    }
+
+    // 5. Open V4L2 Character Device
+    s_video_fd = open("/dev/video0", O_RDWR);
+    if (s_video_fd < 0) {
+        ESP_LOGE(TAG_CAM, "Failed to open /dev/video0 (errno %d: %s)", errno, strerror(errno));
+        return -1;
+    }
+
+    // 6. Query & Set Active Format
+    struct v4l2_format fmt = {};
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(s_video_fd, VIDIOC_G_FMT, &fmt) < 0) {
+        ESP_LOGE(TAG_CAM, "Failed to get active format from /dev/video0");
+        close(s_video_fd);
+        s_video_fd = -1;
+        return -1;
+    }
+
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_RGB565;
+    if (ioctl(s_video_fd, VIDIOC_S_FMT, &fmt) < 0) {
+        ESP_LOGE(TAG_CAM, "Failed to set RGB565 format (errno %d: %s)", errno, strerror(errno));
+        close(s_video_fd);
+        s_video_fd = -1;
+        return -1;
+    }
+
+    // 7. Request MMAP Buffers
+    struct v4l2_requestbuffers req = {};
+    req.count = CAM_BUF_COUNT;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(s_video_fd, VIDIOC_REQBUFS, &req) < 0) {
+        ESP_LOGE(TAG_CAM, "Failed to request V4L2 buffers");
+        close(s_video_fd);
+        s_video_fd = -1;
+        return -1;
+    }
+
+    // 8. Map and ENQUEUE (QBUF) all allocated buffers into the CSI DMA ring
+    for (int i = 0; i < CAM_BUF_COUNT; i++) {
+        struct v4l2_buffer buf = {};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+
+        if (ioctl(s_video_fd, VIDIOC_QUERYBUF, &buf) < 0) {
+            ESP_LOGE(TAG_CAM, "Failed to query buffer %d", i);
+            return -1;
+        }
+
+        s_cam_buf_lengths[i] = buf.length;
+        s_cam_buffers[i] = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, s_video_fd, buf.m.offset);
+        if (s_cam_buffers[i] == MAP_FAILED) {
+            ESP_LOGE(TAG_CAM, "Failed to mmap buffer %d", i);
+            return -1;
+        }
+
+        // QUEUE BUFFER into CSI DMA controller
+        if (ioctl(s_video_fd, VIDIOC_QBUF, &buf) < 0) {
+            ESP_LOGE(TAG_CAM, "Failed to qbuf (enqueue) buffer %d", i);
+            return -1;
+        }
+    }
+
+    // 9. Start Streaming (CSI DMA now has ready buffers!)
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(s_video_fd, VIDIOC_STREAMON, &type) < 0) {
+        ESP_LOGE(TAG_CAM, "Failed to start V4L2 stream (errno %d: %s)", errno, strerror(errno));
+        close(s_video_fd);
+        s_video_fd = -1;
+        return -1;
+    }
+
+    ESP_LOGI(TAG_CAM, "OV5647 Camera streaming successfully on /dev/video0 (%dx%d RGB565)!", 
+             fmt.fmt.pix.width, fmt.fmt.pix.height);
+    return 0;
+}
+
+int32_t p4_camera_capture_frame(p4_camera_frame_t *frame, uint32_t timeout_ms) {
+    if (s_video_fd < 0 || !frame) {
+        return -1;
+    }
+
+    // 1. Dequeue completed frame buffer from hardware ISP queue
+    struct v4l2_buffer buf = {};
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+
+    if (ioctl(s_video_fd, VIDIOC_DQBUF, &buf) < 0) {
+        // -2 signals "no frame ready yet / timeout" to Rust biometrics worker
+        return -2;
+    }
+
+    // 2. Populate frame struct for Rust FFI (MobileFaceNet / ESP-DL)
+    frame->data = (uint8_t *)s_v4l2_buffers[buf.index].start;
+    frame->data_len = buf.bytesused;
+    frame->width = 1280;   // Matches active OV5647 format
+    frame->height = 960;   // Matches active OV5647 format
+    frame->buffer_index = buf.index; // Stored so release function can re-QBUF
+
+    return 0; // Success
+}
+
+int32_t p4_camera_release_frame(const p4_camera_frame_t *frame) {
+    if (s_video_fd < 0 || !frame) {
+        return -1;
+    }
+
+    struct v4l2_buffer buf = {};
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = frame->buffer_index;
+
+    // Return buffer to CSI DMA hardware pool
+    if (ioctl(s_video_fd, VIDIOC_QBUF, &buf) < 0) {
+        ESP_LOGE(TAG_CAM, "VIDIOC_QBUF failed on release for index %u", buf.index);
+        return -1;
+    }
+
+    return 0;
+}
+
 int32_t p4_hardware_init_all(const p4_hardware_config_t *config) {
     ESP_LOGI(TAG_HW, "Starting Unified Hardware Bring-up...");
 
@@ -375,33 +527,14 @@ int32_t p4_hardware_init_all(const p4_hardware_config_t *config) {
     esp_err_t ret = init_display_with_bsp();
     if (ret != ESP_OK) return ret;
 
-    ret = init_camera(config->camera_width, config->camera_height);
+    ret = p4_camera_init_v4l2(CONFIG_BIOMETRICS_CAM_WIDTH, CONFIG_BIOMETRICS_CAM_HEIGHT);
     if (ret != ESP_OK) return ret;
 
-    ESP_LOGI(TAG_HW, "All Systems Initialized Successfully!");
+    ESP_LOGI(TAG_HW, "Display Systems Initialized Successfully!");
     s_hardware_initialized = true;
 
     p4_display_draw_test_pattern();
     return ESP_OK;
-}
-
-int32_t p4_camera_capture_frame(p4_camera_frame_t *frame, uint32_t timeout_ms) {
-    if (!s_csi_cam_handle || !s_cam_frame_buffer || !frame) return -1;
-
-    esp_cam_ctlr_trans_t trans = {};
-    trans.buffer = s_cam_frame_buffer;
-    trans.buflen = s_cam_fb_size;
-
-    esp_err_t ret = esp_cam_ctlr_receive(s_csi_cam_handle, &trans, pdMS_TO_TICKS(timeout_ms));
-
-    if (ret == ESP_OK) {
-        frame->data = (uint8_t *)trans.buffer;
-        frame->data_len = (trans.received_size > 0) ? trans.received_size : s_cam_fb_size;
-        frame->width = 1280;
-        frame->height = 720;
-        return 0;
-    }
-    return (int32_t)ret;
 }
 
 int32_t p4_perform_ota_update(const char *url) {
@@ -527,6 +660,20 @@ int init_admin_button_gpio() {
 
 bool is_admin_button_pressed() {
     return gpio_get_level(BoardPins::System::ADMIN_BTN) == 0;
+}
+
+int32_t p4_display_draw_frame(const uint16_t *frame_buffer, uint16_t width, uint16_t height) {
+    if (!s_lcd_panel || !frame_buffer) return ESP_ERR_INVALID_ARG;
+
+    // Push RGB565 buffer directly to MIPI-DSI display via DMA
+    esp_err_t ret = esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, 0, width, height, frame_buffer);
+    return (int32_t)ret;
+}
+
+int32_t p4_display_draw_bitmap(uint16_t x_start, uint16_t y_start, uint16_t x_end, uint16_t y_end, const uint16_t *data) {
+    if (!s_lcd_panel || !data) return -1;
+    // Direct DMA transfer to LCD controller
+    return (int32_t)esp_lcd_panel_draw_bitmap(s_lcd_panel, x_start, y_start, x_end, y_end, data);
 }
 
 // -----------------------------------------------------------------------------

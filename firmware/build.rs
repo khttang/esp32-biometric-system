@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=components/biometrics_wrapper/biometrics_wrapper.cpp");
     println!("cargo:rerun-if-changed=components/biometrics_wrapper/include/bindings.h");
     println!("cargo:rerun-if-changed=components/biometrics_wrapper/biometrics_wrapper.h");
+    println!("cargo:rerun-if-changed=sdkconfig.defaults");
 
     // Propagate ESP-IDF build flags and linker scripts
     LinkArgs::output_propagated("ESP_IDF").expect("Failed to propagate link args");

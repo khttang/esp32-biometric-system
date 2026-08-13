@@ -10,9 +10,9 @@ rust-version = "1.90"
 name = "firmware"
 path = "src/main.rs"
 
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 # Compilation Profiles
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 [profile.release]
 opt-level = "s"         # Optimize for size (use "3" for maximum math speed if needed)
 lto = true              # Link-Time Optimization across C/C++ and Rust
@@ -22,6 +22,9 @@ panic = "abort"
 [profile.dev]
 debug = true 
 opt-level = "z"        # Optimize for size in dev to prevent binary flash overflow
+
+[profile.dev.package.firmware]
+opt-level = 3
 
 # -----------------------------------------------------------------------------
 # Dependencies
@@ -78,3 +81,4 @@ remote_component = { name = "espressif/esp_lcd_touch_gt911", version = "^1.0.0" 
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }
 bindgen = "0.72.1"
+
