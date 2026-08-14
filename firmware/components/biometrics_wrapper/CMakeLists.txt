@@ -10,6 +10,10 @@ idf_component_register(
         esp_eth 
         esp_netif
         esp_lcd
+        esp_lcd_dsi
+        esp_lcd_hx8394
+        esp_lcd_touch
+        esp_lcd_touch_gt911
         esp_hw_support 
         esp_pm 
         hal

@@ -1,9 +1,3 @@
-/*
- * SPDX-FileCopyrightText: 2024 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: Apache-2.0
- */
-
 #include "soc/soc_caps.h"
 
 #if SOC_MIPI_DSI_SUPPORTED
@@ -19,12 +13,17 @@
 #include "driver/gpio.h"
 #include "esp_lcd_hx8394.h"
 #include "esp_idf_version.h"
+#include "driver/i2c_master.h"
 
 #define HX8394_CMD_DSI_INT0 (0xBA)
 #define HX8394_DSI_1_LANE (0x60)
 #define HX8394_DSI_2_LANE (0x61)
 #define HX8394_DSI_3_LANE (0x62)
 #define HX8394_DSI_4_LANE (0x63)
+
+// Forward declarations for BSP I2C functions to prevent CMake circular dependency
+extern i2c_master_bus_handle_t bsp_i2c_get_handle(void);
+extern esp_err_t bsp_i2c_init(void);
 
 typedef struct
 {
@@ -111,6 +110,42 @@ esp_err_t esp_lcd_new_panel_hx8394(const esp_lcd_panel_io_handle_t io, const esp
     hx8394->reset_gpio_num = panel_dev_config->reset_gpio_num;
     hx8394->flags.reset_level = panel_dev_config->flags.reset_active_high;
 
+    // Retrieve active BSP i2c_master bus handle
+    i2c_master_bus_handle_t i2c0_bus = bsp_i2c_get_handle();
+    if (i2c0_bus == NULL) {
+        ESP_GOTO_ON_ERROR(bsp_i2c_init(), err, TAG, "bsp_i2c_init failed");
+        i2c0_bus = bsp_i2c_get_handle();
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = 0x45,
+        .scl_speed_hz = 100000,
+    };
+    i2c_master_dev_handle_t i2c0_device1 = NULL;
+    ESP_GOTO_ON_ERROR(i2c_master_bus_add_device(i2c0_bus, &dev_cfg, &i2c0_device1), err, TAG, "i2c add dev 0x45 failed");
+
+    uint8_t cmd[2];
+
+    cmd[0] = 0x95; cmd[1] = 0x11;
+    i2c_master_transmit(i2c0_device1, cmd, 2, 100);
+
+    cmd[0] = 0x95; cmd[1] = 0x17;
+    i2c_master_transmit(i2c0_device1, cmd, 2, 100);
+
+    cmd[0] = 0x96; cmd[1] = 0x00;
+    i2c_master_transmit(i2c0_device1, cmd, 2, 100);
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    cmd[0] = 0x96; cmd[1] = 0xFF;
+    i2c_master_transmit(i2c0_device1, cmd, 2, 100);
+
+    // Remove device instance without tearing down the underlying i2c0_bus
+    i2c_master_bus_rm_device(i2c0_device1);
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
     // Create MIPI DPI panel
     esp_lcd_panel_handle_t panel_handle = NULL;
     ESP_GOTO_ON_ERROR(esp_lcd_new_panel_dpi(vendor_config->mipi_config.dsi_bus, vendor_config->mipi_config.dpi_config, &panel_handle), err, TAG,
@@ -148,7 +183,7 @@ err:
 }
 
 static const hx8394_lcd_init_cmd_t vendor_specific_init_code_default[] = {
-    // {cmd, { data }, data_size, delay_ms}
+    //  {cmd, { data }, data_size, delay_ms}
     {0xB9, (uint8_t[]){0xFF,0x83,0x94}, 3, 0},
     {0xB1, (uint8_t[]){0x48,0x0A,0x6A,0x09,0x33,0x54,0x71,0x71,0x2E,0x45}, 10, 0},
     {0xBA, (uint8_t[]){0x61,0x03,0x68,0x6B,0xB2,0xC0}, 6, 0},
@@ -238,8 +273,6 @@ static esp_err_t panel_hx8394_init(esp_lcd_panel_t *panel)
                                                   1),
                         TAG, "send command failed");
 
-    // vendor specific initialization, it can be different between manufacturers
-    // should consult the LCD supplier for initialization sequence code
     if (hx8394->init_cmds)
     {
         init_cmds = hx8394->init_cmds;
@@ -253,7 +286,6 @@ static esp_err_t panel_hx8394_init(esp_lcd_panel_t *panel)
 
     for (int i = 0; i < init_cmds_size; i++)
     {
-        // Check if the command has been used or conflicts with the internal
         if (init_cmds[i].data_bytes > 0)
         {
             switch (init_cmds[i].cmd)
@@ -279,7 +311,6 @@ static esp_err_t panel_hx8394_init(esp_lcd_panel_t *panel)
             }
         }
 
-        // Send command
         ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(io, init_cmds[i].cmd, init_cmds[i].data, init_cmds[i].data_bytes), TAG, "send command failed");
         vTaskDelay(pdMS_TO_TICKS(init_cmds[i].delay_ms));
     }
@@ -296,7 +327,6 @@ static esp_err_t panel_hx8394_reset(esp_lcd_panel_t *panel)
     hx8394_panel_t *hx8394 = (hx8394_panel_t *)panel->user_data;
     esp_lcd_panel_io_handle_t io = hx8394->io;
 
-    // Perform hardware reset
     if (hx8394->reset_gpio_num >= 0)
     {
         gpio_set_level(hx8394->reset_gpio_num, hx8394->flags.reset_level);
@@ -305,7 +335,7 @@ static esp_err_t panel_hx8394_reset(esp_lcd_panel_t *panel)
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     else if (io)
-    { // Perform software reset
+    {
         ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(io, LCD_CMD_SWRESET, NULL, 0), TAG, "send command failed");
         vTaskDelay(pdMS_TO_TICKS(120));
     }

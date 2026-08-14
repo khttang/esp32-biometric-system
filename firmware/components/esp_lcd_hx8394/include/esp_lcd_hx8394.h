@@ -3,6 +3,11 @@
 #include <stdint.h>
 #include "soc/soc_caps.h"
 
+// Local component version definitions
+#define ESP_LCD_HX8394_VER_MAJOR 2
+#define ESP_LCD_HX8394_VER_MINOR 0
+#define ESP_LCD_HX8394_VER_PATCH 0
+
 #if SOC_MIPI_DSI_SUPPORTED
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_mipi_dsi.h"

@@ -14,17 +14,21 @@
 #include "esp_lcd_dsi.h"
 #include "esp_idf_version.h"
 
-#include "i2c_bus.h"
+#include "driver/i2c_master.h"
 
 #define DSI_CMD_GS_BIT (1 << 0)
 #define DSI_CMD_SS_BIT (1 << 1)
+
+// Forward declarations for BSP I2C functions to prevent CMake circular dependency
+extern i2c_master_bus_handle_t bsp_i2c_get_handle(void);
+extern esp_err_t bsp_i2c_init(void);
 
 typedef struct
 {
     esp_lcd_panel_io_handle_t io;
     int reset_gpio_num;
     uint8_t madctl_val; // save current value of LCD_CMD_MADCTL register
-    uint8_t colmod_val; // save surrent value of LCD_CMD_COLMOD register
+    uint8_t colmod_val; // save current value of LCD_CMD_COLMOD register
     const dsi_lcd_init_cmd_t *init_cmds;
     uint16_t init_cmds_size;
     struct
@@ -87,33 +91,43 @@ esp_err_t esp_lcd_new_panel_dsi(const esp_lcd_panel_io_handle_t io, const esp_lc
     dsi->reset_gpio_num = panel_dev_config->reset_gpio_num;
     dsi->flags.reset_level = panel_dev_config->flags.reset_active_high;
 
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = 7,
-        // .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_io_num = 8,
-        // .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 100000,
+    // Retrieve active BSP i2c_master bus handle
+    i2c_master_bus_handle_t i2c0_bus = bsp_i2c_get_handle();
+    if (i2c0_bus == NULL) {
+        ESP_GOTO_ON_ERROR(bsp_i2c_init(), err, TAG, "bsp_i2c_init failed");
+        i2c0_bus = bsp_i2c_get_handle();
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = 0x45,
+        .scl_speed_hz = 100000,
     };
+    i2c_master_dev_handle_t i2c0_device1 = NULL;
+    ESP_GOTO_ON_ERROR(i2c_master_bus_add_device(i2c0_bus, &dev_cfg, &i2c0_device1), err, TAG, "i2c add dev 0x45 failed");
 
-    i2c_bus_handle_t i2c0_bus = i2c_bus_create(I2C_NUM_1, &conf);
-    i2c_bus_device_handle_t i2c0_device1 = i2c_bus_device_create(i2c0_bus, 0x45, 0);
+    uint8_t cmd[2];
+    
+    cmd[0] = 0xc0; cmd[1] = 0x01;
+    i2c_master_transmit(i2c0_device1, cmd, 2, 100);
 
-    uint8_t data = 0x01;
-    i2c_bus_write_bytes(i2c0_device1, 0xc0, 1, &data);
-    i2c_bus_write_bytes(i2c0_device1, 0xc2, 1, &data);
-    i2c_bus_write_bytes(i2c0_device1, 0xac, 1, &data);
+    cmd[0] = 0xc2; cmd[1] = 0x01;
+    i2c_master_transmit(i2c0_device1, cmd, 2, 100);
 
-    data = 0x00;
-    i2c_bus_write_bytes(i2c0_device1, 0xab, 1, &data);
+    cmd[0] = 0xac; cmd[1] = 0x01;
+    i2c_master_transmit(i2c0_device1, cmd, 2, 100);
 
-    data = 0x01;
-    i2c_bus_write_bytes(i2c0_device1, 0xaa, 1, &data);
-//    data = 0x02;
-    i2c_bus_write_bytes(i2c0_device1, 0xad, 1, &data);
+    cmd[0] = 0xab; cmd[1] = 0x00;
+    i2c_master_transmit(i2c0_device1, cmd, 2, 100);
 
-    i2c_bus_device_delete(&i2c0_device1);
-//    i2c_bus_delete(&i2c0_bus);
+    cmd[0] = 0xaa; cmd[1] = 0x01;
+    i2c_master_transmit(i2c0_device1, cmd, 2, 100);
+
+    cmd[0] = 0xad; cmd[1] = 0x01;
+    i2c_master_transmit(i2c0_device1, cmd, 2, 100);
+
+    // Remove device instance without tearing down the underlying i2c0_bus
+    i2c_master_bus_rm_device(i2c0_device1);
 
     vTaskDelay(pdMS_TO_TICKS(1000));
 
@@ -184,17 +198,12 @@ static esp_err_t panel_dsi_init(esp_lcd_panel_t *panel)
     uint16_t init_cmds_size = 0;
     bool is_cmd_overwritten = false;
 
-    // uint8_t ID[3];
-    // ESP_RETURN_ON_ERROR(esp_lcd_panel_io_rx_param(io, 0x04, ID, 3), TAG, "read ID failed");
-
     ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(io, LCD_CMD_MADCTL, (uint8_t[]){
                                                                           dsi->madctl_val,
                                                                       },
                                                   1),
                         TAG, "send command failed");
 
-    // vendor specific initialization, it can be different between manufacturers
-    // should consult the LCD supplier for initialization sequence code
     if (dsi->init_cmds)
     {
         init_cmds = dsi->init_cmds;
@@ -208,7 +217,6 @@ static esp_err_t panel_dsi_init(esp_lcd_panel_t *panel)
 
     for (int i = 0; i < init_cmds_size; i++)
     {
-        // Check if the command has been used or conflicts with the internal
         if (init_cmds[i].data_bytes > 0)
         {
             switch (init_cmds[i].cmd)
@@ -230,7 +238,6 @@ static esp_err_t panel_dsi_init(esp_lcd_panel_t *panel)
             }
         }
 
-        // Send command
         ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(io, init_cmds[i].cmd, init_cmds[i].data, init_cmds[i].data_bytes), TAG, "send command failed");
         vTaskDelay(pdMS_TO_TICKS(init_cmds[i].delay_ms));
     }
@@ -246,7 +253,6 @@ static esp_err_t panel_dsi_reset(esp_lcd_panel_t *panel)
     dsi_panel_t *dsi = (dsi_panel_t *)panel->user_data;
     esp_lcd_panel_io_handle_t io = dsi->io;
 
-    // Perform hardware reset
     if (dsi->reset_gpio_num >= 0)
     {
         gpio_set_level(dsi->reset_gpio_num, !dsi->flags.reset_level);
@@ -257,7 +263,7 @@ static esp_err_t panel_dsi_reset(esp_lcd_panel_t *panel)
         vTaskDelay(pdMS_TO_TICKS(120));
     }
     else if (io)
-    { // Perform software reset
+    {
         ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(io, LCD_CMD_SWRESET, NULL, 0), TAG, "send command failed");
         vTaskDelay(pdMS_TO_TICKS(120));
     }
@@ -294,7 +300,6 @@ static esp_err_t panel_dsi_mirror(esp_lcd_panel_t *panel, bool mirror_x, bool mi
 
     ESP_RETURN_ON_FALSE(io, ESP_ERR_INVALID_STATE, TAG, "invalid panel IO");
 
-    // Control mirror through LCD command
     if (mirror_x)
     {
         madctl_val |= DSI_CMD_GS_BIT;

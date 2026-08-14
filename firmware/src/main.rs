@@ -29,6 +29,7 @@ use crate::biometrics::BiometricSystem;
 const WIFI_SSID: &str = "YOUR_WIFI_SSID";
 const WIFI_PASS: &str = "YOUR_WIFI_PASSWORD";
 
+/*
 fn main() -> Result<()>{
     // 1. Mandatory ESP-IDF patch linking & logger initialization
     esp_idf_svc::sys::link_patches();
@@ -68,6 +69,47 @@ fn main() -> Result<()>{
 
         // ~60 FPS loop rate
         thread::sleep(Duration::from_millis(16));
+    }
+}
+*/
+
+fn main() -> anyhow::Result<()> {
+    // 1. Initialize ESP-IDF system drivers
+    esp_idf_svc::sys::link_patches();
+    esp_idf_svc::log::EspLogger::initialize_default();
+
+    info!("Starting Display & Touch Hardware Test...");
+
+    // 2. Initialize display and touch via C++ wrapper
+    unsafe {
+        let disp_err = ffi::init_display_with_bsp();
+        if disp_err != 0 {
+            info!("Display init failed with error code: {}", disp_err);
+        } else {
+            info!("Display initialized! Drawing test pattern...");
+            ffi::p4_display_draw_test_pattern();
+        }
+
+        let touch_err = ffi::init_touch_with_bsp();
+        if touch_err != 0 {
+            info!("Touch init failed with error code: {}", touch_err);
+        } else {
+            info!("Touch controller initialized successfully!");
+        }
+    }
+
+    // 3. Poll touch coordinates at 20 Hz
+    let mut touch_data = ffi::p4_touch_data_t::default();
+    loop {
+        unsafe {
+            if ffi::p4_touch_read(&mut touch_data) {
+                info!(
+                    "Touch Detected! X: {}, Y: {}, Points: {}, Strength: {}",
+                    touch_data.x, touch_data.y, touch_data.points, touch_data.strength
+                );
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 

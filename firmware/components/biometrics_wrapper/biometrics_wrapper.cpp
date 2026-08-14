@@ -16,6 +16,7 @@
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
+#include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_check.h"
 #include "esp_cache.h"
@@ -38,6 +39,7 @@
 
 // Official Waveshare ESP32-P4-NANO BSP Headers
 #include "esp_lcd_touch.h"
+#include "esp_lcd_touch_gt911.h"
 #include "bsp/esp32_p4_nano.h"
 #include "bsp/display.h"
 #include "bsp/touch.h"
@@ -47,10 +49,8 @@
 #include "dl_tensor_base.hpp"
 
 #include "sdkconfig.h"
-#include "esp_log.h"
 #include "biometrics_wrapper.h"
 
-// Access your custom Kconfig values directly!
 #ifndef CONFIG_BIOMETRICS_CAM_WIDTH
 #define CONFIG_BIOMETRICS_CAM_WIDTH 1280
 #endif
@@ -84,8 +84,8 @@ namespace BoardPins {
         }
     }
     namespace Camera {
-        constexpr gpio_num_t SDA      = GPIO_NUM_7;  // Waveshare P4-NANO Camera I2C SDA
-        constexpr gpio_num_t SCL      = GPIO_NUM_8;  // Waveshare P4-NANO Camera I2C SCL
+        constexpr gpio_num_t SDA      = GPIO_NUM_7;  // Shared I2C0 SDA (Initialized by BSP)
+        constexpr gpio_num_t SCL      = GPIO_NUM_8;  // Shared I2C0 SCL (Initialized by BSP)
         constexpr gpio_num_t PWDN     = GPIO_NUM_5;  // Camera Power Down Pin (Active LOW)
         constexpr gpio_num_t RESET    = GPIO_NUM_6;  // Camera Reset Pin (Active LOW)
         constexpr i2c_port_num_t PORT = I2C_NUM_0;
@@ -106,6 +106,7 @@ namespace BoardAddr {
 #define TAG_FACENET "ESP_DL_FACENET"
 #define TAG_I2S     "I2S_WRAPPER"
 #define TAG_LCD     "p4_lcd"
+#define TAG_TOUCH   "p4_touch"
 
 #define CAM_BUF_COUNT 2
 #define C_LINE_SIZE 128  // ESP32-P4 L2 Cache Line Size (0x80)
@@ -114,6 +115,7 @@ namespace BoardAddr {
 static esp_lcd_panel_handle_t s_lcd_panel = NULL;
 static esp_lcd_panel_io_handle_t s_lcd_io = NULL;
 static esp_lcd_touch_handle_t s_touch_handle = NULL;
+static i2c_master_dev_handle_t s_gt911_i2c_dev = NULL;
 
 static i2s_chan_handle_t g_i2s_tx_handle = NULL;
 static i2s_chan_handle_t g_i2s_rx_handle = NULL;
@@ -125,13 +127,19 @@ static int s_video_fd = -1;
 struct v4l2_frame_buffer_t s_cam_buffers[CAM_BUF_COUNT] = {};
 static size_t s_cam_buf_lengths[CAM_BUF_COUNT] = {0};
 
+extern "C" {
+    i2c_master_bus_handle_t bsp_i2c_get_handle(void);
+    esp_err_t bsp_i2c_init(void);
+}
+
 // -----------------------------------------------------------------------------
 // Display Initialization & Helper Functions
 // -----------------------------------------------------------------------------
 static esp_err_t power_on_display_bridge_0x45(void) {
+    // Acquire the pre-initialized shared I2C0 bus handle created by Kconfig/BSP
     i2c_master_bus_handle_t bus_handle = bsp_i2c_get_handle();
     if (!bus_handle) {
-        ESP_LOGE(TAG_LCD, "BSP I2C bus handle is NULL");
+        ESP_LOGE(TAG_LCD, "Pre-initialized BSP I2C handle is NULL");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -143,7 +151,7 @@ static esp_err_t power_on_display_bridge_0x45(void) {
 
     esp_err_t err = i2c_master_bus_add_device(bus_handle, &dev_cfg, &dev_handle);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG_LCD, "Failed to register 0x45 I2C device: 0x%x", err);
+        ESP_LOGE(TAG_LCD, "Failed to register 0x45 I2C device on shared bus: 0x%x", err);
         return err;
     }
 
@@ -184,24 +192,11 @@ int32_t init_display_with_bsp(void) {
 
     ESP_LOGI(TAG_LCD, "Initializing 5-inch MIPI-DSI Display via Waveshare BSP...");
 
-    // 1. Initialize BSP primary I2C bus (I2C0, GPIO7/8)
-    esp_err_t err = bsp_i2c_init();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG_LCD, "Failed to initialize BSP I2C bus: 0x%x", err);
-        return err;
-    }
-
-    // 2. Power on display bridge IC @ 0x45
-    err = power_on_display_bridge_0x45();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG_LCD, "0x45 power sequence returned error: 0x%x (proceeding anyway)", err);
-    }
-
-    // 3. Allocate Display & Power Handles via BSP
+    // 1. Initialize display via BSP handles (uses unified bsp_i2c_get_handle internally)
     bsp_lcd_handles_t handles = {};
     bsp_display_config_t disp_cfg = {};
     
-    err = bsp_display_new_with_handles(&disp_cfg, &handles);
+    esp_err_t err = bsp_display_new_with_handles(&disp_cfg, &handles);
     if (err != ESP_OK) {
         ESP_LOGE(TAG_LCD, "Failed to create BSP display handles: 0x%x (%s)", err, esp_err_to_name(err));
         return err;
@@ -210,22 +205,14 @@ int32_t init_display_with_bsp(void) {
     s_lcd_panel = handles.panel;
     s_lcd_io = handles.io;
 
-    /* This block was added here but didn't work
-    // 1. Swap X and Y axes (transforms 720x1280 portrait panel to 1280x720 landscape)
-    esp_lcd_panel_swap_xy(s_lcd_panel, true);
+    // 2. Force Backlight Pin HIGH via GPIO 26
+    gpio_config_t bk_gpio_config = {};
+    bk_gpio_config.pin_bit_mask = (1ULL << GPIO_NUM_26);
+    bk_gpio_config.mode = GPIO_MODE_OUTPUT;
+    gpio_config(&bk_gpio_config);
+    gpio_set_level(GPIO_NUM_26, 1);
 
-    // 2. Adjust hardware mirroring for proper landscape orientation
-    // (If image appears mirrored horizontally or vertically, toggle true/false on these parameters)
-    esp_lcd_panel_mirror(s_lcd_panel, true, false);
-
-    // 3. Send configuration to panel
-    esp_lcd_panel_init(s_lcd_panel);
-    */
-
-    // 4. Turn on Backlight
-    ESP_ERROR_CHECK(bsp_display_backlight_on());
-
-    ESP_LOGI(TAG_LCD, "5-inch Display & Backlight Initialized Successfully!");
+    ESP_LOGI(TAG_LCD, "BSP Display initialized successfully!");
     return ESP_OK;
 }
 
@@ -366,13 +353,8 @@ int write_i2s_tx_c(int i2s_port, const int16_t *buffer, uint32_t sample_count, u
 }
 
 void configure_camera_exposure_gain(int fd) {
-    // 1. Enable Auto Exposure (V4L2_EXPOSURE_AUTO = 0)
     set_v4l2_control(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO, "EXPOSURE_AUTO");
-
-    // 2. Enable Auto Gain Control (AGC)
     set_v4l2_control(fd, V4L2_CID_AUTOGAIN, 1, "AUTOGAIN");
-
-    // 3. Enable Auto White Balance (AWB)
     set_v4l2_control(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1, "AUTO_WHITE_BALANCE");
 }
 
@@ -384,16 +366,15 @@ extern "C" {
 esp_cam_sensor_device_t *ov5647_detect(void *config);
 
 int32_t p4_camera_init_v4l2_default(void) {
-    // Uses the values defined in Kconfig / sdkconfig.defaults
     return p4_camera_init_v4l2(CONFIG_BIOMETRICS_CAM_WIDTH, CONFIG_BIOMETRICS_CAM_HEIGHT);
 }
 
 int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
-    if (s_video_fd >= 0) return 0; // Already initialized
+    if (s_video_fd >= 0) return 0;
 
-    ESP_LOGI(TAG_CAM, "Initializing OV5647 via esp_video (Shared I2C Bus)...");
+    ESP_LOGI(TAG_CAM, "Initializing OV5647 via esp_video (Pre-initialized I2C0 Bus)...");
 
-    // 1. Get Shared I2C Bus Handle from BSP
+    // 1. Get Shared I2C0 Bus Handle from BSP
     i2c_master_bus_handle_t shared_i2c_bus = bsp_i2c_get_handle();
     if (!shared_i2c_bus) {
         ESP_LOGE(TAG_CAM, "bsp_i2c_get_handle() returned NULL!");
@@ -409,7 +390,6 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
         return -1;
     }
 
-    // Force link of ov5647_detect so the object file is retained by linker
     (void)ov5647_detect;
 
     // 3. Configure esp_video CSI parameters with explicit BoardPins
@@ -418,8 +398,8 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
     csi_cfg.sccb_config.i2c_handle = shared_i2c_bus;
     csi_cfg.sccb_config.freq = 100000;
 
-    csi_cfg.reset_pin = static_cast<gpio_num_t>(BoardPins::Camera::RESET); // GPIO 6
-    csi_cfg.pwdn_pin  = static_cast<gpio_num_t>(BoardPins::Camera::PWDN);  // GPIO 5
+    csi_cfg.reset_pin = static_cast<gpio_num_t>(BoardPins::Camera::RESET);
+    csi_cfg.pwdn_pin  = static_cast<gpio_num_t>(BoardPins::Camera::PWDN);
     csi_cfg.dont_init_ldo = false;
 
     esp_video_init_config_t cam_cfg = {};
@@ -471,7 +451,7 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
         return -1;
     }
 
-    // 8. Map and ENQUEUE (QBUF) all allocated buffers into the CSI DMA ring
+    // 8. Map and ENQUEUE all allocated buffers into the CSI DMA ring
     for (int i = 0; i < CAM_BUF_COUNT; i++) {
         struct v4l2_buffer buf = {};
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -490,14 +470,13 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
             return -1;
         }
 
-        // QUEUE BUFFER into CSI DMA controller
         if (ioctl(s_video_fd, VIDIOC_QBUF, &buf) < 0) {
             ESP_LOGE(TAG_CAM, "Failed to qbuf (enqueue) buffer %d", i);
             return -1;
         }
     }
 
-    // 9. Start Streaming (CSI DMA now has ready buffers!)
+    // 9. Start Streaming
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(s_video_fd, VIDIOC_STREAMON, &type) < 0) {
         ESP_LOGE(TAG_CAM, "Failed to start V4L2 stream (errno %d: %s)", errno, strerror(errno));
@@ -521,14 +500,13 @@ int32_t p4_camera_capture_frame(p4_camera_frame_t *frame, uint32_t timeout_ms) {
     int ret = ioctl(s_video_fd, VIDIOC_DQBUF, &buf);
     if (ret < 0) {
         static uint32_t err_count = 0;
-        if (++err_count % 60 == 1) { // Log once every 60 attempts to prevent console flooding
+        if (++err_count % 60 == 1) {
             ESP_LOGI("CAM_DQBUF", "ioctl(VIDIOC_DQBUF) failed (ret: %d, errno: %d -> %s)", 
                      ret, errno, strerror(errno));
         }
         return (errno == EAGAIN || errno == EWOULDBLOCK) ? -2 : -1;
     }
 
-    // Success...
     frame->data = (uint8_t *)s_cam_buffers[buf.index].start;
     frame->data_len = buf.bytesused;
     frame->width = 1280;
@@ -547,7 +525,6 @@ int32_t p4_camera_release_frame(const p4_camera_frame_t *frame) {
     buf.memory = V4L2_MEMORY_MMAP;
     buf.index = frame->buffer_index;
 
-    // Return buffer to CSI DMA hardware pool
     if (ioctl(s_video_fd, VIDIOC_QBUF, &buf) < 0) {
         ESP_LOGE(TAG_CAM, "VIDIOC_QBUF failed on release for index %u", buf.index);
         return -1;
@@ -703,7 +680,6 @@ bool is_admin_button_pressed() {
 int32_t p4_display_draw_frame(const uint16_t *frame_buffer, uint16_t width, uint16_t height) {
     if (!s_lcd_panel || !frame_buffer) return ESP_ERR_INVALID_ARG;
 
-    // Push RGB565 buffer directly to MIPI-DSI display via DMA
     esp_err_t ret = esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, 0, width, height, frame_buffer);
     return (int32_t)ret;
 }
@@ -714,13 +690,9 @@ int32_t p4_display_draw_bitmap(uint16_t x_start, uint16_t y_start, uint16_t x_en
     uintptr_t addr = (uintptr_t)data;
     size_t len = (x_end - x_start) * (y_end - y_start) * sizeof(uint16_t);
 
-    // 1. Align start address down to nearest 128-byte boundary
     uintptr_t aligned_addr = addr & ~(C_LINE_SIZE - 1);
-
-    // 2. Adjust size to cover from the aligned start through the end of data
     size_t aligned_len = (addr + len - aligned_addr + C_LINE_SIZE - 1) & ~(C_LINE_SIZE - 1);
 
-    // 3. Flush aligned cache region
     esp_cache_msync((void *)aligned_addr, aligned_len, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
 
     return (int32_t)esp_lcd_panel_draw_bitmap(s_lcd_panel, x_start, y_start, x_end, y_end, data);
@@ -816,46 +788,125 @@ int32_t dl_mobilefacenet_run(const uint8_t *crop_rgb888, float *out_embedding, s
     }
 }
 
-int32_t init_touch_with_bsp(void) {
-    if (s_touch_handle != NULL) return ESP_OK;
+// -----------------------------------------------------------------------------
+// Touch Subsystem Entry Points
+// -----------------------------------------------------------------------------
 
-    ESP_LOGI(TAG_LCD, "Initializing GT911 Touch Controller via Waveshare BSP...");
+static uint8_t g_gt911_addr = 0x5D;
+static i2c_master_dev_handle_t s_gt911_dev_handle = NULL;
 
-    esp_err_t err = bsp_i2c_init();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG_LCD, "Failed to initialize I2C for touch: 0x%x", err);
-        return err;
+esp_err_t power_on_bridge_legacy(i2c_port_t port)
+{
+    i2c_master_bus_handle_t bus_handle = bsp_i2c_get_handle();
+    if (bus_handle == NULL) {
+        bsp_i2c_init();
+        bus_handle = bsp_i2c_get_handle();
+    }
+    if (bus_handle == NULL) {
+        return ESP_FAIL;
     }
 
-    err = bsp_touch_new(NULL, &s_touch_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG_LCD, "Failed to initialize touch handle: 0x%x", err);
-        return err;
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = 0x45,
+        .scl_speed_hz = 100000,
+    };
+    i2c_master_dev_handle_t dev_handle = NULL;
+    esp_err_t ret = i2c_master_bus_add_device(bus_handle, &dev_cfg, &dev_handle);
+    if (ret != ESP_OK) {
+        return ret;
     }
 
-    ESP_LOGI(TAG_LCD, "Touch Controller Initialized Successfully!");
+    uint8_t cmd1[2] = {0x95, 0x11};
+    i2c_master_transmit(dev_handle, cmd1, 2, 100);
+
+    uint8_t cmd2[2] = {0x95, 0x17};
+    i2c_master_transmit(dev_handle, cmd2, 2, 100);
+
+    uint8_t cmd3[2] = {0x96, 0x00};
+    i2c_master_transmit(dev_handle, cmd3, 2, 100);
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    uint8_t cmd4[2] = {0x96, 0xFF};
+    i2c_master_transmit(dev_handle, cmd4, 2, 100);
+
+    i2c_master_bus_rm_device(dev_handle);
     return ESP_OK;
 }
 
-bool p4_touch_read(p4_touch_data_t *touch_data) {
-    if (!s_touch_handle || !touch_data) return false;
+int32_t init_touch_with_bsp(void) {
+    i2c_master_bus_handle_t bus_handle = bsp_i2c_get_handle();
+    if (bus_handle == NULL) {
+        bsp_i2c_init();
+        bus_handle = bsp_i2c_get_handle();
+    }
+    if (bus_handle == NULL) {
+        ESP_LOGE(TAG_TOUCH, "Failed to obtain BSP I2C master bus handle");
+        return ESP_FAIL;
+    }
 
-    esp_lcd_touch_read_data(s_touch_handle);
+    // Configure GT911 device on BSP's I2C bus
+    if (s_gt911_dev_handle == NULL) {
+        i2c_device_config_t dev_cfg = {};
+        dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+        dev_cfg.device_address = g_gt911_addr;
+        dev_cfg.scl_speed_hz = 100000;
 
-    uint16_t x[1] = {0};
-    uint16_t y[1] = {0};
-    uint16_t strength[1] = {0};
-    uint8_t point_num = 0;
+        esp_err_t err = i2c_master_bus_add_device(bus_handle, &dev_cfg, &s_gt911_dev_handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_TOUCH, "Failed to add GT911 device to master bus: 0x%x", err);
+            return err;
+        }
+    }
 
-    bool touched = esp_lcd_touch_get_coordinates(s_touch_handle, x, y, strength, &point_num, 1);
+    // Read product ID from register 0x8140
+    uint8_t test_reg[2] = {0x81, 0x40};
+    uint8_t product_id[4] = {0};
+    esp_err_t err = i2c_master_transmit_receive(s_gt911_dev_handle, test_reg, 2, product_id, 4, 100);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG_TOUCH, "GT911 Touch detected! Product ID: %.4s", product_id);
+        return ESP_OK;
+    } else {
+        ESP_LOGE(TAG_TOUCH, "GT911 Touch probe failed at address 0x%02X: 0x%x", g_gt911_addr, err);
+        return err;
+    }
+}
 
-    touch_data->touched = touched && (point_num > 0);
-    touch_data->x = x[0];
-    touch_data->y = y[0];
-    touch_data->strength = strength[0];
-    touch_data->points = point_num;
+bool p4_touch_read(p4_touch_data_t *data) {
+    if (data == NULL || s_gt911_dev_handle == NULL) {
+        return false;
+    }
 
-    return touch_data->touched;
+    // Read GT911 touch status and coordinates (Reg 0x814E, length 7 bytes)
+    uint8_t reg_addr[2] = {0x81, 0x4E};
+    uint8_t touch_buf[7] = {0};
+
+    esp_err_t err = i2c_master_transmit_receive(s_gt911_dev_handle, reg_addr, 2, touch_buf, sizeof(touch_buf), 50);
+    uint8_t clear_cmd[3] = {0x81, 0x4E, 0x00};
+
+    if (err != ESP_OK) {
+        i2c_master_transmit(s_gt911_dev_handle, clear_cmd, 3, 20);
+        return false;
+    }
+
+    uint8_t touch_status = touch_buf[0];
+    uint8_t touch_num = touch_status & 0x0F;
+
+    if ((touch_status & 0x80) && touch_num > 0) {
+        data->x = touch_buf[2] | (touch_buf[3] << 8);
+        data->y = touch_buf[4] | (touch_buf[5] << 8);
+        data->touched = true;
+
+        // Clear status register
+        i2c_master_transmit(s_gt911_dev_handle, clear_cmd, 3, 20);
+        return true;
+    }
+
+    // Clear buffer ready bit when no touches detected
+    i2c_master_transmit(s_gt911_dev_handle, clear_cmd, 3, 20);
+    data->touched = false;
+    return false;
 }
 
 } // extern "C"
