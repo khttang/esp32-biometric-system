@@ -72,6 +72,20 @@ impl Default for P4CameraFrame {
         }
     }
 }
+impl P4CameraFrame {
+    pub fn as_slice(&self) -> Option<&[u16]> {
+        if self.data.is_null() || self.data_len == 0 {
+            return None;
+        }
+        let pixel_count = (self.width as usize) * (self.height as usize);
+        unsafe {
+            Some(std::slice::from_raw_parts(
+                self.data as *const u16,
+                pixel_count,
+            ))
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -94,6 +108,7 @@ mod ffi {
         pub fn p4_eth_is_link_up() -> bool;
         pub fn p4_hardware_init_all(config: *const P4HardwareConfig) -> i32;
         pub fn p4_camera_capture_frame(frame: *mut P4CameraFrame, timeout_ms: u32) -> i32;
+        pub fn p4_camera_release_frame(frame: *const P4CameraFrame) -> i32;
         pub fn p4_perform_ota_update(url: *const libc::c_char) -> esp_err_t;
         pub fn p4_mark_app_valid();
         pub fn dl_mobilefacenet_init(model_buf: *const u8, model_size: usize) -> i32;
@@ -141,8 +156,10 @@ pub struct SystemResources {
     pub pending_template_download: bool,
 
     // Zero-copy camera metadata struct passed to C
-    raw_frame: P4CameraFrame,
+    pub raw_frame: P4CameraFrame,
     frame_valid: bool,
+
+    pub fail_count: u32,
 }
 
 impl SystemResources {
@@ -182,6 +199,7 @@ impl SystemResources {
             pending_template_download: false,
             raw_frame: P4CameraFrame::default(),
             frame_valid: false,
+            fail_count: 0,
         })
     }
 
@@ -243,7 +261,6 @@ impl SystemResources {
     /// `&mut self` borrow ENDS instantly upon return.
     pub fn capture_camera_frame(&mut self) -> bool {
         let ret = unsafe { ffi::p4_camera_capture_frame(&mut self.raw_frame, 100) };
-
         if ret == 0 && !self.raw_frame.data.is_null() {
             self.frame_valid = true;
             true
@@ -253,8 +270,17 @@ impl SystemResources {
         }
     }
 
+    pub fn release_camera_frame(&mut self) {
+        if self.frame_valid {
+            unsafe {
+                ffi::p4_camera_release_frame(&self.raw_frame);
+            }
+            self.frame_valid = false;
+        }
+    }
+
     /// Converts the C PSRAM pointer into a safe, immutable RGB565 Rust slice (&[u16]).
-    pub fn camera_frame<'a>(&self) -> Option<&'a[u16]> {
+    pub fn camera_frame(&self) -> Option<&[u16]> {
         if !self.frame_valid || self.raw_frame.data.is_null() {
             return None;
         }
@@ -263,10 +289,7 @@ impl SystemResources {
         
         // Safety: Pointer is guaranteed non-null and valid for `pixel_count` u16 elements by C driver
         unsafe {
-            Some(std::slice::from_raw_parts(
-                self.raw_frame.data as *const u16,
-                pixel_count,
-            ))
+            Some(std::slice::from_raw_parts(self.raw_frame.data as *const u16,pixel_count))
         }
     }
 
@@ -378,44 +401,6 @@ impl SystemResources {
         Ok(())
     }
 
-/// Crops a face region from the raw RGB565 camera frame and resizes it to 112x112 RGB888 for ESP-DL
-    pub fn crop_face_112x112(&self, frame_rgb565: &[u16], face: &FaceBox) -> Option<Vec<u8>> {
-        let frame_w = 1280;
-        let frame_h = 720;
-
-        let bx = (face.x as usize).min(frame_w - 1);
-        let by = (face.y as usize).min(frame_h - 1);
-        let bw = (face.width as usize).min(frame_w - bx);
-        let bh = (face.height as usize).min(frame_h - by);
-
-        if bw == 0 || bh == 0 {
-            return None;
-        }
-
-        let mut crop_rgb888 = vec![0u8; 112 * 112 * 3];
-
-        // Nearest-neighbor crop and RGB565 -> RGB888 conversion
-        for dy in 0..112 {
-            let sy = by + (dy * bh) / 112;
-            for dx in 0..112 {
-                let sx = bx + (dx * bw) / 112;
-                let pixel_565 = frame_rgb565[sy * frame_w + sx];
-
-                // Extract RGB channels
-                let r = (((pixel_565 >> 11) & 0x1F) as u8) << 3;
-                let g = (((pixel_565 >> 5) & 0x3F) as u8) << 2;
-                let b = ((pixel_565 & 0x1F) as u8) << 3;
-
-                let out_idx = (dy * 112 + dx) * 3;
-                crop_rgb888[out_idx] = r;
-                crop_rgb888[out_idx + 1] = g;
-                crop_rgb888[out_idx + 2] = b;
-            }
-        }
-
-        Some(crop_rgb888)
-    }
-
     pub fn extract_face_embedding(&self, face_crop_112x112: &[u8]) -> anyhow::Result<[f32; 512]> {
         if face_crop_112x112.len() != 112 * 112 * 3 {
             anyhow::bail!("Invalid face crop frame size");
@@ -493,4 +478,40 @@ pub fn test_camera_capture() {
     } else {
         error!("Camera capture failed with error code: {}", ret);
     }
+}
+
+/// Crops a face region from the raw RGB565 camera frame and resizes it to 112x112 RGB888 for ESP-DL
+pub fn crop_face_112x112(frame_rgb565: &[u16], frame_w: usize, frame_h: usize, face: &FaceBox) -> Option<Vec<u8>> {
+
+    let bx = (face.x as usize).min(frame_w - 1);
+    let by = (face.y as usize).min(frame_h - 1);
+    let bw = (face.width as usize).min(frame_w - bx);
+    let bh = (face.height as usize).min(frame_h - by);
+    
+    if bw == 0 || bh == 0 {
+        return None;
+    }
+
+    let mut crop_rgb888 = vec![0u8; 112 * 112 * 3];
+
+    // Nearest-neighbor crop and RGB565 -> RGB888 conversion
+    for dy in 0..112 {
+        let sy = by + (dy * bh) / 112;
+        for dx in 0..112 {
+            let sx = bx + (dx * bw) / 112;
+            let pixel_565 = frame_rgb565[sy * frame_w + sx];
+
+            // Extract RGB channels
+            let r = (((pixel_565 >> 11) & 0x1F) as u8) << 3;
+            let g = (((pixel_565 >> 5) & 0x3F) as u8) << 2;
+            let b = ((pixel_565 & 0x1F) as u8) << 3;
+
+            let out_idx = (dy * 112 + dx) * 3;
+            crop_rgb888[out_idx] = r;
+            crop_rgb888[out_idx + 1] = g;
+            crop_rgb888[out_idx + 2] = b;
+        }
+    }
+
+    Some(crop_rgb888)
 }

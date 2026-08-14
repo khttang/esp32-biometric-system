@@ -6,8 +6,7 @@ use serde::{Deserialize, Serialize};
 use log::{error, info, warn};
 use std::time::{Duration, Instant};
 
-use crate::system::SystemResources;
-use crate::video::FaceBox;
+use crate::system::{ SystemResources, crop_face_112x112 };
 
 const INACTIVITY_TIMEOUT_SECS: u64 = 180; // 3 minutes idle -> Deep Sleep
 const FACE_EMBEDDING_DIM: usize = 512;
@@ -85,17 +84,22 @@ impl BiometricSystem {
 
                 // B. Capture frame and detect faces using SystemResources
                 if resources.capture_camera_frame() {
-                    if let Some(frame_slice) = resources.camera_frame() {
+                    resources.fail_count = 0;
+                    if let Some(frame_slice) = resources.raw_frame.as_slice() {
                         let detected_faces = resources.detect_faces(frame_slice);
 
                         // Render 640x360 camera preview on the left half of the display
-                        let _ = resources.video_pipeline.render_camera_half(frame_slice, &detected_faces);
+                        let render_res = resources.video_pipeline.render_camera_half(frame_slice, &detected_faces);
+                        if let Err(err_code) = render_res {
+                            error!("[DISPLAY_ERROR] render_camera_half returned error code: {}", err_code);
+                        }
 
                         if !detected_faces.is_empty() {
                             self.last_activity_time = now;
 
                             // 1. Crop face box to 112x112 RGB888 buffer
-                            if let Some(crop_112x112) = resources.crop_face_112x112(frame_slice, &detected_faces[0]) {
+                            if let Some(crop_112x112) = crate::system::crop_face_112x112(
+                                frame_slice, resources.raw_frame.width as usize, resources.raw_frame.height as usize, &detected_faces[0]) {
                                 if let Ok(live_embedding) = resources.extract_face_embedding(&crop_112x112) {
                                     let members_guard = resources.group_members.load();
                                     if let Some(matched_member) = self.try_match_biometrics(&live_embedding, &members_guard) {
@@ -108,8 +112,14 @@ impl BiometricSystem {
                             }
                         }
                     }
+                    resources.release_camera_frame();
+                } else {
+                    // Log if capture returns false
+                    resources.fail_count += 1;
+                    if resources.fail_count % 120 == 0 {
+                        info!("[CAM_DEBUG] capture_camera_frame() returned false {} times!", resources.fail_count);
+                    }
                 }
-
 
                 // D. 180s Inactivity Timeout -> Deep Sleep
                 if now.duration_since(self.last_activity_time) >= Duration::from_secs(INACTIVITY_TIMEOUT_SECS) {

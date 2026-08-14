@@ -108,6 +108,7 @@ namespace BoardAddr {
 #define TAG_LCD     "p4_lcd"
 
 #define CAM_BUF_COUNT 2
+#define C_LINE_SIZE 128  // ESP32-P4 L2 Cache Line Size (0x80)
 
 // Global Hardware Handles
 static esp_lcd_panel_handle_t s_lcd_panel = NULL;
@@ -121,9 +122,7 @@ static bool s_hardware_initialized = false;
 static dl::Model *g_mobilefacenet_model = NULL;
 
 static int s_video_fd = -1;
-static struct v4l2_frame_buffer_t s_v4l2_buffers[2] = {};
-static bool s_buffers_mapped = false;
-static void *s_cam_buffers[CAM_BUF_COUNT] = {NULL};
+struct v4l2_frame_buffer_t s_cam_buffers[CAM_BUF_COUNT] = {};
 static size_t s_cam_buf_lengths[CAM_BUF_COUNT] = {0};
 
 // -----------------------------------------------------------------------------
@@ -167,6 +166,19 @@ static esp_err_t power_on_display_bridge_0x45(void) {
     return ESP_OK;
 }
 
+// Helper to apply V4L2 controls
+static void set_v4l2_control(int fd, uint32_t id, int32_t value, const char *name) {
+    struct v4l2_control ctrl = {};
+    ctrl.id = id;
+    ctrl.value = value;
+    if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0) {
+        ESP_LOGW(TAG_CAM, "Failed to set V4L2 ctrl %s (0x%08" PRIx32 "): errno %d (%s)", 
+                 name, id, errno, strerror(errno));
+    } else {
+        ESP_LOGI(TAG_CAM, "V4L2 Ctrl %s set to %" PRId32, name, value);
+    }
+}
+
 int32_t init_display_with_bsp(void) {
     if (s_lcd_panel != NULL) return ESP_OK;
 
@@ -197,6 +209,18 @@ int32_t init_display_with_bsp(void) {
 
     s_lcd_panel = handles.panel;
     s_lcd_io = handles.io;
+
+    /* This block was added here but didn't work
+    // 1. Swap X and Y axes (transforms 720x1280 portrait panel to 1280x720 landscape)
+    esp_lcd_panel_swap_xy(s_lcd_panel, true);
+
+    // 2. Adjust hardware mirroring for proper landscape orientation
+    // (If image appears mirrored horizontally or vertically, toggle true/false on these parameters)
+    esp_lcd_panel_mirror(s_lcd_panel, true, false);
+
+    // 3. Send configuration to panel
+    esp_lcd_panel_init(s_lcd_panel);
+    */
 
     // 4. Turn on Backlight
     ESP_ERROR_CHECK(bsp_display_backlight_on());
@@ -341,6 +365,17 @@ int write_i2s_tx_c(int i2s_port, const int16_t *buffer, uint32_t sample_count, u
     return (int)ret;
 }
 
+void configure_camera_exposure_gain(int fd) {
+    // 1. Enable Auto Exposure (V4L2_EXPOSURE_AUTO = 0)
+    set_v4l2_control(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO, "EXPOSURE_AUTO");
+
+    // 2. Enable Auto Gain Control (AGC)
+    set_v4l2_control(fd, V4L2_CID_AUTOGAIN, 1, "AUTOGAIN");
+
+    // 3. Enable Auto White Balance (AWB)
+    set_v4l2_control(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1, "AUTO_WHITE_BALANCE");
+}
+
 // -----------------------------------------------------------------------------
 // Public Rust FFI Exports
 // -----------------------------------------------------------------------------
@@ -398,7 +433,7 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
     }
 
     // 5. Open V4L2 Character Device
-    s_video_fd = open("/dev/video0", O_RDWR);
+    s_video_fd = open("/dev/video0", O_RDWR|O_NONBLOCK);
     if (s_video_fd < 0) {
         ESP_LOGE(TAG_CAM, "Failed to open /dev/video0 (errno %d: %s)", errno, strerror(errno));
         return -1;
@@ -421,6 +456,8 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
         s_video_fd = -1;
         return -1;
     }
+
+    configure_camera_exposure_gain(s_video_fd);
 
     // 7. Request MMAP Buffers
     struct v4l2_requestbuffers req = {};
@@ -447,8 +484,8 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
         }
 
         s_cam_buf_lengths[i] = buf.length;
-        s_cam_buffers[i] = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, s_video_fd, buf.m.offset);
-        if (s_cam_buffers[i] == MAP_FAILED) {
+        s_cam_buffers[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, s_video_fd, buf.m.offset);
+        if (s_cam_buffers[i].start == MAP_FAILED) {
             ESP_LOGE(TAG_CAM, "Failed to mmap buffer %d", i);
             return -1;
         }
@@ -475,28 +512,29 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
 }
 
 int32_t p4_camera_capture_frame(p4_camera_frame_t *frame, uint32_t timeout_ms) {
-    if (s_video_fd < 0 || !frame) {
-        return -1;
-    }
+    if (s_video_fd < 0 || !frame) return -1;
 
-    // 1. Dequeue completed frame buffer from hardware ISP queue
     struct v4l2_buffer buf = {};
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
 
-    if (ioctl(s_video_fd, VIDIOC_DQBUF, &buf) < 0) {
-        // -2 signals "no frame ready yet / timeout" to Rust biometrics worker
-        return -2;
+    int ret = ioctl(s_video_fd, VIDIOC_DQBUF, &buf);
+    if (ret < 0) {
+        static uint32_t err_count = 0;
+        if (++err_count % 60 == 1) { // Log once every 60 attempts to prevent console flooding
+            ESP_LOGI("CAM_DQBUF", "ioctl(VIDIOC_DQBUF) failed (ret: %d, errno: %d -> %s)", 
+                     ret, errno, strerror(errno));
+        }
+        return (errno == EAGAIN || errno == EWOULDBLOCK) ? -2 : -1;
     }
 
-    // 2. Populate frame struct for Rust FFI (MobileFaceNet / ESP-DL)
-    frame->data = (uint8_t *)s_v4l2_buffers[buf.index].start;
+    // Success...
+    frame->data = (uint8_t *)s_cam_buffers[buf.index].start;
     frame->data_len = buf.bytesused;
-    frame->width = 1280;   // Matches active OV5647 format
-    frame->height = 960;   // Matches active OV5647 format
-    frame->buffer_index = buf.index; // Stored so release function can re-QBUF
-
-    return 0; // Success
+    frame->width = 1280;
+    frame->height = 960;
+    frame->buffer_index = buf.index;
+    return 0;
 }
 
 int32_t p4_camera_release_frame(const p4_camera_frame_t *frame) {
@@ -672,7 +710,19 @@ int32_t p4_display_draw_frame(const uint16_t *frame_buffer, uint16_t width, uint
 
 int32_t p4_display_draw_bitmap(uint16_t x_start, uint16_t y_start, uint16_t x_end, uint16_t y_end, const uint16_t *data) {
     if (!s_lcd_panel || !data) return -1;
-    // Direct DMA transfer to LCD controller
+
+    uintptr_t addr = (uintptr_t)data;
+    size_t len = (x_end - x_start) * (y_end - y_start) * sizeof(uint16_t);
+
+    // 1. Align start address down to nearest 128-byte boundary
+    uintptr_t aligned_addr = addr & ~(C_LINE_SIZE - 1);
+
+    // 2. Adjust size to cover from the aligned start through the end of data
+    size_t aligned_len = (addr + len - aligned_addr + C_LINE_SIZE - 1) & ~(C_LINE_SIZE - 1);
+
+    // 3. Flush aligned cache region
+    esp_cache_msync((void *)aligned_addr, aligned_len, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
     return (int32_t)esp_lcd_panel_draw_bitmap(s_lcd_panel, x_start, y_start, x_end, y_end, data);
 }
 

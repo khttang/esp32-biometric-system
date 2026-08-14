@@ -29,56 +29,116 @@ pub struct VideoPipeline {
 }
 
 impl VideoPipeline {
+    /*     Region       X Bounds         Y Bounds    Width x Height
+     *     Left Half    0 - 640          180 - 540   640 x 360
+     *    Right Half    640 - 1280       0 - 720     640 x 720
+     */
     pub fn new(dst_width: usize, dst_height: usize) -> Self {
-        let buffer_size = dst_width * dst_height;
-        info!("Allocating {} KB preview buffer in Rust...", (buffer_size * 2) / 1024);
-
         Self {
-            scaled_buffer: vec![0u16; buffer_size],
             dst_width,
             dst_height,
+            scaled_buffer: vec![0u8; dst_width * dst_height * 2] // 640x360 RGB565
+                .chunks_exact(2)
+                .map(|_| 0u16)
+                .collect(),
         }
     }
 
     /// Processes a raw 1280x720 RGB565 frame, downsamples it to 640x360,
     /// overlays bounding boxes, and blits to the left half of the display.
     pub fn render_camera_half(&mut self, src_raw: &[u16], faces: &[FaceBox]) -> Result<(), i32> {
-        // 1. Fast 2x Nearest-Neighbor Downsample in Rust
-        self.downsample_2x(src_raw, 1280);
+        // 1. Rotate & scale to 640x360 landscape buffer
+        self.rotate_90_cw(src_raw, 1280);
 
-        // 2. Draw Green Bounding Boxes directly in the Rust buffer
+        // 2. Draw face bounding boxes
         for face in faces {
-            self.draw_bounding_box(face, 0x07E0, 2); // Bright Green in RGB565
+            self.draw_bounding_box(face, 0x07E0, 2);
         }
 
-        // 3. Send final frame to display via thin C++ FFI
-        // Blit to Left Half centered vertically: X: 0..640, Y: 180..540
+        // 3. Blit to entire left half (X: 0..640, Y: 180..540)
         let res = unsafe {
             p4_display_draw_bitmap(
-                0,
-                180,
-                self.dst_width as u16,
-                (180 + self.dst_height) as u16,
+                0,    // x_start (left edge of screen)
+                180,  // y_start (centered vertically)
+                640,  // x_end   (midpoint of 1280 screen)
+                540,  // y_end   (180 + 360)
                 self.scaled_buffer.as_ptr(),
             )
         };
 
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(res)
+        if res == 0 { Ok(()) } else { Err(res) }
+    }
+
+    /// Rotates 1280x960 camera frame 90 deg CW into a 640x360 landscape buffer
+    pub fn rotate_90_cw(&mut self, src_raw: &[u16], src_stride: usize) {
+        let dst_w = 640; // Horizontal Width
+        let dst_h = 360; // Vertical Height
+
+        // Center crop 540 pixels out of 1280 camera width: (1280 - 540) / 2 = 370
+        let x_center_offset = 370;
+
+        for dy in 0..dst_h {
+            // Destination Y (0..360) maps to Camera X (370..910)
+            let sx = x_center_offset + ((dy * 3) >> 1);
+            let dst_row = dy * dst_w;
+
+            for dx in 0..dst_w {
+                // Destination X (0..640) maps to Camera Y (959..0)
+                let sy = 959 - ((dx * 3) >> 1);
+
+                self.scaled_buffer[dst_row + dx] = src_raw[(sy * src_stride) + sx];
+            }
         }
     }
 
-    /// Fast 2x Downscaler (1280x720 -> 640x360) using slice iteration
-    fn downsample_2x(&mut self, src: &[u16], src_stride: usize) {
-        for y in 0..self.dst_height {
-            let src_y = y * 2;
-            let src_row = &src[src_y * src_stride..(src_y + 1) * src_stride];
-            let dst_row = &mut self.scaled_buffer[y * self.dst_width..(y + 1) * self.dst_width];
+    /// Downsamples 1280x960 camera frame to 640x360 for Left Half Display
+    pub fn downsample_2x(&mut self, src_raw: &[u16], src_stride: usize) {
+        let dst_w = 640;
+        let dst_h = 360;
 
-            for x in 0..self.dst_width {
-                dst_row[x] = src_row[x * 2];
+        // Center crop vertically: start reading at row 120 to extract a 1280x720 region from 1280x960
+        let y_start_offset = 120;
+
+        for dy in 0..dst_h {
+            let sy = y_start_offset + (dy * 2);
+            let src_row = sy * src_stride;
+            let dst_row = dy * dst_w;
+
+            for dx in 0..dst_w {
+                let sx = dx * 2;
+                
+                // Sample pixel directly (1280 -> 640)
+                let pixel = src_raw[src_row + sx];
+
+                // Remove .swap_bytes() first to test native endianness.
+                // If static disappears but colors are inverted (blue skin), change to: pixel.swap_bytes()
+                self.scaled_buffer[dst_row + dx] = pixel;
+            }
+        }
+    }
+
+    /// Downsamples and rotates raw 1280x960 camera frame 90 degrees CW into a 640x360 landscape viewport
+    pub fn downsample_and_rotate_90_cw(&mut self, src_raw: &[u16], src_stride: usize) {
+        let dst_w = 640;
+        let dst_h = 360;
+
+        // Center crop raw camera width from 1280 down to 720 (280..1000)
+        let x_center_offset = 280; 
+
+        for dy in 0..dst_h {
+            // Map destination Y (0..360) to raw camera X (280..1000)
+            let sx = x_center_offset + (dy * 2);
+            let dst_row_offset = dy * dst_w;
+
+            for dx in 0..dst_w {
+                // Map destination X (0..640) to raw camera Y (0..960) with 1.5x scale
+                let sy = (dx * 3) >> 1; // Integer equivalent of (dx * 1.5)
+                
+                let src_idx = (sy * src_stride) + sx;
+                let pixel = src_raw[src_idx];
+
+                // If colors look inverted (e.g. blue skin), swap endianness: pixel.swap_bytes()
+                self.scaled_buffer[dst_row_offset + dx] = pixel;
             }
         }
     }
