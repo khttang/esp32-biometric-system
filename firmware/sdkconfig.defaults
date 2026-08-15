@@ -19,6 +19,7 @@ CONFIG_IDF_TARGET_ESP32P4=y
 # 3. External RAM (PSRAM) Configuration (32MB @ 200MHz)
 # =============================================================================
 CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_SPEED_200M=y
 CONFIG_SPIRAM_USE_MALLOC=y

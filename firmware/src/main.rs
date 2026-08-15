@@ -73,21 +73,24 @@ fn main() -> Result<()>{
 }
 */
 
+extern "C" {
+    fn init_display_system() -> i32;
+}
+
 fn main() -> anyhow::Result<()> {
     // 1. Initialize ESP-IDF system drivers
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
     info!("Starting Display & Touch Hardware Test...");
-
+    
     // 2. Initialize display and touch via C++ wrapper
     unsafe {
-        let disp_err = ffi::init_display_with_bsp();
+        let disp_err = ffi::init_display_system();
         if disp_err != 0 {
             info!("Display init failed with error code: {}", disp_err);
         } else {
-            info!("Display initialized! Drawing test pattern...");
-            ffi::p4_display_draw_test_pattern();
+            info!("Display initialized!");
         }
 
         let touch_err = ffi::init_touch_with_bsp();

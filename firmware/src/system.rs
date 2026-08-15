@@ -111,6 +111,8 @@ mod ffi {
         pub fn p4_camera_release_frame(frame: *const P4CameraFrame) -> i32;
         pub fn p4_perform_ota_update(url: *const libc::c_char) -> esp_err_t;
         pub fn p4_mark_app_valid();
+        pub fn init_display_system() -> i32;
+        pub fn init_display_with_bsp() -> i32;
         pub fn dl_mobilefacenet_init(model_buf: *const u8, model_size: usize) -> i32;
         pub fn dl_mobilefacenet_run(crop_rgb888: *const u8, out_embedding: *mut f32, embedding_len: usize) -> i32;
         pub fn init_touch_with_bsp() -> i32;

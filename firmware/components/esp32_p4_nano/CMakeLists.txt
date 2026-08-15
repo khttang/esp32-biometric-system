@@ -14,7 +14,7 @@ idf_component_register(
     SRCS "esp32_p4_nano.c"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "priv_include"
-    REQUIRES ${REQ} fatfs esp_codec_dev
+    REQUIRES ${REQ} fatfs esp_codec_dev lvgl esp_lvgl_port
     PRIV_REQUIRES ${PRIV_REQ} esp_lcd esp_lcd_dsi esp_lcd_hx8394 esp_lcd_touch esp_lcd_touch_gt911 spiffs esp_psram hal
 )
 

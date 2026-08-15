@@ -17,6 +17,8 @@ idf_component_register(
         esp_hw_support 
         esp_pm 
         hal
+        lvgl
         esp32_p4_nano
         esp_video
+
 )
