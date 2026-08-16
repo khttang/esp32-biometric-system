@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::gpio::*;
+use esp_idf_svc::hal::gpio::{Gpio0, Input, PinDriver, Pull};
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection, Method};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -125,14 +125,6 @@ pub struct EthernetSession {
     pub ip_address: Option<String>,
 }
 
-pub struct HardwareTriggers {
-    pub admin_button_pressed: AtomicBool,
-}
-
-pub struct HardwarePins {
-    pub int_pin: Gpio0<'static>,
-}
-
 /// Lifetime-free system resources container
 pub struct SystemResources {
     pub nvs: EspDefaultNvsPartition,
@@ -142,7 +134,7 @@ pub struct SystemResources {
     pub model_size: usize,
     pub model_weights: Option<Vec<u8>>,
     pub video_pipeline: VideoPipeline,
-    pins: Option<HardwarePins>,
+    pub admin_button: PinDriver<'static, Input>,
 
     // Inactivity watchdog timer handle
     pub inactivity_timer: InactivityTimer,
@@ -163,30 +155,83 @@ pub struct SystemResources {
     pub fail_count: u32,
 }
 
-impl SystemResources {
+pub struct SystemResourcesBuilder {
+    peripherals: Peripherals,
+}
+
+impl SystemResourcesBuilder {
     pub fn new() -> Result<Self> {
-        let nvs = EspDefaultNvsPartition::take()
-            .context("SystemResources Failed to take default NVS partition")?;
-        let event_loop = EspSystemEventLoop::take()
-            .context("SystemResources Failed to take system event loop")?;
-        let timer_service = EspTaskTimerService::new()
-            .context("SystemResources Failed to create task timer service")?;
         let peripherals = Peripherals::take()
             .context("SystemResources Failed to take ESP32-P4 peripherals")?;
+        Ok(Self { peripherals })
+    }
 
+    pub fn build(self) -> Result<SystemResources> {
+        // 1. Base Service Handlers
+        let nvs = EspDefaultNvsPartition::take()
+            .context("[SystemResources] Failed to take default NVS partition")?;
+        let event_loop = EspSystemEventLoop::take()
+            .context("[SystemResources] Failed to take system event loop")?;
+        let timer_service = EspTaskTimerService::new()
+            .context("[SystemResources] Failed to create task timer service")?;
+
+        // 2. Audio Subsystem & Worker
+        init_audio_subsystem()
+            .context("[SystemResources] initializes audio system")?;
+        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<Vec<i16>>();
+        crate::audio_worker::spawn_audio_capture_thread(0, audio_tx);
         let hdmi_player = HdmiAudioPlayer::new(0);
-        let pins = HardwarePins { int_pin: peripherals.pins.gpio0 };
+
+        // 3. P4 EMAC Ethernet
+        let eth_err = unsafe { ffi::init_p4_ethernet() };
+        if eth_err != 0 {
+            bail!("[SystemResources] Ethernet Init Failed: {}", eth_err);
+        }
+
+        // 4. Unified BSP Board Hardware (Display, Camera, I2C, Power)
+        let config = P4HardwareConfig {
+            display_width: 1280,
+            display_height: 720,
+            camera_width: 1280,
+            camera_height: 720,
+        };
+        let init_ret = unsafe { ffi::p4_hardware_init_all(&config) };
+        if init_ret != 0 {
+            bail!("[SystemResources] p4_hardware_init_all failed: {}", init_ret);
+        }
+
+        // 5. Admin Button (Pure Rust PinDriver on GPIO0)
+        let admin_button = PinDriver::input(self.peripherals.pins.gpio0, Pull::Up)
+            .context("[SystemResources] Failed to configure GPIO0 as admin button input")?;
+
+        // 6. Inactivity Watchdog
+        let inactivity_timer = InactivityTimer::new();
+        crate::power::spawn_inactivity_watchdog(
+            inactivity_timer.clone(),
+            INACTIVITY_TIMEOUT_SECS,
+            GT911_INT_LP_GPIO,
+            ADMIN_BUTTON_LP_GPIO,
+        );
+        info!("[SystemResources] Power Inactivity watchdog active (Timeout: {}s)", INACTIVITY_TIMEOUT_SECS);
+
+        // 7. Neural Model Setup
         let model_ptr = MODEL_WEIGHTS.0.as_ptr();
         let model_size = MODEL_WEIGHTS.0.len();
         info!("[ESP-DL] MobileFaceNet model mapped at flash addr {:p} (Size: {} bytes)", model_ptr, model_size);
 
-        Ok(Self {
+        let dl_err = unsafe { ffi::dl_mobilefacenet_init(model_ptr as *const u8, model_size) };
+        if dl_err != 0 {
+            bail!("[SystemResources] MobileFaceNet Init Failed with code: {}", dl_err);
+        }
+
+        info!("[SystemResources] All hardware subsystems and LVGL 9 split-screen ready!");
+        Ok(SystemResources {
             nvs,
             event_loop,
             timer_service,
             hdmi_player,
             inactivity_timer: InactivityTimer::new(),
-            pins: Some(pins),
+            admin_button,
             video_pipeline: VideoPipeline::new(),
             model_ptr: model_ptr as *mut u8,
             model_size,
@@ -203,60 +248,11 @@ impl SystemResources {
             fail_count: 0,
         })
     }
+}
 
-    pub fn init(&mut self) -> Result<()> {
-    
-        init_audio_subsystem()
-            .context("[SystemResources] initializes audio system")?;
-
-        // Spawn audio capture worker thread
-        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<Vec<i16>>();
-        crate::audio_worker::spawn_audio_capture_thread(0, audio_tx);
-
-        // Initialize P4 EMAC Ethernet
-        let eth_err = unsafe { ffi::init_p4_ethernet() };
-        if eth_err != 0 {
-            bail!("[SystemResources] Ethernet Init Failed: {}", eth_err);
-        }
-
-        // Initialize ESP-DL MobileFaceNet Neural Model from Flash Memory
-        if let Err(e) = self.init_mobilefacenet() {
-            bail!("[SystemResources] MobileFaceNet Init Failed: {:?}", e);
-        }
-
-        // 4. Bring up Unified Board Hardware (Display, Camera, I2C, Power) via BSP
-        let config = P4HardwareConfig {
-            display_width: 1280,
-            display_height: 720,
-            camera_width: 1280,
-            camera_height: 720,
-        };
-        let init_ret = unsafe { ffi::p4_hardware_init_all(&config) };
-        if init_ret != 0 {
-            bail!("[SystemResources] p4_hardware_init_all failed: {}", init_ret);
-        }
-
-        let _pins = self
-            .pins
-            .take()
-            .context("[SystemResources] Hardware pins already consumed")?;
-
-        // 5. Initialize Inactivity Watchdog
-        crate::power::spawn_inactivity_watchdog(
-            self.inactivity_timer.clone(),
-            INACTIVITY_TIMEOUT_SECS,
-            GT911_INT_LP_GPIO,
-            ADMIN_BUTTON_LP_GPIO,
-        );
-        info!("[SystemResources] Power Inactivity watchdog active (Timeout: {}s)", INACTIVITY_TIMEOUT_SECS);
-
-        // 6. Configure Admin GPIO Button
-        if let Err(e) = setup_admin_button() {
-            bail!("[SystemResources] Failed to init Admin Button GPIO: {}", e);
-        }
-
-        info!("[SystemResources] All hardware subsystems and LVGL 9 split-screen ready!");
-        Ok(())
+impl SystemResources {
+    pub fn builder() -> Result<SystemResourcesBuilder> {
+        SystemResourcesBuilder::new()
     }
 
     /// Captures the frame into the C driver buffer.

@@ -41,8 +41,8 @@ fn main() -> Result<()>{
     system::validate_running_app();
     info!("[Boot] Marked running firmware application as valid.");
 
-    // 5. Instantiate SystemResources container (InactivityTimer is initialized automatically inside)
-    let mut resources = match SystemResources::new() {
+    // 3. Instantiate SystemResources container (InactivityTimer is initialized automatically inside)
+    let mut resources = match SystemResources::builder()?.build() {
         Ok(res) => {
             crate::power::reset_boot_crash_counter();
             info!("[Boot] SystemResources container allocated.");
@@ -52,10 +52,8 @@ fn main() -> Result<()>{
             crate::power::handle_fatal_init_error(e);
         }
     };
-    if let Err(e) = resources.init() {
-        crate::power::handle_fatal_init_error(e);
-    }
 
+    // 4. Instantiate BiometricSystem instance
     let mut biometric_system = BiometricSystem::new();
     info!("[Boot] SystemResources initialized, Hardware drivers & worker threads initialized. Launching state machine loop...");
     loop {

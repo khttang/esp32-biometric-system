@@ -367,7 +367,7 @@ void lvgl_unlock(void) {
 }
 
 void camera_stream_task(void *pvParameters) {
-    (void)pvParameters;
+    //(void)pvParameters;
     p4_camera_frame_t frame = {};
     while (1) {
         // Dequeue frame captured by MIPI-CSI ISP DMA
