@@ -1,9 +1,10 @@
 idf_component_register(
     SRCS "biometrics_wrapper.cpp"
-    INCLUDE_DIRS "include"
+    INCLUDE_DIRS "include" "."
     REQUIRES 
-        main
         cxx 
+        app_update
+        esp_https_ota
         esp-dl 
         driver 
         esp_driver_i2c
@@ -22,3 +23,5 @@ idf_component_register(
         esp_video
 
 )
+
+target_compile_options(${COMPONENT_LIB} PRIVATE -msmall-data-limit=0)

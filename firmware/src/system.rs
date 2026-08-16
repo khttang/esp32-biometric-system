@@ -97,7 +97,7 @@ pub struct P4TouchData {
     pub touched: bool,
 }
 
-mod ffi {
+pub mod ffi {
     use esp_idf_svc::sys::esp_err_t;
     use super::{ P4CameraFrame, P4HardwareConfig, P4TouchData };
 
@@ -115,9 +115,8 @@ mod ffi {
         pub fn init_display_with_bsp() -> i32;
         pub fn dl_mobilefacenet_init(model_buf: *const u8, model_size: usize) -> i32;
         pub fn dl_mobilefacenet_run(crop_rgb888: *const u8, out_embedding: *mut f32, embedding_len: usize) -> i32;
-        pub fn init_touch_with_bsp() -> i32;
-        pub fn p4_touch_read(touch_data: *mut P4TouchData) -> bool;
         pub fn init_i2s_duplex_c(sample_rate: u32, bclk_gpio: i32, ws_gpio: i32, din_gpio: i32, dout_gpio: i32) -> i32;
+        pub fn update_camera_viewport(frame: *const P4CameraFrame);
     }
 }
 
@@ -188,7 +187,7 @@ impl SystemResources {
             hdmi_player,
             inactivity_timer: InactivityTimer::new(),
             pins: Some(pins),
-            video_pipeline: VideoPipeline::new(640, 360),
+            video_pipeline: VideoPipeline::new(),
             model_ptr: model_ptr as *mut u8,
             model_size,
             model_weights: None,
@@ -208,7 +207,7 @@ impl SystemResources {
     pub fn init(&mut self) -> Result<()> {
     
         init_audio_subsystem()
-            .context("SystemResources initializes audio system")?;
+            .context("[SystemResources] initializes audio system")?;
 
         // Spawn audio capture worker thread
         let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<Vec<i16>>();
@@ -217,30 +216,30 @@ impl SystemResources {
         // Initialize P4 EMAC Ethernet
         let eth_err = unsafe { ffi::init_p4_ethernet() };
         if eth_err != 0 {
-            bail!("SystemResources Ethernet Init Failed: {}", eth_err);
+            bail!("[SystemResources] Ethernet Init Failed: {}", eth_err);
         }
 
         // Initialize ESP-DL MobileFaceNet Neural Model from Flash Memory
         if let Err(e) = self.init_mobilefacenet() {
-            bail!("SystemResources MobileFaceNet Init Failed: {:?}", e);
+            bail!("[SystemResources] MobileFaceNet Init Failed: {:?}", e);
         }
 
         // 4. Bring up Unified Board Hardware (Display, Camera, I2C, Power) via BSP
         let config = P4HardwareConfig {
-            display_width: 720,
-            display_height: 1280,
+            display_width: 1280,
+            display_height: 720,
             camera_width: 1280,
             camera_height: 720,
         };
         let init_ret = unsafe { ffi::p4_hardware_init_all(&config) };
         if init_ret != 0 {
-            bail!("SystemResources Hardware bring-up failed with code {}", init_ret);
+            bail!("[SystemResources] p4_hardware_init_all failed: {}", init_ret);
         }
 
         let _pins = self
             .pins
             .take()
-            .context("SystemResources Hardware pins already consumed")?;
+            .context("[SystemResources] Hardware pins already consumed")?;
 
         // 5. Initialize Inactivity Watchdog
         crate::power::spawn_inactivity_watchdog(
@@ -249,13 +248,14 @@ impl SystemResources {
             GT911_INT_LP_GPIO,
             ADMIN_BUTTON_LP_GPIO,
         );
-        info!("SystemResources Power Inactivity watchdog active (Timeout: {}s)", INACTIVITY_TIMEOUT_SECS);
+        info!("[SystemResources] Power Inactivity watchdog active (Timeout: {}s)", INACTIVITY_TIMEOUT_SECS);
 
         // 6. Configure Admin GPIO Button
         if let Err(e) = setup_admin_button() {
-            bail!("SystemResources Failed to init Admin Button GPIO: {}", e);
+            bail!("[SystemResources] Failed to init Admin Button GPIO: {}", e);
         }
 
+        info!("[SystemResources] All hardware subsystems and LVGL 9 split-screen ready!");
         Ok(())
     }
 

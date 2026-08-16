@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use log::{error, info, warn};
 use std::time::{Duration, Instant};
 
-use crate::system::{ SystemResources, crop_face_112x112 };
+use crate::system::{SystemResources, crop_face_112x112};
 
 const INACTIVITY_TIMEOUT_SECS: u64 = 180; // 3 minutes idle -> Deep Sleep
 const FACE_EMBEDDING_DIM: usize = 512;
@@ -85,27 +85,31 @@ impl BiometricSystem {
                 // B. Capture frame and detect faces using SystemResources
                 if resources.capture_camera_frame() {
                     resources.fail_count = 0;
+                    
                     if let Some(frame_slice) = resources.raw_frame.as_slice() {
                         let detected_faces = resources.detect_faces(frame_slice);
 
-                        // Render 640x360 camera preview on the left half of the display
-                        let render_res = resources.video_pipeline.render_camera_half(frame_slice, &detected_faces);
-                        if let Err(err_code) = render_res {
-                            error!("[DISPLAY_ERROR] render_camera_half returned error code: {}", err_code);
-                        }
+                        // Render camera preview on the left half of the display via PPA hardware
+                        resources.video_pipeline.render_camera_half(&resources.raw_frame, &detected_faces);
 
                         if !detected_faces.is_empty() {
                             self.last_activity_time = now;
 
                             // 1. Crop face box to 112x112 RGB888 buffer
-                            if let Some(crop_112x112) = crate::system::crop_face_112x112(
-                                frame_slice, resources.raw_frame.width as usize, resources.raw_frame.height as usize, &detected_faces[0]) {
+                            if let Some(crop_112x112) = crop_face_112x112(
+                                frame_slice, 
+                                resources.raw_frame.width as usize, 
+                                resources.raw_frame.height as usize, 
+                                &detected_faces[0]
+                            ) {
                                 if let Ok(live_embedding) = resources.extract_face_embedding(&crop_112x112) {
                                     let members_guard = resources.group_members.load();
                                     if let Some(matched_member) = self.try_match_biometrics(&live_embedding, &members_guard) {
                                         info!("Biometric match confirmed for: {}", matched_member.name);
                                         self.action_display_timer = Some(now + Duration::from_secs(3));
                                         self.state = SystemState::ActionExecuted { member: matched_member };
+                                        
+                                        resources.release_camera_frame();
                                         return;
                                     }
                                 }
@@ -121,7 +125,7 @@ impl BiometricSystem {
                     }
                 }
 
-                // D. 180s Inactivity Timeout -> Deep Sleep
+                // C. 180s Inactivity Timeout -> Deep Sleep
                 if now.duration_since(self.last_activity_time) >= Duration::from_secs(INACTIVITY_TIMEOUT_SECS) {
                     info!("No activity detected for {}s. Entering Deep Sleep...", INACTIVITY_TIMEOUT_SECS);
                     crate::power::enter_deep_sleep(None); // Shuts off backlight, arms wake pins, calls esp_deep_sleep_start
@@ -169,11 +173,6 @@ impl BiometricSystem {
             // 5. ACTION EXECUTED: Unlock / Success UI feedback
             // -----------------------------------------------------------------
             SystemState::ActionExecuted { member } => {
-                // Keep rendering live preview behind UI banner
-                //if let Some(frame_slice) = resources.camera_frame() {
-                //    let _ = resources.video_pipeline.render_camera_half(frame_slice, &[]);
-                //}
-
                 if let Some(timer) = self.action_display_timer {
                     if now >= timer {
                         info!("Action feedback complete. Returning to DetectionValidation.");
@@ -193,7 +192,7 @@ impl BiometricSystem {
         }
     }
 
-pub fn try_match_biometrics(
+    pub fn try_match_biometrics(
         &self,
         live_embedding: &[f32; 512],
         enrolled_templates: &[GroupMember],
@@ -231,7 +230,6 @@ pub fn try_match_biometrics(
     }
 
     pub async fn fetch_templates_from_laptop(url: &str) -> Result<Vec<GroupMember>> {
-    
         let url_string = url.to_string();
 
         tokio::task::spawn_blocking(move || {
