@@ -41,7 +41,6 @@ void lvgl_unlock(void);
 
 // Unified Display, Touch & LVGL System Initialization
 int32_t init_display_system(void);
-int32_t init_display_with_bsp(void);
 void setup_split_screen_ui(void);
 void update_camera_viewport(const p4_camera_frame_t *frame);
 int32_t p4_camera_capture_frame(p4_camera_frame_t *frame, uint32_t timeout_ms);
@@ -64,17 +63,10 @@ int read_i2s_mic_c(int i2s_port, int16_t *out_buffer, uint32_t samples_to_read, 
 int write_i2s_tx_c(int i2s_port, const int16_t *buffer, uint32_t sample_count, uint32_t timeout_ms);
 
 // System & Admin Controls
-int init_admin_button_gpio(void);
-bool is_admin_button_pressed(void);
 int32_t p4_perform_ota_update(const char *url);
 void p4_mark_app_valid(void);
 
-// Legacy Peripherals
-int init_wifi_hosted_c(const char *ssid, const char *password, uint32_t timeout_ms);
-bool is_wifi_connected_c(void);
-int stop_wifi_hosted_c(void);
-int32_t init_mipi_csi_camera_c(void);
-int32_t init_mipi_dsi_display_c(uint16_t width, uint16_t height);
+int32_t init_p4_ethernet(void);
 
 #ifdef __cplusplus
 }

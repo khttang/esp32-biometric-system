@@ -102,17 +102,11 @@ pub mod ffi {
     use super::{ P4CameraFrame, P4HardwareConfig, P4TouchData };
 
     extern "C" {
-        pub fn init_p4_ethernet() -> i32;
-        pub fn init_admin_button_gpio() -> i32;
-        pub fn is_admin_button_pressed() -> bool;
-        pub fn p4_eth_is_link_up() -> bool;
+        pub fn p4_mark_app_valid();
         pub fn p4_hardware_init_all(config: *const P4HardwareConfig) -> i32;
         pub fn p4_camera_capture_frame(frame: *mut P4CameraFrame, timeout_ms: u32) -> i32;
         pub fn p4_camera_release_frame(frame: *const P4CameraFrame) -> i32;
         pub fn p4_perform_ota_update(url: *const libc::c_char) -> esp_err_t;
-        pub fn p4_mark_app_valid();
-        pub fn init_display_system() -> i32;
-        pub fn init_display_with_bsp() -> i32;
         pub fn dl_mobilefacenet_init(model_buf: *const u8, model_size: usize) -> i32;
         pub fn dl_mobilefacenet_run(crop_rgb888: *const u8, out_embedding: *mut f32, embedding_len: usize) -> i32;
         pub fn init_i2s_duplex_c(sample_rate: u32, bclk_gpio: i32, ws_gpio: i32, din_gpio: i32, dout_gpio: i32) -> i32;
@@ -182,13 +176,7 @@ impl SystemResourcesBuilder {
         crate::audio_worker::spawn_audio_capture_thread(0, audio_tx);
         let hdmi_player = HdmiAudioPlayer::new(0);
 
-        // 3. P4 EMAC Ethernet
-        let eth_err = unsafe { ffi::init_p4_ethernet() };
-        if eth_err != 0 {
-            bail!("[SystemResources] Ethernet Init Failed: {}", eth_err);
-        }
-
-        // 4. Unified BSP Board Hardware (Display, Camera, I2C, Power)
+        // 3. Unified BSP Board Hardware (Display, Camera, I2C, Power)
         let config = P4HardwareConfig {
             display_width: 1280,
             display_height: 720,
@@ -200,11 +188,11 @@ impl SystemResourcesBuilder {
             bail!("[SystemResources] p4_hardware_init_all failed: {}", init_ret);
         }
 
-        // 5. Admin Button (Pure Rust PinDriver on GPIO0)
+        // 4. Admin Button (Pure Rust PinDriver on GPIO0)
         let admin_button = PinDriver::input(self.peripherals.pins.gpio0, Pull::Up)
             .context("[SystemResources] Failed to configure GPIO0 as admin button input")?;
 
-        // 6. Inactivity Watchdog
+        // 5. Inactivity Watchdog
         let inactivity_timer = InactivityTimer::new();
         crate::power::spawn_inactivity_watchdog(
             inactivity_timer.clone(),
@@ -214,7 +202,7 @@ impl SystemResourcesBuilder {
         );
         info!("[SystemResources] Power Inactivity watchdog active (Timeout: {}s)", INACTIVITY_TIMEOUT_SECS);
 
-        // 7. Neural Model Setup
+        // 6. Neural Model Setup
         let model_ptr = MODEL_WEIGHTS.0.as_ptr();
         let model_size = MODEL_WEIGHTS.0.len();
         info!("[ESP-DL] MobileFaceNet model mapped at flash addr {:p} (Size: {} bytes)", model_ptr, model_size);
@@ -297,7 +285,7 @@ impl SystemResources {
     }
 
     pub fn is_admin_pressed(&self) -> bool {
-        unsafe { ffi::is_admin_button_pressed() }
+        self.admin_button.is_low()
     }
 
     /// Fetch group members over network with local Flash fallback
@@ -429,18 +417,6 @@ impl SystemResources {
 
 pub fn validate_running_app() {
     unsafe { ffi::p4_mark_app_valid() };
-}
-
-pub fn setup_admin_button() -> Result<()> {
-    let err = unsafe { ffi::init_admin_button_gpio() };
-    if err != 0 {
-        bail!("Failed to configure admin button GPIO, ESP-IDF err: {}", err);
-    }
-    Ok(())
-}
-
-pub fn check_admin_button() -> bool {
-    unsafe { ffi::is_admin_button_pressed() }
 }
 
 pub fn init_audio_subsystem() -> Result<()> {

@@ -603,8 +603,12 @@ int32_t p4_hardware_init_all(const p4_hardware_config_t *config) {
 
     ret = p4_camera_init_v4l2(CONFIG_BIOMETRICS_CAM_WIDTH, CONFIG_BIOMETRICS_CAM_HEIGHT);
     if (ret != ESP_OK) return ret;
-
     ESP_LOGI(TAG_HW, "Display Systems Initialized Successfully!");
+
+    ret = init_p4_ethernet();
+    if (ret != ESP_OK) return ret;
+    ESP_LOGI(TAG_HW, "Ethernet Initialized Successfully!");
+
     s_hardware_initialized = true;
     return ESP_OK;
 }
@@ -719,21 +723,6 @@ int32_t init_p4_ethernet(void) {
     return esp_eth_start(eth_handle);
 }
 
-int init_admin_button_gpio() {
-    gpio_config_t io_conf = {};
-    io_conf.pin_bit_mask = (1ULL << BoardPins::System::ADMIN_BTN);
-    io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-
-    return (int)gpio_config(&io_conf);
-}
-
-bool is_admin_button_pressed() {
-    return gpio_get_level(BoardPins::System::ADMIN_BTN) == 0;
-}
-
 int32_t p4_display_draw_frame(const uint16_t *frame_buffer, uint16_t width, uint16_t height) {
     if (!s_lcd_panel || !frame_buffer) return ESP_ERR_INVALID_ARG;
 
@@ -826,19 +815,6 @@ int32_t dl_mobilefacenet_run(const uint8_t *crop_rgb888, float *out_embedding, s
     }
 
     return ESP_OK;
-}
-
-int32_t init_display_with_bsp(void) {
-    if (s_lcd_panel != NULL) {
-        return 0; // Already initialized via init_display_system()
-    }
-    bsp_lcd_handles_t handles = {};
-    esp_err_t err = bsp_display_new_with_handles(NULL, &handles);
-    if (err != ESP_OK) return (int32_t)err;
-    
-    s_lcd_panel = handles.panel;
-    s_lcd_io = handles.io;
-    return 0;
 }
 
 void setup_split_screen_ui(void) {
