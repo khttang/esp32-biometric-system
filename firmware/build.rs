@@ -5,16 +5,17 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-changed=components/biometrics_wrapper/biometrics_wrapper.cpp");
     println!("cargo:rerun-if-changed=components/biometrics_wrapper/include/bindings.h");
-    println!("cargo:rerun-if-changed=components/biometrics_wrapper/biometrics_wrapper.h");
+    println!("cargo:rerun-if-changed=components/biometrics_wrapper/include/biometrics_wrapper.h");
+    println!("cargo:rerun-if-changed=sdkconfig.defaults");
 
-    // Propagate ESP-IDF build flags and linker scripts
+    // Propagate ESP-IDF build flags and linker configuration
     LinkArgs::output_propagated("ESP_IDF").expect("Failed to propagate link args");
 
+    // Ensure C++ standard library is explicitly linked for biometrics_wrapper
     println!("cargo:rustc-link-arg=-lstdc++");
-    
-    // Generate Rust FFI bindings from clean C header
+
     let bindings = bindgen::Builder::default()
-        .header("components/biometrics_wrapper/include/bindings.h")
+        .header("components/biometrics_wrapper/include/biometrics_wrapper.h")
         .clang_arg("-Icomponents/biometrics_wrapper/include")
         .derive_default(true)
         .use_core()

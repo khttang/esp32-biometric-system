@@ -12,7 +12,7 @@
 
 #if (BSP_CONFIG_NO_GRAPHIC_LIB == 0)
 #include "lvgl.h"
-#include "esp_lv_adapter.h"
+#include "esp_lvgl_port.h"
 #endif // BSP_CONFIG_NO_GRAPHIC_LIB == 0
 
 /**************************************************************************************************
@@ -248,14 +248,7 @@ esp_err_t bsp_sdcard_unmount(void);
  *
  */
 typedef struct {
-    esp_lv_adapter_config_t          lv_adapter_cfg;   /*!< LVGL adapter configuration */
-    esp_lv_adapter_rotation_t        rotation;         /*!< Display rotation */
-    esp_lv_adapter_tear_avoid_mode_t tear_avoid_mode;  /*!< Tearing avoidance mode */
-    struct {
-        unsigned int swap_xy: 1;   /*!< Swap X and Y after reading touch coordinates */
-        unsigned int mirror_x: 1;  /*!< Mirror X after reading touch coordinates */
-        unsigned int mirror_y: 1;  /*!< Mirror Y after reading touch coordinates */
-    } touch_flags;
+    int dummy; // Unused when using direct esp_lvgl_port
 } bsp_display_cfg_t;
 
 /**

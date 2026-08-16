@@ -1,21 +1,27 @@
-#include "driver/i2c_master.h"
-#include "bindings.h"
-
 #include <stdio.h>
-#include <cstring>
-#include <memory>
-#include <cmath>
+#include <string.h>
+#include <math.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/videodev2.h>
 
-#include "esp_log.h"
+#include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
-#include "driver/isp_core.h"
+#include "driver/ppa.h"
+
+#include "esp_video_init.h"
+#include "esp_video_ioctl.h"
+#include "esp_log.h"
 #include "esp_err.h"
 #include "esp_check.h"
-#include "esp_cam_ctlr.h"
-#include "esp_cam_ctlr_csi.h"
-#include "esp_cam_ctlr_types.h"
-#include "esp_cam_sensor.h"
+#include "esp_cache.h"
+#include "esp_attr.h"
+#include "esp_timer.h"
+
+#include "esp_cam_sensor_detect.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_io.h"
@@ -29,19 +35,35 @@
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_ldo_regulator.h"
+#include "freertos/semphr.h"
 
-// Official Waveshare ESP32-P4-NANO BSP Headers
+// Waveshare ESP32-P4-NANO BSP & Touch Headers
 #include "esp_lcd_touch.h"
+#include "esp_lcd_touch_gt911.h"
 #include "bsp/esp32_p4_nano.h"
 #include "bsp/display.h"
 #include "bsp/touch.h"
+#include "lvgl.h"
 
 // Core esp-dl Headers
 #include "dl_model_base.hpp"
 #include "dl_tensor_base.hpp"
 
+#include "sdkconfig.h"
 #include "biometrics_wrapper.h"
+
+#ifndef CONFIG_BIOMETRICS_CAM_WIDTH
+#define CONFIG_BIOMETRICS_CAM_WIDTH 1280
+#endif
+
+#ifndef CONFIG_BIOMETRICS_CAM_HEIGHT
+#define CONFIG_BIOMETRICS_CAM_HEIGHT 720
+#endif
+
+struct v4l2_frame_buffer_t {
+    void  *start;
+    size_t length;
+};
 
 // -----------------------------------------------------------------------------
 // Hardware Pinout Definitions
@@ -62,186 +84,157 @@ namespace BoardPins {
             constexpr gpio_num_t RXD1   = GPIO_NUM_30;
         }
     }
+    namespace Camera {
+        constexpr gpio_num_t SDA      = GPIO_NUM_7;  // Shared I2C0 SDA (Initialized by BSP)
+        constexpr gpio_num_t SCL      = GPIO_NUM_8;  // Shared I2C0 SCL (Initialized by BSP)
+        constexpr gpio_num_t PWDN     = GPIO_NUM_5;  // Camera Power Down Pin (Active LOW)
+        constexpr gpio_num_t RESET    = GPIO_NUM_6;  // Camera Reset Pin (Active LOW)
+        constexpr i2c_port_num_t PORT = I2C_NUM_0;
+    }
     namespace System {
         constexpr gpio_num_t ADMIN_BTN = GPIO_NUM_0;
     }
-}
-
-namespace BoardAddr {
-    constexpr uint8_t OV5647_SCCB = 0x36;
+    namespace Audio {
+        constexpr gpio_num_t BCLK      = GPIO_NUM_12;
+        constexpr gpio_num_t WS        = GPIO_NUM_13;
+        constexpr gpio_num_t DIN       = GPIO_NUM_11;
+        constexpr gpio_num_t DOUT      = GPIO_NUM_14;
+    }
 }
 
 #define TAG_HW      "p4_hardware"
-#define TAG_ETH     "p4_ethernet"
 #define TAG_CAM     "p4_camera"
+#define TAG_ETH     "p4_ethernet"
+#define TAG_TOUCH   "p4_touch"
+#define TAG_LVGL    "p4_lvgl"
+#define TAG_AUDIO   "p4_audio"
 #define TAG_OTA     "p4_ota"
 #define TAG_FACENET "ESP_DL_FACENET"
 #define TAG_I2S     "I2S_WRAPPER"
-#define TAG_LCD     "p4_lcd"
 
-// Global Hardware Handles
+#define CAM_BUF_COUNT 2
+#define C_LINE_SIZE 128  // ESP32-P4 L2 Cache Line Size (0x80)
+
+// Global Subsystem Handles
 static esp_lcd_panel_handle_t s_lcd_panel = NULL;
 static esp_lcd_panel_io_handle_t s_lcd_io = NULL;
 static esp_lcd_touch_handle_t s_touch_handle = NULL;
-static esp_cam_ctlr_handle_t s_csi_cam_handle = NULL;
-
-static uint8_t *s_cam_frame_buffer = NULL;
-static size_t s_cam_fb_size = 0;
 
 static i2s_chan_handle_t g_i2s_tx_handle = NULL;
 static i2s_chan_handle_t g_i2s_rx_handle = NULL;
 
+static ppa_client_handle_t s_ppa_client = NULL;
+
 static bool s_hardware_initialized = false;
 static dl::Model *g_mobilefacenet_model = NULL;
 
-// -----------------------------------------------------------------------------
-// Display Initialization & Helper Functions
-// -----------------------------------------------------------------------------
-static esp_err_t power_on_display_bridge_0x45(void) {
-    i2c_master_bus_handle_t bus_handle = bsp_i2c_get_handle();
-    if (!bus_handle) {
-        ESP_LOGE(TAG_LCD, "BSP I2C bus handle is NULL");
-        return ESP_ERR_INVALID_STATE;
-    }
+static int s_video_fd = -1;
+struct v4l2_frame_buffer_t s_cam_buffers[CAM_BUF_COUNT] = {};
+static size_t s_cam_buf_lengths[CAM_BUF_COUNT] = {0};
 
-    i2c_master_dev_handle_t dev_handle = NULL;
-    i2c_device_config_t dev_cfg = {};
-    dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-    dev_cfg.device_address = 0x45;
-    dev_cfg.scl_speed_hz = 100000;
+static SemaphoreHandle_t s_lvgl_mutex = NULL;
 
-    esp_err_t err = i2c_master_bus_add_device(bus_handle, &dev_cfg, &dev_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG_LCD, "Failed to register 0x45 I2C device: 0x%x", err);
-        return err;
-    }
+// LVGL Camera Image Descriptor Handles
+static lv_obj_t *s_camera_img = NULL;
+static lv_image_dsc_t s_camera_dsc = {};
+static lv_obj_t *s_status_label = NULL;
 
-    ESP_LOGI(TAG_LCD, "Sending power-on sequence to display bridge IC @ 0x45...");
-    uint8_t cmd1[2] = {0x95, 0x11};
-    i2c_master_transmit(dev_handle, cmd1, 2, 1000);
-    uint8_t cmd2[2] = {0x95, 0x17};
-    i2c_master_transmit(dev_handle, cmd2, 2, 1000);
-    uint8_t cmd3[2] = {0x96, 0x00};
-    i2c_master_transmit(dev_handle, cmd3, 2, 1000);
-    vTaskDelay(pdMS_TO_TICKS(100));
+static uint16_t *s_ppa_buf[2] = {NULL, NULL};
+static uint8_t s_ppa_idx = 0;
 
-    // Assert power and wait for PMIC voltage rails to stabilize
-    uint8_t cmd4[2] = {0x96, 0xFF};
-    i2c_master_transmit(dev_handle, cmd4, 2, 1000);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    i2c_master_bus_rm_device(dev_handle);
-    ESP_LOGI(TAG_LCD, "0x45 Power-on sequence complete & rails stabilized.");
-    return ESP_OK;
-}
-
-int32_t init_display_with_bsp(void) {
-    if (s_lcd_panel != NULL) return ESP_OK;
-
-    ESP_LOGI(TAG_LCD, "Initializing 5-inch MIPI-DSI Display via Waveshare BSP...");
-
-    // 1. Initialize BSP primary I2C bus (I2C0, GPIO7/8)
-    esp_err_t err = bsp_i2c_init();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG_LCD, "Failed to initialize BSP I2C bus: 0x%x", err);
-        return err;
-    }
-
-    // 2. Power on display bridge IC @ 0x45
-    err = power_on_display_bridge_0x45();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG_LCD, "0x45 power sequence returned error: 0x%x (proceeding anyway)", err);
-    }
-
-    // 3. Allocate Display & Power Handles via BSP
-    bsp_lcd_handles_t handles = {};
-    bsp_display_config_t disp_cfg = {};
-    
-    err = bsp_display_new_with_handles(&disp_cfg, &handles);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG_LCD, "Failed to create BSP display handles: 0x%x (%s)", err, esp_err_to_name(err));
-        return err;
-    }
-
-    s_lcd_panel = handles.panel;
-    s_lcd_io = handles.io;
-
-    // 4. Turn on Backlight
-    ESP_ERROR_CHECK(bsp_display_backlight_on());
-
-    ESP_LOGI(TAG_LCD, "5-inch Display & Backlight Initialized Successfully!");
-    return ESP_OK;
-}
-
-void p4_display_draw_test_pattern(void) {
-    if (!s_lcd_panel) {
-        ESP_LOGE(TAG_LCD, "Cannot draw test pattern: Display panel handle is NULL!");
-        return;
-    }
-
-    size_t buffer_size = 720 * 1280 * sizeof(uint16_t);
-    uint16_t *test_buf = (uint16_t *)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
-
-    if (test_buf) {
-        for (int i = 0; i < 720 * 1280; i++) {
-            test_buf[i] = 0x07FF; // Solid Cyan (RGB565)
-        }
-        ESP_LOGI(TAG_HW, "Pushing Solid Cyan Test Frame to Display...");
-        esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, 0, 720, 1280, test_buf);
-        heap_caps_free(test_buf);
-    }
+extern "C" {
+    i2c_master_bus_handle_t bsp_i2c_get_handle(void);
+    esp_err_t bsp_i2c_init(void);
 }
 
 // -----------------------------------------------------------------------------
-// MIPI-CSI Camera Initialization
+// LVGL 9 Callbacks & Task Loop
 // -----------------------------------------------------------------------------
-static bool IRAM_ATTR csi_on_trans_finished_cb(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data) {
+
+// Asynchronous MIPI-DSI DMA completion callback
+static bool on_color_trans_done(esp_lcd_panel_handle_t panel, esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx) {
+    lv_display_t *disp = (lv_display_t *)user_ctx;
+    if (disp) {
+        lv_display_flush_ready(disp);
+    }
     return false;
 }
 
-static esp_err_t init_camera(uint16_t width, uint16_t height) {
-    ESP_LOGI(TAG_HW, "Initializing MIPI-CSI Camera (%dx%d)...", width, height);
+// Display Flush Callback (initiates async DSI DMA transfer)
+static void lvgl_display_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
+    esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)lv_display_get_user_data(disp);
 
-    s_cam_fb_size = width * height * 2;
-    if (s_cam_frame_buffer == NULL) {
-        s_cam_frame_buffer = (uint8_t *)heap_caps_malloc(s_cam_fb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!s_cam_frame_buffer) {
-            ESP_LOGE(TAG_CAM, "Failed to allocate camera framebuffer in PSRAM!");
-            return ESP_ERR_NO_MEM;
+    int x1 = area->x1;
+    int x2 = area->x2;
+    int y1 = area->y1;
+    int y2 = area->y2;
+
+    // Draw directly to translated physical coordinates
+    esp_lcd_panel_draw_bitmap(panel, x1, y1, x2 + 1, y2 + 1, px_map);
+}
+
+// Touch Input Read Callback (reads GT911 coordinates)
+void lvgl_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
+    esp_lcd_touch_handle_t touch_handle = (esp_lcd_touch_handle_t)lv_indev_get_user_data(indev);
+    uint16_t touch_x[1], touch_y[1];
+    uint8_t touch_cnt = 0;
+
+    esp_lcd_touch_read_data(touch_handle);
+    bool pressed = esp_lcd_touch_get_coordinates(touch_handle, touch_x, touch_y, NULL, &touch_cnt, 1);
+
+    if (pressed && touch_cnt > 0) {
+        data->state = LV_INDEV_STATE_PRESSED;
+        // Map portrait hardware touch (720x1280) to landscape canvas (1280x720)
+        data->point.x = touch_y[0];
+        data->point.y = 719 - touch_x[0];
+    } else {
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
+}
+
+// Background FreeRTOS task handling LVGL timer ticks
+static void lvgl_port_task(void *arg) {
+    while (1) {
+        if (xSemaphoreTake(s_lvgl_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            uint32_t task_delay = lv_timer_handler();
+            xSemaphoreGive(s_lvgl_mutex);
+            
+            // Sleep for the dynamic time requested by LVGL (capped between 1ms and 30ms)
+            vTaskDelay(pdMS_TO_TICKS(task_delay > 0 ? (task_delay > 30 ? 30 : task_delay) : 1));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
+}
 
-    if (s_csi_cam_handle == NULL) {
-        esp_cam_ctlr_csi_config_t csi_config = {};
-        csi_config.ctlr_id = 0;
-        csi_config.clk_src = MIPI_CSI_PHY_CLK_SRC_DEFAULT;
-        csi_config.h_res = width;
-        csi_config.v_res = height;
-        csi_config.data_lane_num = 2;
-        csi_config.lane_bit_rate_mbps = 800;
-        csi_config.input_data_color_type = CAM_CTLR_COLOR_RAW10;
-        csi_config.output_data_color_type = CAM_CTLR_COLOR_RAW10;
-        csi_config.queue_items = 2;
-        csi_config.byte_swap_en = false;
-
-        esp_err_t ret = esp_cam_new_csi_ctlr(&csi_config, &s_csi_cam_handle);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG_CAM, "esp_cam_new_csi_ctlr failed: 0x%x (%s)", ret, esp_err_to_name(ret));
-            return ret;
-        }
-
-        esp_cam_ctlr_evt_cbs_t cbs = {
-            .on_get_new_trans = NULL,
-            .on_trans_finished = csi_on_trans_finished_cb,
-        };
-        ESP_ERROR_CHECK(esp_cam_ctlr_register_event_callbacks(s_csi_cam_handle, &cbs, NULL));
-
-        ESP_ERROR_CHECK(esp_cam_ctlr_enable(s_csi_cam_handle));
-        ESP_ERROR_CHECK(esp_cam_ctlr_start(s_csi_cam_handle));
+// Helper to apply V4L2 controls
+static void set_v4l2_control(int fd, uint32_t id, int32_t value, const char *name) {
+    struct v4l2_control ctrl = {};
+    ctrl.id = id;
+    ctrl.value = value;
+    if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0) {
+        ESP_LOGW(TAG_CAM, "Failed to set V4L2 ctrl %s (0x%08" PRIx32 "): errno %d (%s)", 
+                 name, id, errno, strerror(errno));
+    } else {
+        ESP_LOGI(TAG_CAM, "V4L2 Ctrl %s set to %" PRId32, name, value);
     }
+}
 
-    ESP_LOGI(TAG_HW, "OV5647 MIPI-CSI Pipeline Active & Frame Buffer Ready!");
-    return ESP_OK;
+esp_err_t init_ppa_hardware_engine(void) {
+    ppa_client_config_t ppa_cfg = {};
+    ppa_cfg.oper_type = PPA_OPERATION_SRM; // Scaling, Rotation, Mirroring Engine
+    
+    esp_err_t err = ppa_register_client(&ppa_cfg, &s_ppa_client);
+    if (err == ESP_OK) {
+        ESP_LOGI("PPA_SYS", "ESP32-P4 PPA Hardware Accelerator Initialized Successfully.");
+    }
+    return err;
+}
+
+void configure_camera_exposure_gain(int fd) {
+    set_v4l2_control(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO, "EXPOSURE_AUTO");
+    set_v4l2_control(fd, V4L2_CID_AUTOGAIN, 1, "AUTOGAIN");
+    set_v4l2_control(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1, "AUTO_WHITE_BALANCE");
 }
 
 // -----------------------------------------------------------------------------
@@ -276,15 +269,15 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
 // -----------------------------------------------------------------------------
 // Audio Peripheral Drivers
 // -----------------------------------------------------------------------------
-int init_i2s_tx_c(int i2s_port, uint32_t sample_rate, int bclk_gpio, int ws_gpio, int dout_gpio) {
-    return init_i2s_duplex_c(sample_rate, bclk_gpio, ws_gpio, -1, dout_gpio);
-}
 
-int init_i2s_mic_c(int i2s_port, uint32_t sample_rate, int bclk_gpio, int ws_gpio, int din_gpio) {
-    return init_i2s_duplex_c(sample_rate, bclk_gpio, ws_gpio, din_gpio, -1);
-}
-
+/*
+* Initialize I2S TX and RX channels together.
+* Outcome:
+*  - TX channel (g_i2s_tx_handle): I2S_TX, 16-bit data, left-justified, mono, no DMA, no clock divider.
+*  - RX channel (g_i2s_rx_handle): I2S_RX, 16-bit data, left-justified, mono, no DMA, no clock divider.
+*/
 int init_i2s_duplex_c(uint32_t sample_rate, int bclk_gpio, int ws_gpio, int din_gpio, int dout_gpio) {
+    // 1. Clean up existing channels if re-initialized
     if (g_i2s_tx_handle) {
         i2s_channel_disable(g_i2s_tx_handle);
         i2s_del_channel(g_i2s_tx_handle);
@@ -296,53 +289,58 @@ int init_i2s_duplex_c(uint32_t sample_rate, int bclk_gpio, int ws_gpio, int din_
         g_i2s_rx_handle = NULL;
     }
 
+    // 2. Allocate full-duplex channel pair on I2S_NUM_0
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    
-    i2s_chan_handle_t *p_tx = (dout_gpio >= 0) ? &g_i2s_tx_handle : NULL;
-    i2s_chan_handle_t *p_rx = (din_gpio >= 0)  ? &g_i2s_rx_handle : NULL;
-
-    esp_err_t ret = i2s_new_channel(&chan_cfg, p_tx, p_rx);
+    esp_err_t ret = i2s_new_channel(&chan_cfg, &g_i2s_tx_handle, &g_i2s_rx_handle);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG_I2S, "i2s_new_channel failed: 0x%x", ret);
+        ESP_LOGE(TAG_AUDIO, "Failed to allocate I2S channels: 0x%x", ret);
         return (int)ret;
     }
 
-    if (g_i2s_tx_handle && dout_gpio >= 0) {
-        i2s_std_config_t tx_cfg = {
-            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
-            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-            .gpio_cfg = {
-                .mclk = I2S_GPIO_UNUSED,
-                .bclk = (gpio_num_t)bclk_gpio,
-                .ws   = (gpio_num_t)ws_gpio,
-                .dout = (gpio_num_t)dout_gpio,
-                .din  = I2S_GPIO_UNUSED,
-            },
-        };
-        ret = i2s_channel_init_std_mode(g_i2s_tx_handle, &tx_cfg);
-        if (ret != ESP_OK) return (int)ret;
-        ret = i2s_channel_enable(g_i2s_tx_handle);
-        if (ret != ESP_OK) return (int)ret;
+    // 3. Configure TX Channel (Drives Speaker DOUT & Physical Clocks BCLK/WS)
+    i2s_std_config_t tx_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = (gpio_num_t)bclk_gpio,
+            .ws   = (gpio_num_t)ws_gpio,
+            .dout = (gpio_num_t)dout_gpio,
+            .din  = I2S_GPIO_UNUSED,
+        },
+    };
+    ret = i2s_channel_init_std_mode(g_i2s_tx_handle, &tx_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_AUDIO, "Failed to init I2S TX channel: 0x%x", ret);
+        return (int)ret;
     }
 
-    if (g_i2s_rx_handle && din_gpio >= 0) {
-        i2s_std_config_t rx_cfg = {
-            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
-            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-            .gpio_cfg = {
-                .mclk = I2S_GPIO_UNUSED,
-                .bclk = (gpio_num_t)bclk_gpio,
-                .ws   = (gpio_num_t)ws_gpio,
-                .dout = I2S_GPIO_UNUSED,
-                .din  = (gpio_num_t)din_gpio,
-            },
-        };
-        ret = i2s_channel_init_std_mode(g_i2s_rx_handle, &rx_cfg);
-        if (ret != ESP_OK) return (int)ret;
-        ret = i2s_channel_enable(g_i2s_rx_handle);
-        if (ret != ESP_OK) return (int)ret;
+    // 4. Configure RX Channel (Reads Microphone DIN & Shares Clock Internal Lines)
+    i2s_std_config_t rx_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = I2S_GPIO_UNUSED, // Uses internal clock routed from TX
+            .ws   = I2S_GPIO_UNUSED, // Uses internal clock routed from TX
+            .dout = I2S_GPIO_UNUSED,
+            .din  = (gpio_num_t)din_gpio,
+        },
+    };
+    ret = i2s_channel_init_std_mode(g_i2s_rx_handle, &rx_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_AUDIO, "Failed to init I2S RX channel: 0x%x", ret);
+        return (int)ret;
     }
 
+    // 5. Enable both channels
+    ret = i2s_channel_enable(g_i2s_tx_handle);
+    if (ret != ESP_OK) return (int)ret;
+
+    ret = i2s_channel_enable(g_i2s_rx_handle);
+    if (ret != ESP_OK) return (int)ret;
+
+    ESP_LOGI(TAG_AUDIO, "I2S_NUM_0 Duplex audio initialized successfully (%u Hz)", sample_rate);
     return 0;
 }
 
@@ -366,42 +364,273 @@ int write_i2s_tx_c(int i2s_port, const int16_t *buffer, uint32_t sample_count, u
 // -----------------------------------------------------------------------------
 extern "C" {
 
+esp_cam_sensor_device_t *ov5647_detect(void *config);
+
+// Thread-safe LVGL Mutex Helpers
+bool lvgl_lock(uint32_t timeout_ms) {
+    if (!s_lvgl_mutex) return false;
+    return xSemaphoreTake(s_lvgl_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+void lvgl_unlock(void) {
+    if (s_lvgl_mutex) {
+        xSemaphoreGive(s_lvgl_mutex);
+    }
+}
+
+void camera_stream_task(void *pvParameters) {
+    //(void)pvParameters;
+    p4_camera_frame_t frame = {};
+    while (1) {
+        // Dequeue frame captured by MIPI-CSI ISP DMA
+        if (p4_camera_capture_frame(&frame, 100) == 0) {
+            update_camera_viewport(&frame);
+            p4_camera_release_frame(&frame);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+int32_t init_audio_system(void) {
+    const uint32_t SAMPLE_RATE = 16000U;
+    return init_i2s_duplex_c(SAMPLE_RATE, BoardPins::Audio::BCLK, BoardPins::Audio::WS, BoardPins::Audio::DIN, BoardPins::Audio::DOUT);
+}
+
+// Unified Display, Touch & LVGL 9 System Initialization
+int32_t init_display_system(void) {
+    ESP_LOGI(TAG_LVGL, "Initializing Display Hardware (1280x720 Landscape)...");
+
+    s_lvgl_mutex = xSemaphoreCreateMutex();
+
+    // 0. Initialize PPA Hardware Accelerator Client FIRST
+    if (init_ppa_hardware_engine() != ESP_OK) {
+        ESP_LOGE(TAG_LVGL, "Failed to initialize PPA hardware client!");
+        return ESP_FAIL;
+    }
+
+    // 1. Acquire raw LCD panel handles from BSP
+    bsp_lcd_handles_t handles = {};
+    esp_err_t err = bsp_display_new_with_handles(NULL, &handles);
+    if (err != ESP_OK) return err;
+
+    s_lcd_panel = handles.panel;
+    s_lcd_io = handles.io;
+
+    esp_lcd_panel_disp_on_off(handles.panel, true);
+
+    // 2. Acquire GT911 Touch handle from BSP
+    esp_lcd_touch_handle_t touch_handle = NULL;
+    if (bsp_touch_new(NULL, &touch_handle) == ESP_OK) {
+        s_touch_handle = touch_handle;
+    }
+
+    // 3. Initialize LVGL 9
+    lv_init();
+
+    lv_tick_set_cb([]() -> uint32_t {
+        return (uint32_t)(esp_timer_get_time() / 1000);
+    });
+
+    // 4. Create Display (720x1280 physical panel rotated to 1280x720)
+    lv_display_t *disp = lv_display_create(720, 1280);
+    lv_display_set_user_data(disp, handles.panel);
+    
+    // Rotate 720x1280 physical panel into 1280x720 Landscape
+    lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_90);
+
+    // 5. Allocate draw buffers in PSRAM to avoid internal SRAM fragmentation
+    size_t buf_size = 1280 * 20 * sizeof(uint16_t); // 51.2 KB per buffer
+
+    void *buf1 = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *buf2 = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    if (!buf1 || !buf2) {
+        ESP_LOGE(TAG_LVGL, "Failed to allocate PSRAM draw buffers!");
+        return ESP_ERR_NO_MEM;
+    }
+
+    lv_display_set_buffers(disp, buf1, buf2, buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(disp, lvgl_display_flush_cb);
+
+    // Register async DSI DMA callback
+    esp_lcd_dpi_panel_event_callbacks_t dsi_cbs = {};
+    dsi_cbs.on_color_trans_done = on_color_trans_done;
+    esp_lcd_dpi_panel_register_event_callbacks(handles.panel, &dsi_cbs, disp);
+
+    // 6. Touch Input Device
+    lv_indev_t *indev = lv_indev_create();
+    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_user_data(indev, touch_handle);
+    lv_indev_set_read_cb(indev, lvgl_touch_read_cb);
+
+    // 7. Start LVGL Task
+    xTaskCreatePinnedToCore(lvgl_port_task, "lvgl_task", 8192, NULL, 5, NULL, 0);
+
+    // 8. Construct 1280x720 UI Layout
+    setup_split_screen_ui();
+
+    // 9. Spawn camera streaming worker thread on Core 1
+    xTaskCreatePinnedToCore(
+        camera_stream_task,  // Task function entry point
+        "camera_task",       // Task name
+        8192,                // Stack size in bytes (V4L2 driver needs ~8 KB)
+        NULL,                // Task input parameter
+        5,                   // Priority (matching or higher than main worker loop)
+        NULL,                // Task handle reference
+        1                    // Core ID (Core 1 isolates V4L2 from LVGL on Core 0)
+    );
+
+    return 0;
+}
+
+int32_t p4_camera_init_v4l2_default(void) {
+    return p4_camera_init_v4l2(CONFIG_BIOMETRICS_CAM_WIDTH, CONFIG_BIOMETRICS_CAM_HEIGHT);
+}
+
+int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
+    if (s_video_fd >= 0) return 0;
+
+    ESP_LOGI(TAG_CAM, "Initializing OV5647 via esp_video at %dx%d...", width, height);
+
+    i2c_master_bus_handle_t shared_i2c_bus = bsp_i2c_get_handle();
+    if (!shared_i2c_bus) {
+        ESP_LOGE(TAG_CAM, "bsp_i2c_get_handle() returned NULL!");
+        return -1;
+    }
+
+    esp_video_init_csi_config_t csi_cfg = {};
+    csi_cfg.sccb_config.init_sccb = false;
+    csi_cfg.sccb_config.i2c_handle = shared_i2c_bus;
+    csi_cfg.sccb_config.freq = 100000;
+    csi_cfg.reset_pin = static_cast<gpio_num_t>(BoardPins::Camera::RESET);
+    csi_cfg.pwdn_pin  = static_cast<gpio_num_t>(BoardPins::Camera::PWDN);
+    csi_cfg.dont_init_ldo = false;
+
+    esp_video_init_config_t cam_cfg = {};
+    cam_cfg.csi = &csi_cfg;
+
+    esp_err_t ret = esp_video_init(&cam_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_CAM, "esp_video_init failed: 0x%x", ret);
+        return ret;
+    }
+
+    s_video_fd = open("/dev/video0", O_RDWR | O_NONBLOCK);
+    if (s_video_fd < 0) {
+        ESP_LOGE(TAG_CAM, "Failed to open /dev/video0");
+        return -1;
+    }
+
+    // Set target resolution (1280x720) explicitly
+    struct v4l2_format fmt = {};
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = width;
+    fmt.fmt.pix.height = height;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_RGB565;
+
+    if (ioctl(s_video_fd, VIDIOC_S_FMT, &fmt) < 0) {
+        ESP_LOGE(TAG_CAM, "Failed to set RGB565 %dx%d format: errno %d (%s)", 
+                 width, height, errno, strerror(errno));
+        close(s_video_fd);
+        s_video_fd = -1;
+        return -1;
+    }
+
+    // Request MMAP Buffers
+    struct v4l2_requestbuffers req = {};
+    req.count = CAM_BUF_COUNT;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(s_video_fd, VIDIOC_REQBUFS, &req) < 0) {
+        ESP_LOGE(TAG_CAM, "Failed to request V4L2 buffers");
+        return -1;
+    }
+
+    for (int i = 0; i < CAM_BUF_COUNT; i++) {
+        struct v4l2_buffer buf = {};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+
+        if (ioctl(s_video_fd, VIDIOC_QUERYBUF, &buf) < 0) return -1;
+
+        s_cam_buf_lengths[i] = buf.length;
+        s_cam_buffers[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, s_video_fd, buf.m.offset);
+        if (s_cam_buffers[i].start == MAP_FAILED) return -1;
+        if (ioctl(s_video_fd, VIDIOC_QBUF, &buf) < 0) return -1;
+    }
+
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(s_video_fd, VIDIOC_STREAMON, &type) < 0) {
+        ESP_LOGE(TAG_CAM, "Failed to start V4L2 stream");
+        return -1;
+    }
+
+    ESP_LOGI(TAG_CAM, "OV5647 Camera streaming successfully on /dev/video0 (%dx%d RGB565)!", 
+             fmt.fmt.pix.width, fmt.fmt.pix.height);
+    return 0;
+}
+
+int32_t p4_camera_capture_frame(p4_camera_frame_t *frame, uint32_t timeout_ms) {
+    if (s_video_fd < 0 || !frame) return -1;
+
+    struct v4l2_buffer buf = {};
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+
+    int ret = ioctl(s_video_fd, VIDIOC_DQBUF, &buf);
+    if (ret < 0) {
+        return (errno == EAGAIN || errno == EWOULDBLOCK) ? -2 : -1;
+    }
+
+    frame->data = (uint8_t *)s_cam_buffers[buf.index].start;
+    frame->data_len = buf.bytesused;
+    frame->width = CONFIG_BIOMETRICS_CAM_WIDTH;   // 1280
+    frame->height = CONFIG_BIOMETRICS_CAM_HEIGHT; // 720
+    frame->buffer_index = buf.index;
+    return 0;
+}
+
+int32_t p4_camera_release_frame(const p4_camera_frame_t *frame) {
+    if (s_video_fd < 0 || !frame) {
+        return -1;
+    }
+
+    struct v4l2_buffer buf = {};
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = frame->buffer_index;
+
+    if (ioctl(s_video_fd, VIDIOC_QBUF, &buf) < 0) {
+        ESP_LOGE(TAG_CAM, "VIDIOC_QBUF failed on release for index %u", buf.index);
+        return -1;
+    }
+
+    return 0;
+}
+
 int32_t p4_hardware_init_all(const p4_hardware_config_t *config) {
     ESP_LOGI(TAG_HW, "Starting Unified Hardware Bring-up...");
 
     if (s_hardware_initialized) return ESP_OK;
     if (!config) return -1;
 
-    esp_err_t ret = init_display_with_bsp();
+    esp_err_t ret = init_audio_system();
     if (ret != ESP_OK) return ret;
 
-    ret = init_camera(config->camera_width, config->camera_height);
+    ret = init_display_system();
     if (ret != ESP_OK) return ret;
 
-    ESP_LOGI(TAG_HW, "All Systems Initialized Successfully!");
+    ret = p4_camera_init_v4l2(CONFIG_BIOMETRICS_CAM_WIDTH, CONFIG_BIOMETRICS_CAM_HEIGHT);
+    if (ret != ESP_OK) return ret;
+    ESP_LOGI(TAG_HW, "Display Systems Initialized Successfully!");
+
+    ret = init_p4_ethernet();
+    if (ret != ESP_OK) return ret;
+    ESP_LOGI(TAG_HW, "Ethernet Initialized Successfully!");
+
     s_hardware_initialized = true;
-
-    p4_display_draw_test_pattern();
     return ESP_OK;
-}
-
-int32_t p4_camera_capture_frame(p4_camera_frame_t *frame, uint32_t timeout_ms) {
-    if (!s_csi_cam_handle || !s_cam_frame_buffer || !frame) return -1;
-
-    esp_cam_ctlr_trans_t trans = {};
-    trans.buffer = s_cam_frame_buffer;
-    trans.buflen = s_cam_fb_size;
-
-    esp_err_t ret = esp_cam_ctlr_receive(s_csi_cam_handle, &trans, pdMS_TO_TICKS(timeout_ms));
-
-    if (ret == ESP_OK) {
-        frame->data = (uint8_t *)trans.buffer;
-        frame->data_len = (trans.received_size > 0) ? trans.received_size : s_cam_fb_size;
-        frame->width = 1280;
-        frame->height = 720;
-        return 0;
-    }
-    return (int32_t)ret;
 }
 
 int32_t p4_perform_ota_update(const char *url) {
@@ -514,19 +743,25 @@ int32_t init_p4_ethernet(void) {
     return esp_eth_start(eth_handle);
 }
 
-int init_admin_button_gpio() {
-    gpio_config_t io_conf = {};
-    io_conf.pin_bit_mask = (1ULL << BoardPins::System::ADMIN_BTN);
-    io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.intr_type = GPIO_INTR_DISABLE;
+int32_t p4_display_draw_frame(const uint16_t *frame_buffer, uint16_t width, uint16_t height) {
+    if (!s_lcd_panel || !frame_buffer) return ESP_ERR_INVALID_ARG;
 
-    return (int)gpio_config(&io_conf);
+    esp_err_t ret = esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, 0, width, height, frame_buffer);
+    return (int32_t)ret;
 }
 
-bool is_admin_button_pressed() {
-    return gpio_get_level(BoardPins::System::ADMIN_BTN) == 0;
+int32_t p4_display_draw_bitmap(uint16_t x_start, uint16_t y_start, uint16_t x_end, uint16_t y_end, const uint16_t *data) {
+    if (!s_lcd_panel || !data) return -1;
+
+    uintptr_t addr = (uintptr_t)data;
+    size_t len = (x_end - x_start) * (y_end - y_start) * sizeof(uint16_t);
+
+    uintptr_t aligned_addr = addr & ~(C_LINE_SIZE - 1);
+    size_t aligned_len = (addr + len - aligned_addr + C_LINE_SIZE - 1) & ~(C_LINE_SIZE - 1);
+
+    esp_cache_msync((void *)aligned_addr, aligned_len, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
+    return (int32_t)esp_lcd_panel_draw_bitmap(s_lcd_panel, x_start, y_start, x_end, y_end, data);
 }
 
 // -----------------------------------------------------------------------------
@@ -538,32 +773,23 @@ int32_t dl_mobilefacenet_init(const uint8_t *model_buf, size_t model_size) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    try {
-        g_mobilefacenet_model = new dl::Model(
-            (const char *)model_buf,
-            model_size
-        );
+    g_mobilefacenet_model = new (std::nothrow) dl::Model(
+        (const char *)model_buf,
+        model_size
+    );
 
-        if (!g_mobilefacenet_model) {
-            ESP_LOGE(TAG_FACENET, "Failed to allocate dl::Model");
-            return ESP_FAIL;
-        }
-
-        ESP_LOGI(TAG_FACENET, "MobileFaceNet loaded successfully! (Flash addr: %p)", model_buf);
-        return ESP_OK;
-
-    } catch (const std::exception &e) {
-        ESP_LOGE(TAG_FACENET, "Exception during ESP-DL model construction: %s", e.what());
-        return ESP_FAIL;
-    } catch (...) {
-        ESP_LOGE(TAG_FACENET, "Unknown exception during ESP-DL model construction");
+    if (!g_mobilefacenet_model) {
+        ESP_LOGE(TAG_FACENET, "Failed to allocate dl::Model");
         return ESP_FAIL;
     }
+
+    ESP_LOGI(TAG_FACENET, "MobileFaceNet loaded successfully! (Flash addr: %p)", model_buf);
+    return ESP_OK;
 }
 
 int32_t dl_mobilefacenet_run(const uint8_t *crop_rgb888, float *out_embedding, size_t embedding_len) {
     if (!g_mobilefacenet_model) {
-        ESP_LOGE(TAG_FACENET, "Model not initialized! Call dl_mobilefacenet_init first.");
+        ESP_LOGE(TAG_FACENET, "Model not initialized!");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -571,94 +797,175 @@ int32_t dl_mobilefacenet_run(const uint8_t *crop_rgb888, float *out_embedding, s
         return ESP_ERR_INVALID_ARG;
     }
 
-    try {
-        std::map<std::string, dl::TensorBase *> &inputs = g_mobilefacenet_model->get_inputs();
-        if (inputs.empty()) return ESP_FAIL;
+    std::map<std::string, dl::TensorBase *> &inputs = g_mobilefacenet_model->get_inputs();
+    if (inputs.empty()) return ESP_FAIL;
 
-        dl::TensorBase *input_tensor = inputs.begin()->second;
-        void *tensor_buf = input_tensor->get_element_ptr();
-        if (!tensor_buf) return ESP_FAIL;
+    dl::TensorBase *input_tensor = inputs.begin()->second;
+    void *tensor_buf = input_tensor->get_element_ptr();
+    if (!tensor_buf) return ESP_FAIL;
 
-        size_t input_bytes = input_tensor->get_bytes();
-        std::memcpy(tensor_buf, crop_rgb888, input_bytes);
+    size_t input_bytes = input_tensor->get_bytes();
+    memcpy(tensor_buf, crop_rgb888, input_bytes);
 
-        g_mobilefacenet_model->run();
+    g_mobilefacenet_model->run();
 
-        std::map<std::string, dl::TensorBase *> &outputs = g_mobilefacenet_model->get_outputs();
-        if (outputs.empty()) return ESP_FAIL;
+    std::map<std::string, dl::TensorBase *> &outputs = g_mobilefacenet_model->get_outputs();
+    if (outputs.empty()) return ESP_FAIL;
 
-        dl::TensorBase *output_tensor = outputs.begin()->second;
-        int8_t *quant_data = (int8_t *)output_tensor->get_element_ptr();
+    dl::TensorBase *output_tensor = outputs.begin()->second;
+    int8_t *quant_data = (int8_t *)output_tensor->get_element_ptr();
+    if (!quant_data) return ESP_FAIL;
 
-        int exponent = output_tensor->get_exponent();
-        float scale = std::pow(2.0f, exponent);
+    int exponent = output_tensor->get_exponent();
+    float scale = powf(2.0f, (float)exponent);
 
-        float sum_squares = 0.0f;
+    float sum_squares = 0.0f;
+    for (size_t i = 0; i < 512; i++) {
+        float dequant_val = (float)quant_data[i] * scale;
+        out_embedding[i] = dequant_val;
+        sum_squares += dequant_val * dequant_val;
+    }
+
+    float l2_norm = sqrtf(sum_squares);
+    if (l2_norm > 1e-6f) {
+        float inv_norm = 1.0f / l2_norm;
         for (size_t i = 0; i < 512; i++) {
-            float dequant_val = (float)quant_data[i] * scale;
-            out_embedding[i] = dequant_val;
-            sum_squares += dequant_val * dequant_val;
+            out_embedding[i] *= inv_norm;
         }
-
-        float l2_norm = std::sqrt(sum_squares);
-        if (l2_norm > 1e-6f) {
-            float inv_norm = 1.0f / l2_norm;
-            for (size_t i = 0; i < 512; i++) {
-                out_embedding[i] *= inv_norm;
-            }
-        }
-
-        return ESP_OK;
-
-    } catch (const std::exception &e) {
-        ESP_LOGE(TAG_FACENET, "Exception during inference: %s", e.what());
-        return ESP_FAIL;
-    } catch (...) {
-        ESP_LOGE(TAG_FACENET, "Unknown exception during inference");
-        return ESP_FAIL;
-    }
-}
-
-int32_t init_touch_with_bsp(void) {
-    if (s_touch_handle != NULL) return ESP_OK;
-
-    ESP_LOGI(TAG_LCD, "Initializing GT911 Touch Controller via Waveshare BSP...");
-
-    esp_err_t err = bsp_i2c_init();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG_LCD, "Failed to initialize I2C for touch: 0x%x", err);
-        return err;
     }
 
-    err = bsp_touch_new(NULL, &s_touch_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG_LCD, "Failed to initialize touch handle: 0x%x", err);
-        return err;
-    }
-
-    ESP_LOGI(TAG_LCD, "Touch Controller Initialized Successfully!");
     return ESP_OK;
 }
 
-bool p4_touch_read(p4_touch_data_t *touch_data) {
-    if (!s_touch_handle || !touch_data) return false;
+void setup_split_screen_ui(void) {
+    if (!lvgl_lock(200)) return;
 
-    esp_lcd_touch_read_data(s_touch_handle);
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x121212), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
 
-    uint16_t x[1] = {0};
-    uint16_t y[1] = {0};
-    uint16_t strength[1] = {0};
-    uint8_t point_num = 0;
+    // Left Column: 640x720 Video Viewport
+    s_camera_img = lv_image_create(scr);
+    lv_obj_set_size(s_camera_img, 640, 720);
+    lv_obj_align(s_camera_img, LV_ALIGN_LEFT_MID, 0, 0);
 
-    bool touched = esp_lcd_touch_get_coordinates(s_touch_handle, x, y, strength, &point_num, 1);
+    // Right Column: 640x720 Control Panel
+    lv_obj_t *panel = lv_obj_create(scr);
+    lv_obj_set_size(panel, 640, 720);
+    lv_obj_align(panel, LV_ALIGN_RIGHT_MID, 0, 0);
+    
+    // Explicit dark styling to replace default LVGL light-grey box
+    lv_obj_set_style_bg_color(panel, lv_color_hex(0x1E1E1E), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(panel, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(panel, 0, LV_PART_MAIN);
 
-    touch_data->touched = touched && (point_num > 0);
-    touch_data->x = x[0];
-    touch_data->y = y[0];
-    touch_data->strength = strength[0];
-    touch_data->points = point_num;
+    lv_obj_t *title = lv_label_create(panel);
+    lv_label_set_text(title, "MULTIMODAL BIOMETRICS");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
 
-    return touch_data->touched;
+    lvgl_unlock();
+}
+
+void update_camera_viewport(const p4_camera_frame_t *frame) {
+    if (!s_ppa_client) {
+        ESP_LOGE("PPA_SYS", "PPA client handle is NULL!");
+        return;
+    }
+    if (!s_camera_img || !frame || !frame->data) return;
+
+    const size_t cache_line_size = 128;
+    const uint16_t out_w = 640;
+    const uint16_t out_h = 480;
+    const uint32_t out_stride = out_w * sizeof(uint16_t); // 1280 bytes
+    const size_t raw_out_bytes = out_stride * out_h;      // 614,400 bytes
+
+    // Round output size up to 128-byte cache line boundary
+    const size_t out_bytes = (raw_out_bytes + cache_line_size - 1) & ~(cache_line_size - 1);
+
+    // 128-byte aligned PSRAM buffers for PPA DMA
+    if (!s_ppa_buf[0]) {
+        s_ppa_buf[0] = (uint16_t *)heap_caps_aligned_alloc(
+            128, out_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+        s_ppa_buf[1] = (uint16_t *)heap_caps_aligned_alloc(
+            128, out_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+        if (!s_ppa_buf[0] || !s_ppa_buf[1]) {
+            ESP_LOGE("PPA_SYS", "Failed to allocate 128-byte aligned PSRAM buffers!");
+            return;
+        }
+    }
+
+    uint16_t *current_ppa_out = s_ppa_buf[s_ppa_idx];
+    s_ppa_idx ^= 1;
+
+    uint32_t in_width = (frame->width > 0) ? frame->width : 1280;
+    uint32_t in_height = (frame->height > 0) ? frame->height : 960;
+    uint32_t bytesperline = (frame->data_len > 0 && in_height > 0) 
+                            ? (frame->data_len / in_height) 
+                            : (in_width * sizeof(uint16_t));
+    uint32_t in_stride_pixels = bytesperline / sizeof(uint16_t);
+
+    ppa_srm_oper_config_t srm_cfg = {};
+
+    // --- INPUT PICTURE CONFIGURATION ---
+    srm_cfg.in.buffer = frame->data;
+    srm_cfg.in.pic_w = in_stride_pixels;
+    srm_cfg.in.pic_h = in_height;
+    srm_cfg.in.block_w = in_width;
+    srm_cfg.in.block_h = in_height;
+    srm_cfg.in.block_offset_x = 0;
+    srm_cfg.in.block_offset_y = 0;
+    srm_cfg.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+
+    // --- OUTPUT PICTURE CONFIGURATION ---
+    srm_cfg.out.buffer = current_ppa_out;
+    srm_cfg.out.buffer_size = out_bytes;       // Explicit output buffer size in bytes
+    srm_cfg.out.pic_w = out_w;
+    srm_cfg.out.pic_h = out_h;
+    srm_cfg.out.block_offset_x = 0;
+    srm_cfg.out.block_offset_y = 0;
+    srm_cfg.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+
+    // --- TRANSFORMATIONS ---
+    srm_cfg.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
+    srm_cfg.scale_x = 0.5f;
+    srm_cfg.scale_y = 0.5f;
+    srm_cfg.mirror_x = false;
+    srm_cfg.mirror_y = false;
+    srm_cfg.rgb_swap = false;
+    srm_cfg.byte_swap = false;
+    srm_cfg.mode = PPA_TRANS_MODE_BLOCKING;
+
+    // Execute PPA hardware scaling
+    esp_err_t err = ppa_do_scale_rotate_mirror(s_ppa_client, &srm_cfg);
+    if (err != ESP_OK) {
+        static uint32_t err_cnt = 0;
+        if (++err_cnt % 30 == 1) {
+            ESP_LOGE("PPA_SYS", "ppa_do_scale_rotate_mirror failed: 0x%x", err);
+        }
+        return;
+    }
+
+    // --- PASS HARDWARE-SCALED BUFFER TO LVGL 9 ---
+    if (lvgl_lock(16)) {
+        s_camera_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+        s_camera_dsc.header.w = out_w; 
+        s_camera_dsc.header.h = out_h;
+        s_camera_dsc.header.stride = out_stride;
+        s_camera_dsc.data_size = raw_out_bytes;
+        s_camera_dsc.data = (const uint8_t *)current_ppa_out;
+
+        lv_image_set_src(s_camera_img, NULL);
+        lv_image_set_src(s_camera_img, &s_camera_dsc);
+        lv_image_set_scale(s_camera_img, 256);
+
+        lv_obj_move_foreground(s_camera_img);
+        lv_obj_invalidate(s_camera_img);
+        
+        lvgl_unlock();
+    }
 }
 
 } // extern "C"
