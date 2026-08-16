@@ -169,14 +169,7 @@ impl SystemResourcesBuilder {
         let timer_service = EspTaskTimerService::new()
             .context("[SystemResources] Failed to create task timer service")?;
 
-        // 2. Audio Subsystem & Worker
-        init_audio_subsystem()
-            .context("[SystemResources] initializes audio system")?;
-        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<Vec<i16>>();
-        crate::audio_worker::spawn_audio_capture_thread(0, audio_tx);
-        let hdmi_player = HdmiAudioPlayer::new(0);
-
-        // 3. Unified BSP Board Hardware (Display, Camera, I2C, Power)
+        // 2. Unified BSP Board Hardware (Display, Camera, I2C, Power)
         let config = P4HardwareConfig {
             display_width: 1280,
             display_height: 720,
@@ -187,6 +180,13 @@ impl SystemResourcesBuilder {
         if init_ret != 0 {
             bail!("[SystemResources] p4_hardware_init_all failed: {}", init_ret);
         }
+
+        // 3. Audio Subsystem & Worker
+        //init_audio_subsystem()
+        //    .context("[SystemResources] initializes audio system")?;
+        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<Vec<i16>>();
+        crate::audio_worker::spawn_audio_capture_thread(0, audio_tx);
+        let hdmi_player = HdmiAudioPlayer::new(0);
 
         // 4. Admin Button (Pure Rust PinDriver on GPIO0)
         let admin_button = PinDriver::input(self.peripherals.pins.gpio0, Pull::Up)
@@ -417,19 +417,6 @@ impl SystemResources {
 
 pub fn validate_running_app() {
     unsafe { ffi::p4_mark_app_valid() };
-}
-
-pub fn init_audio_subsystem() -> Result<()> {
-    let ret = unsafe { 
-        ffi::init_i2s_duplex_c(SAMPLE_RATE, BCLK_GPIO, WS_GPIO, DIN_GPIO, DOUT_GPIO) 
-    };
-    
-    if ret != 0 {
-        bail!("Failed to initialize audio subsystem: {}", ret); // Instantly returns Err
-    }
-
-    info!("[Audio] Duplex I2S audio subsystem initialized.");
-    Ok(())
 }
 
 pub fn test_camera_capture() {

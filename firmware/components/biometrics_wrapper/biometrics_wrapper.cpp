@@ -94,16 +94,23 @@ namespace BoardPins {
     namespace System {
         constexpr gpio_num_t ADMIN_BTN = GPIO_NUM_0;
     }
+    namespace Audio {
+        constexpr gpio_num_t BCLK      = GPIO_NUM_12;
+        constexpr gpio_num_t WS        = GPIO_NUM_13;
+        constexpr gpio_num_t DIN       = GPIO_NUM_11;
+        constexpr gpio_num_t DOUT      = GPIO_NUM_14;
+    }
 }
 
 #define TAG_HW      "p4_hardware"
 #define TAG_CAM     "p4_camera"
 #define TAG_ETH     "p4_ethernet"
+#define TAG_TOUCH   "p4_touch"
+#define TAG_LVGL    "p4_lvgl"
+#define TAG_AUDIO   "p4_audio"
 #define TAG_OTA     "p4_ota"
 #define TAG_FACENET "ESP_DL_FACENET"
 #define TAG_I2S     "I2S_WRAPPER"
-#define TAG_LV      "biometrics_lv"
-#define TAG_TOUCH   "p4_touch"
 
 #define CAM_BUF_COUNT 2
 #define C_LINE_SIZE 128  // ESP32-P4 L2 Cache Line Size (0x80)
@@ -262,15 +269,15 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
 // -----------------------------------------------------------------------------
 // Audio Peripheral Drivers
 // -----------------------------------------------------------------------------
-int init_i2s_tx_c(int i2s_port, uint32_t sample_rate, int bclk_gpio, int ws_gpio, int dout_gpio) {
-    return init_i2s_duplex_c(sample_rate, bclk_gpio, ws_gpio, -1, dout_gpio);
-}
 
-int init_i2s_mic_c(int i2s_port, uint32_t sample_rate, int bclk_gpio, int ws_gpio, int din_gpio) {
-    return init_i2s_duplex_c(sample_rate, bclk_gpio, ws_gpio, din_gpio, -1);
-}
-
+/*
+* Initialize I2S TX and RX channels together.
+* Outcome:
+*  - TX channel (g_i2s_tx_handle): I2S_TX, 16-bit data, left-justified, mono, no DMA, no clock divider.
+*  - RX channel (g_i2s_rx_handle): I2S_RX, 16-bit data, left-justified, mono, no DMA, no clock divider.
+*/
 int init_i2s_duplex_c(uint32_t sample_rate, int bclk_gpio, int ws_gpio, int din_gpio, int dout_gpio) {
+    // 1. Clean up existing channels if re-initialized
     if (g_i2s_tx_handle) {
         i2s_channel_disable(g_i2s_tx_handle);
         i2s_del_channel(g_i2s_tx_handle);
@@ -282,53 +289,58 @@ int init_i2s_duplex_c(uint32_t sample_rate, int bclk_gpio, int ws_gpio, int din_
         g_i2s_rx_handle = NULL;
     }
 
+    // 2. Allocate full-duplex channel pair on I2S_NUM_0
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    
-    i2s_chan_handle_t *p_tx = (dout_gpio >= 0) ? &g_i2s_tx_handle : NULL;
-    i2s_chan_handle_t *p_rx = (din_gpio >= 0)  ? &g_i2s_rx_handle : NULL;
-
-    esp_err_t ret = i2s_new_channel(&chan_cfg, p_tx, p_rx);
+    esp_err_t ret = i2s_new_channel(&chan_cfg, &g_i2s_tx_handle, &g_i2s_rx_handle);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG_I2S, "i2s_new_channel failed: 0x%x", ret);
+        ESP_LOGE(TAG_AUDIO, "Failed to allocate I2S channels: 0x%x", ret);
         return (int)ret;
     }
 
-    if (g_i2s_tx_handle && dout_gpio >= 0) {
-        i2s_std_config_t tx_cfg = {
-            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
-            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-            .gpio_cfg = {
-                .mclk = I2S_GPIO_UNUSED,
-                .bclk = (gpio_num_t)bclk_gpio,
-                .ws   = (gpio_num_t)ws_gpio,
-                .dout = (gpio_num_t)dout_gpio,
-                .din  = I2S_GPIO_UNUSED,
-            },
-        };
-        ret = i2s_channel_init_std_mode(g_i2s_tx_handle, &tx_cfg);
-        if (ret != ESP_OK) return (int)ret;
-        ret = i2s_channel_enable(g_i2s_tx_handle);
-        if (ret != ESP_OK) return (int)ret;
+    // 3. Configure TX Channel (Drives Speaker DOUT & Physical Clocks BCLK/WS)
+    i2s_std_config_t tx_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = (gpio_num_t)bclk_gpio,
+            .ws   = (gpio_num_t)ws_gpio,
+            .dout = (gpio_num_t)dout_gpio,
+            .din  = I2S_GPIO_UNUSED,
+        },
+    };
+    ret = i2s_channel_init_std_mode(g_i2s_tx_handle, &tx_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_AUDIO, "Failed to init I2S TX channel: 0x%x", ret);
+        return (int)ret;
     }
 
-    if (g_i2s_rx_handle && din_gpio >= 0) {
-        i2s_std_config_t rx_cfg = {
-            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
-            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-            .gpio_cfg = {
-                .mclk = I2S_GPIO_UNUSED,
-                .bclk = (gpio_num_t)bclk_gpio,
-                .ws   = (gpio_num_t)ws_gpio,
-                .dout = I2S_GPIO_UNUSED,
-                .din  = (gpio_num_t)din_gpio,
-            },
-        };
-        ret = i2s_channel_init_std_mode(g_i2s_rx_handle, &rx_cfg);
-        if (ret != ESP_OK) return (int)ret;
-        ret = i2s_channel_enable(g_i2s_rx_handle);
-        if (ret != ESP_OK) return (int)ret;
+    // 4. Configure RX Channel (Reads Microphone DIN & Shares Clock Internal Lines)
+    i2s_std_config_t rx_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = I2S_GPIO_UNUSED, // Uses internal clock routed from TX
+            .ws   = I2S_GPIO_UNUSED, // Uses internal clock routed from TX
+            .dout = I2S_GPIO_UNUSED,
+            .din  = (gpio_num_t)din_gpio,
+        },
+    };
+    ret = i2s_channel_init_std_mode(g_i2s_rx_handle, &rx_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_AUDIO, "Failed to init I2S RX channel: 0x%x", ret);
+        return (int)ret;
     }
 
+    // 5. Enable both channels
+    ret = i2s_channel_enable(g_i2s_tx_handle);
+    if (ret != ESP_OK) return (int)ret;
+
+    ret = i2s_channel_enable(g_i2s_rx_handle);
+    if (ret != ESP_OK) return (int)ret;
+
+    ESP_LOGI(TAG_AUDIO, "I2S_NUM_0 Duplex audio initialized successfully (%u Hz)", sample_rate);
     return 0;
 }
 
@@ -379,15 +391,20 @@ void camera_stream_task(void *pvParameters) {
     }
 }
 
+int32_t init_audio_system(void) {
+    const uint32_t SAMPLE_RATE = 16000U;
+    return init_i2s_duplex_c(SAMPLE_RATE, BoardPins::Audio::BCLK, BoardPins::Audio::WS, BoardPins::Audio::DIN, BoardPins::Audio::DOUT);
+}
+
 // Unified Display, Touch & LVGL 9 System Initialization
 int32_t init_display_system(void) {
-    ESP_LOGI(TAG_LV, "Initializing Display Hardware (1280x720 Landscape)...");
+    ESP_LOGI(TAG_LVGL, "Initializing Display Hardware (1280x720 Landscape)...");
 
     s_lvgl_mutex = xSemaphoreCreateMutex();
 
     // 0. Initialize PPA Hardware Accelerator Client FIRST
     if (init_ppa_hardware_engine() != ESP_OK) {
-        ESP_LOGE(TAG_LV, "Failed to initialize PPA hardware client!");
+        ESP_LOGE(TAG_LVGL, "Failed to initialize PPA hardware client!");
         return ESP_FAIL;
     }
 
@@ -428,7 +445,7 @@ int32_t init_display_system(void) {
     void *buf2 = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     if (!buf1 || !buf2) {
-        ESP_LOGE(TAG_LV, "Failed to allocate PSRAM draw buffers!");
+        ESP_LOGE(TAG_LVGL, "Failed to allocate PSRAM draw buffers!");
         return ESP_ERR_NO_MEM;
     }
 
@@ -598,7 +615,10 @@ int32_t p4_hardware_init_all(const p4_hardware_config_t *config) {
     if (s_hardware_initialized) return ESP_OK;
     if (!config) return -1;
 
-    esp_err_t ret = init_display_system();
+    esp_err_t ret = init_audio_system();
+    if (ret != ESP_OK) return ret;
+
+    ret = init_display_system();
     if (ret != ESP_OK) return ret;
 
     ret = p4_camera_init_v4l2(CONFIG_BIOMETRICS_CAM_WIDTH, CONFIG_BIOMETRICS_CAM_HEIGHT);
