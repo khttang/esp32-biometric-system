@@ -1,0 +1,10 @@
+dependencies:
+  espressif/esp-dl: "^3.3.0"
+  espressif/esp_video: "^2.3.0"
+  espressif/es8311: "^1.0.0"
+  waveshare/esp_lcd_hx8394: "^2.1.0"
+  espressif/esp_codec_dev: "^1.6.2"
+  espressif/esp_lcd_touch: "^1.2.0"
+  espressif/esp_lcd_touch_gt911: "^1.2.0"
+  lvgl/lvgl: "^9.2.2"
+  espressif/esp_lvgl_port: "^2.3.2"

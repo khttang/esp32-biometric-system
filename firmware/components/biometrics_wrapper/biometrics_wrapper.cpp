@@ -147,6 +147,7 @@ static void *s_ui_canvas_buf = NULL;
 static lv_obj_t *s_camera_canvas_obj = NULL;
 static TaskHandle_t s_camera_task_handle = NULL;
 static volatile bool s_ui_ready = false;
+static lv_obj_t *s_touch_label = NULL;
 
 extern "C" {
     i2c_master_bus_handle_t bsp_i2c_get_handle(void);
@@ -276,6 +277,30 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         break;
     default:
         break;
+    }
+}
+
+static void custom_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
+    esp_lcd_touch_handle_t tp = (esp_lcd_touch_handle_t)lv_indev_get_user_data(indev);
+    if (!tp) return;
+
+    // Gracefully handle I2C read errors without triggering ESP_ERROR_CHECK abort
+    esp_err_t err = esp_lcd_touch_read_data(tp);
+    if (err != ESP_OK) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        return; // Drop frame gracefully on I2C glitch
+    }
+
+    uint16_t touch_x[1], touch_y[1], touch_strength[1];
+    uint8_t touch_cnt = 0;
+    bool touched = esp_lcd_touch_get_coordinates(tp, touch_x, touch_y, touch_strength, &touch_cnt, 1);
+
+    if (touched && touch_cnt > 0) {
+        data->point.x = touch_x[0];
+        data->point.y = touch_y[0];
+        data->state = LV_INDEV_STATE_PRESSED;
+    } else {
+        data->state = LV_INDEV_STATE_RELEASED;
     }
 }
 
@@ -536,8 +561,8 @@ int32_t init_display_system(void) {
 
     // 7. Install GT911 Touch Controller over Shared I2C0
     esp_lcd_panel_io_i2c_config_t touch_io_cfg = {};
-    touch_io_cfg.dev_addr = ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS; // 0x5D or 0x14
-    touch_io_cfg.scl_speed_hz = 400000;
+    touch_io_cfg.dev_addr = ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS_BACKUP; // 0x5D or 0x14
+    touch_io_cfg.scl_speed_hz = 100000;
     touch_io_cfg.control_phase_bytes = 1;  // Standard for GT911
     touch_io_cfg.dc_bit_offset = 0;        // MUST BE 0 (GT911 has no D/C bit)
     touch_io_cfg.lcd_cmd_bits = 16;        // GT911 uses 16-bit register addresses
@@ -551,15 +576,24 @@ int32_t init_display_system(void) {
         .rst_gpio_num = GPIO_NUM_NC,
         .int_gpio_num = GPIO_NUM_NC,
         .levels = { .reset = 0, .interrupt = 0 },
-        .flags = { .swap_xy = 0, .mirror_x = 0, .mirror_y = 0 },
+        // Hardware coordinate mapping for 270 degree software display rotation
+        .flags = {
+            .swap_xy = 1,   // Swaps X (720) and Y (1280) axes
+            .mirror_x = 1,  // Inverts horizontal coordinate direction
+            .mirror_y = 0,  // Keeps vertical axis orientation
+        },
     };
     ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_gt911(touch_io, &touch_cfg, &s_touch_handle));
 
-    const lvgl_port_touch_cfg_t lvgl_touch_cfg = {
-        .disp = disp,
-        .handle = s_touch_handle,
-    };
-    lvgl_port_add_touch(&lvgl_touch_cfg);
+    if (lvgl_port_lock(100)) {
+        lv_indev_t *indev = lv_indev_create();
+        lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+        lv_indev_set_read_cb(indev, custom_touchpad_read);
+        lv_indev_set_user_data(indev, (void *)s_touch_handle);
+        lv_indev_set_display(indev, disp);
+        lvgl_port_unlock();
+        ESP_LOGI(TAG_TOUCH, "Custom fault-tolerant GT911 touch driver registered successfully.");
+    }
 
     setup_split_screen_ui();
 
@@ -985,6 +1019,20 @@ void setup_split_screen_ui(void) {
         lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
         lv_obj_set_style_text_opa(title, LV_OPA_COVER, LV_PART_MAIN);
         lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
+
+        // Add a test button to the right panel in setup_split_screen_ui()
+        lv_obj_t *btn = lv_button_create(panel);
+        lv_obj_set_size(btn, 200, 60);
+        lv_obj_align(btn, LV_ALIGN_CENTER, 0, 0);
+
+        lv_obj_t *btn_label = lv_label_create(btn);
+        lv_label_set_text(btn_label, "TEST TOUCH");
+        lv_obj_center(btn_label);
+
+        // Event callback to print touch status
+        lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+            ESP_LOGI("TOUCH_TEST", "Test button pressed successfully!");
+        }, LV_EVENT_CLICKED, NULL);
 
         lv_obj_move_foreground(panel);
 
