@@ -11,7 +11,6 @@ idf_component_register(
         esp_eth 
         esp_netif
         esp_lcd
-        esp_lcd_dsi
         esp_lcd_hx8394
         esp_lcd_touch
         esp_lcd_touch_gt911
@@ -19,7 +18,7 @@ idf_component_register(
         esp_pm 
         hal
         lvgl
-        esp32_p4_nano
+        esp_lvgl_port
         esp_video
 
 )

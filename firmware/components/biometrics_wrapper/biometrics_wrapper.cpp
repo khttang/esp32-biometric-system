@@ -37,12 +37,12 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
-// Waveshare ESP32-P4-NANO BSP & Touch Headers
-#include "esp_lcd_touch.h"
+#include "esp_ldo_regulator.h"
+#include "esp_lcd_mipi_dsi.h"
+#include "esp_lcd_hx8394.h"
 #include "esp_lcd_touch_gt911.h"
-#include "bsp/esp32_p4_nano.h"
-#include "bsp/display.h"
-#include "bsp/touch.h"
+#include "esp_lvgl_port.h"
+#include "esp_lcd_touch.h"
 #include "lvgl.h"
 
 // Core esp-dl Headers
@@ -57,7 +57,7 @@
 #endif
 
 #ifndef CONFIG_BIOMETRICS_CAM_HEIGHT
-#define CONFIG_BIOMETRICS_CAM_HEIGHT 720
+#define CONFIG_BIOMETRICS_CAM_HEIGHT 720        // working but less captured area 720, 960 is experimenting
 #endif
 
 struct v4l2_frame_buffer_t {
@@ -112,13 +112,15 @@ namespace BoardPins {
 #define TAG_FACENET "ESP_DL_FACENET"
 #define TAG_I2S     "I2S_WRAPPER"
 
-#define CAM_BUF_COUNT 2
-#define C_LINE_SIZE 128  // ESP32-P4 L2 Cache Line Size (0x80)
+#define CAM_BUF_COUNT 3
+#define C_LINE_SIZE 128               // ESP32-P4 L2 Cache Line Size (0x80)
 
 // Global Subsystem Handles
-static esp_lcd_panel_handle_t s_lcd_panel = NULL;
 static esp_lcd_panel_io_handle_t s_lcd_io = NULL;
+static esp_lcd_panel_handle_t s_lcd_panel = NULL;
 static esp_lcd_touch_handle_t s_touch_handle = NULL;
+static i2c_master_bus_handle_t s_i2c_bus_handle = NULL;
+
 
 static i2s_chan_handle_t g_i2s_tx_handle = NULL;
 static i2s_chan_handle_t g_i2s_rx_handle = NULL;
@@ -128,19 +130,23 @@ static ppa_client_handle_t s_ppa_client = NULL;
 static bool s_hardware_initialized = false;
 static dl::Model *g_mobilefacenet_model = NULL;
 
+static volatile bool s_camera_streaming = false;
 static int s_video_fd = -1;
 struct v4l2_frame_buffer_t s_cam_buffers[CAM_BUF_COUNT] = {};
 static size_t s_cam_buf_lengths[CAM_BUF_COUNT] = {0};
 
-static SemaphoreHandle_t s_lvgl_mutex = NULL;
-
 // LVGL Camera Image Descriptor Handles
 static lv_obj_t *s_camera_img = NULL;
 static lv_image_dsc_t s_camera_dsc = {};
-static lv_obj_t *s_status_label = NULL;
 
 static uint16_t *s_ppa_buf[2] = {NULL, NULL};
 static uint8_t s_ppa_idx = 0;
+
+static uint16_t *s_crop_buf = NULL;
+static void *s_ui_canvas_buf = NULL;
+static lv_obj_t *s_camera_canvas_obj = NULL;
+static TaskHandle_t s_camera_task_handle = NULL;
+static volatile bool s_ui_ready = false;
 
 extern "C" {
     i2c_master_bus_handle_t bsp_i2c_get_handle(void);
@@ -150,62 +156,6 @@ extern "C" {
 // -----------------------------------------------------------------------------
 // LVGL 9 Callbacks & Task Loop
 // -----------------------------------------------------------------------------
-
-// Asynchronous MIPI-DSI DMA completion callback
-static bool on_color_trans_done(esp_lcd_panel_handle_t panel, esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx) {
-    lv_display_t *disp = (lv_display_t *)user_ctx;
-    if (disp) {
-        lv_display_flush_ready(disp);
-    }
-    return false;
-}
-
-// Display Flush Callback (initiates async DSI DMA transfer)
-static void lvgl_display_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
-    esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)lv_display_get_user_data(disp);
-
-    int x1 = area->x1;
-    int x2 = area->x2;
-    int y1 = area->y1;
-    int y2 = area->y2;
-
-    // Draw directly to translated physical coordinates
-    esp_lcd_panel_draw_bitmap(panel, x1, y1, x2 + 1, y2 + 1, px_map);
-}
-
-// Touch Input Read Callback (reads GT911 coordinates)
-void lvgl_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
-    esp_lcd_touch_handle_t touch_handle = (esp_lcd_touch_handle_t)lv_indev_get_user_data(indev);
-    uint16_t touch_x[1], touch_y[1];
-    uint8_t touch_cnt = 0;
-
-    esp_lcd_touch_read_data(touch_handle);
-    bool pressed = esp_lcd_touch_get_coordinates(touch_handle, touch_x, touch_y, NULL, &touch_cnt, 1);
-
-    if (pressed && touch_cnt > 0) {
-        data->state = LV_INDEV_STATE_PRESSED;
-        // Map portrait hardware touch (720x1280) to landscape canvas (1280x720)
-        data->point.x = touch_y[0];
-        data->point.y = 719 - touch_x[0];
-    } else {
-        data->state = LV_INDEV_STATE_RELEASED;
-    }
-}
-
-// Background FreeRTOS task handling LVGL timer ticks
-static void lvgl_port_task(void *arg) {
-    while (1) {
-        if (xSemaphoreTake(s_lvgl_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-            uint32_t task_delay = lv_timer_handler();
-            xSemaphoreGive(s_lvgl_mutex);
-            
-            // Sleep for the dynamic time requested by LVGL (capped between 1ms and 30ms)
-            vTaskDelay(pdMS_TO_TICKS(task_delay > 0 ? (task_delay > 30 ? 30 : task_delay) : 1));
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
-    }
-}
 
 // Helper to apply V4L2 controls
 static void set_v4l2_control(int fd, uint32_t id, int32_t value, const char *name) {
@@ -235,6 +185,69 @@ void configure_camera_exposure_gain(int fd) {
     set_v4l2_control(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO, "EXPOSURE_AUTO");
     set_v4l2_control(fd, V4L2_CID_AUTOGAIN, 1, "AUTOGAIN");
     set_v4l2_control(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1, "AUTO_WHITE_BALANCE");
+}
+
+void process_camera_frame_task(void *pvParameters) {
+    struct v4l2_buffer buf = {};
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+
+    ESP_LOGI("CAM_TASK", "Camera capture task running on Core 1");
+
+    while (s_camera_streaming) {
+        if (ioctl(s_video_fd, VIDIOC_DQBUF, &buf) == 0) {
+            void *cam_buf = s_cam_buffers[buf.index].start;
+
+            if (s_ui_ready && s_camera_canvas_obj != NULL && s_ui_canvas_buf != NULL) {
+                if (lvgl_port_lock(0)) {
+                    ppa_srm_oper_config_t srm_cfg = {};
+                    memset(&srm_cfg, 0, sizeof(srm_cfg));
+
+                    // 1. Input Image Configuration (OV5647 1280x960)
+                    srm_cfg.in.buffer = cam_buf;
+                    srm_cfg.in.pic_w = 1280;
+                    srm_cfg.in.pic_h = 960;
+                    srm_cfg.in.block_w = 1280;
+                    srm_cfg.in.block_h = 960;
+                    srm_cfg.in.block_offset_x = 0;
+                    srm_cfg.in.block_offset_y = 0;
+                    srm_cfg.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+
+                    // 2. Output Canvas Configuration
+                    srm_cfg.out.buffer = s_ui_canvas_buf;
+                    srm_cfg.out.buffer_size = 360 * 640 * sizeof(uint16_t);
+                    srm_cfg.out.pic_w = 360;
+                    srm_cfg.out.pic_h = 640;
+                    srm_cfg.out.block_offset_x = 0;
+                    srm_cfg.out.block_offset_y = 0;
+                    srm_cfg.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+
+                    // 3. Scaling Ratios
+                    srm_cfg.scale_x = 360.0f / 1280.0f;
+                    srm_cfg.scale_y = 640.0f / 960.0f;
+                    srm_cfg.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
+                    srm_cfg.mirror_x = false;
+                    srm_cfg.mirror_y = false;
+
+                    // 4. Hardware Scale Execution
+                    esp_err_t ppa_err = ppa_do_scale_rotate_mirror(s_ppa_client, &srm_cfg);
+                    if (ppa_err != ESP_OK) {
+                        ESP_LOGE("CAM_TASK", "PPA scaling failed: 0x%x", ppa_err);
+                    } else {
+                        lv_obj_invalidate(s_camera_canvas_obj);
+                    }
+
+                    lvgl_port_unlock();
+                }
+            }
+            // Re-queue buffer back to V4L2
+            ioctl(s_video_fd, VIDIOC_QBUF, &buf);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    vTaskDelete(NULL);
 }
 
 // -----------------------------------------------------------------------------
@@ -366,125 +379,191 @@ extern "C" {
 
 esp_cam_sensor_device_t *ov5647_detect(void *config);
 
-// Thread-safe LVGL Mutex Helpers
-bool lvgl_lock(uint32_t timeout_ms) {
-    if (!s_lvgl_mutex) return false;
-    return xSemaphoreTake(s_lvgl_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
-}
-
-void lvgl_unlock(void) {
-    if (s_lvgl_mutex) {
-        xSemaphoreGive(s_lvgl_mutex);
-    }
-}
-
-void camera_stream_task(void *pvParameters) {
-    //(void)pvParameters;
-    p4_camera_frame_t frame = {};
-    while (1) {
-        // Dequeue frame captured by MIPI-CSI ISP DMA
-        if (p4_camera_capture_frame(&frame, 100) == 0) {
-            update_camera_viewport(&frame);
-            p4_camera_release_frame(&frame);
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-
 int32_t init_audio_system(void) {
     const uint32_t SAMPLE_RATE = 16000U;
     return init_i2s_duplex_c(SAMPLE_RATE, BoardPins::Audio::BCLK, BoardPins::Audio::WS, BoardPins::Audio::DIN, BoardPins::Audio::DOUT);
 }
 
-// Unified Display, Touch & LVGL 9 System Initialization
 int32_t init_display_system(void) {
-    ESP_LOGI(TAG_LVGL, "Initializing Display Hardware (1280x720 Landscape)...");
+    ESP_LOGI(TAG_LVGL, "Initializing Hardware via esp_lvgl_port...");
 
-    s_lvgl_mutex = xSemaphoreCreateMutex();
+    // 1. Shared I2C0 Master Bus (GPIO 7 SDA / GPIO 8 SCL)
+    if (!s_i2c_bus_handle) {
+        i2c_master_bus_config_t i2c_bus_cfg = {
+            .i2c_port = I2C_NUM_0,
+            .sda_io_num = GPIO_NUM_7,
+            .scl_io_num = GPIO_NUM_8,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt = 7,
+            .flags = { .enable_internal_pullup = true },
+        };
+        esp_err_t err = i2c_new_master_bus(&i2c_bus_cfg, &s_i2c_bus_handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_LVGL, "Failed to create I2C master bus: 0x%x", err);
+            return err;
+        }
+        ESP_LOGI(TAG_LVGL, "I2C Master Bus (I2C_NUM_0) created successfully!");
+    }
 
-    // 0. Initialize PPA Hardware Accelerator Client FIRST
     if (init_ppa_hardware_engine() != ESP_OK) {
         ESP_LOGE(TAG_LVGL, "Failed to initialize PPA hardware client!");
         return ESP_FAIL;
     }
 
-    // 1. Acquire raw LCD panel handles from BSP
-    bsp_lcd_handles_t handles = {};
-    esp_err_t err = bsp_display_new_with_handles(NULL, &handles);
-    if (err != ESP_OK) return err;
+    // 2. Power on MIPI-DSI PHY (2.5V on LDO Channel 3)
+    esp_ldo_channel_handle_t ldo_mipi_phy = NULL;
+    esp_ldo_channel_config_t ldo_cfg = {
+        .chan_id = 3,
+        .voltage_mv = 2500,
+    };
+    ESP_ERROR_CHECK(esp_ldo_acquire_channel(&ldo_cfg, &ldo_mipi_phy));
+    vTaskDelay(pdMS_TO_TICKS(10)); // Allow 2.5V PHY rail and crystal oscillator to settle
 
-    s_lcd_panel = handles.panel;
-    s_lcd_io = handles.io;
+    // 3. Initialize MIPI-DSI Bus
+    esp_lcd_dsi_bus_handle_t dsi_bus = NULL;
+    esp_lcd_dsi_bus_config_t bus_config = {
+        .bus_id = 0,
+        .num_data_lanes = 2,
+        .phy_clk_src = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
+        .lane_bit_rate_mbps = 1000
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_dsi_bus(&bus_config, &dsi_bus));
 
-    esp_lcd_panel_disp_on_off(handles.panel, true);
+    // 4. Install MIPI DBI IO
+    esp_lcd_panel_io_handle_t dbi_io = NULL;
+    esp_lcd_dbi_io_config_t dbi_config = {
+        .virtual_channel = 0,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_dbi(dsi_bus, &dbi_config, &dbi_io));
 
-    // 2. Acquire GT911 Touch handle from BSP
-    esp_lcd_touch_handle_t touch_handle = NULL;
-    if (bsp_touch_new(NULL, &touch_handle) == ESP_OK) {
-        s_touch_handle = touch_handle;
+    // 5. Configure DPI Timing explicitly for C++ compatibility
+    esp_lcd_dpi_panel_config_t dpi_config = {};
+    dpi_config.dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT;
+    dpi_config.dpi_clock_freq_mhz = 60;
+    dpi_config.virtual_channel = 0;
+    dpi_config.pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB565;
+    dpi_config.num_fbs = 2;                           // Allocates 1 DPI framebuffer
+    dpi_config.flags.use_dma2d = true;                 // Enables PPA/DMA2D acceleration
+    dpi_config.video_timing.h_size = 720;
+    dpi_config.video_timing.v_size = 1280;
+    dpi_config.video_timing.hsync_back_porch = 44;
+    dpi_config.video_timing.hsync_front_porch = 46;
+    dpi_config.video_timing.hsync_pulse_width = 8;
+    dpi_config.video_timing.vsync_back_porch = 16;
+    dpi_config.video_timing.vsync_front_porch = 16;
+    dpi_config.video_timing.vsync_pulse_width = 4;
+
+    hx8394_vendor_config_t vendor_config = {};
+    vendor_config.init_cmds = NULL;
+    vendor_config.init_cmds_size = 0;
+    vendor_config.mipi_config.dsi_bus = dsi_bus;
+    vendor_config.mipi_config.dpi_config = &dpi_config;
+    vendor_config.mipi_config.lane_num = 2;
+
+    esp_lcd_panel_dev_config_t panel_dev_config = {};
+    panel_dev_config.reset_gpio_num = -1;
+    panel_dev_config.rgb_endian = LCD_RGB_ENDIAN_RGB;
+    panel_dev_config.bits_per_pixel = 16;
+    panel_dev_config.vendor_config = &vendor_config;
+
+    // Power on & reset panel via IO expander at I2C address 0x45 using s_i2c_bus_handle
+    i2c_device_config_t io_exp_cfg = {};
+    io_exp_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    io_exp_cfg.device_address = 0x45;
+    io_exp_cfg.scl_speed_hz = 100000;
+
+    i2c_master_dev_handle_t io_exp_dev = NULL;
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus_handle, &io_exp_cfg, &io_exp_dev));
+
+    uint8_t write_buf[2];
+
+    // Register 0x95 -> 0x11
+    write_buf[0] = 0x95; write_buf[1] = 0x11;
+    i2c_master_transmit(io_exp_dev, write_buf, 2, 100);
+
+    // Register 0x95 -> 0x17
+    write_buf[0] = 0x95; write_buf[1] = 0x17;
+    i2c_master_transmit(io_exp_dev, write_buf, 2, 100);
+
+    // Register 0x96 -> 0x00
+    write_buf[0] = 0x96; write_buf[1] = 0x00;
+    i2c_master_transmit(io_exp_dev, write_buf, 2, 100);
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Register 0x96 -> 0xFF (Release Reset)
+    write_buf[0] = 0x96; write_buf[1] = 0xFF;
+    i2c_master_transmit(io_exp_dev, write_buf, 2, 100);
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Remove the temporary device handle when finished
+    i2c_master_bus_rm_device(io_exp_dev);
+
+    ESP_ERROR_CHECK(esp_lcd_new_panel_hx8394(dbi_io, &panel_dev_config, &s_lcd_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(s_lcd_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(s_lcd_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_lcd_panel, true));
+
+    // 6. Initialize ESP-LVGL-PORT for MIPI-DSI Panel
+    const lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    ESP_ERROR_CHECK(lvgl_port_init(&port_cfg));
+
+    lvgl_port_display_cfg_t lvgl_disp_cfg = {};
+    lvgl_disp_cfg.panel_handle = s_lcd_panel;
+    lvgl_disp_cfg.io_handle = NULL;
+    lvgl_disp_cfg.buffer_size = 720 * 40;
+    lvgl_disp_cfg.double_buffer = true;
+    lvgl_disp_cfg.hres = 720;
+    lvgl_disp_cfg.vres = 1280;
+    lvgl_disp_cfg.monochrome = false;
+    lvgl_disp_cfg.flags.buff_spiram = true;
+    lvgl_disp_cfg.flags.sw_rotate = true; // Prevents esp_lcd_panel_swap_xy/mirror calls
+
+    lvgl_port_display_dsi_cfg_t dsi_cfg = {};
+    dsi_cfg.flags.avoid_tearing = 0;
+
+    lv_display_t *disp = lvgl_port_add_disp_dsi(&lvgl_disp_cfg, &dsi_cfg);
+    if (!disp) {
+        ESP_LOGE(TAG_LVGL, "Failed to create LVGL DSI display handle!");
+        return ESP_FAIL;
     }
 
-    // 3. Initialize LVGL 9
-    lv_init();
+    // Apply software rotation without triggering panel driver swap_xy/mirror calls
+    lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
 
-    lv_tick_set_cb([]() -> uint32_t {
-        return (uint32_t)(esp_timer_get_time() / 1000);
-    });
+    // 7. Install GT911 Touch Controller over Shared I2C0
+    esp_lcd_panel_io_i2c_config_t touch_io_cfg = {};
+    touch_io_cfg.dev_addr = ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS; // 0x5D or 0x14
+    touch_io_cfg.scl_speed_hz = 400000;
+    touch_io_cfg.control_phase_bytes = 1;  // Standard for GT911
+    touch_io_cfg.dc_bit_offset = 0;        // MUST BE 0 (GT911 has no D/C bit)
+    touch_io_cfg.lcd_cmd_bits = 16;        // GT911 uses 16-bit register addresses
+    touch_io_cfg.lcd_param_bits = 0;
+    esp_lcd_panel_io_handle_t touch_io = NULL;
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(s_i2c_bus_handle, &touch_io_cfg, &touch_io));
 
-    // 4. Create Display (720x1280 physical panel rotated to 1280x720)
-    lv_display_t *disp = lv_display_create(720, 1280);
-    lv_display_set_user_data(disp, handles.panel);
-    
-    // Rotate 720x1280 physical panel into 1280x720 Landscape
-    lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_90);
+    esp_lcd_touch_config_t touch_cfg = {
+        .x_max = 720,
+        .y_max = 1280,
+        .rst_gpio_num = GPIO_NUM_NC,
+        .int_gpio_num = GPIO_NUM_NC,
+        .levels = { .reset = 0, .interrupt = 0 },
+        .flags = { .swap_xy = 0, .mirror_x = 0, .mirror_y = 0 },
+    };
+    ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_gt911(touch_io, &touch_cfg, &s_touch_handle));
 
-    // 5. Allocate draw buffers in PSRAM to avoid internal SRAM fragmentation
-    size_t buf_size = 1280 * 20 * sizeof(uint16_t); // 51.2 KB per buffer
+    const lvgl_port_touch_cfg_t lvgl_touch_cfg = {
+        .disp = disp,
+        .handle = s_touch_handle,
+    };
+    lvgl_port_add_touch(&lvgl_touch_cfg);
 
-    void *buf1 = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    void *buf2 = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-
-    if (!buf1 || !buf2) {
-        ESP_LOGE(TAG_LVGL, "Failed to allocate PSRAM draw buffers!");
-        return ESP_ERR_NO_MEM;
-    }
-
-    lv_display_set_buffers(disp, buf1, buf2, buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
-    lv_display_set_flush_cb(disp, lvgl_display_flush_cb);
-
-    // Register async DSI DMA callback
-    esp_lcd_dpi_panel_event_callbacks_t dsi_cbs = {};
-    dsi_cbs.on_color_trans_done = on_color_trans_done;
-    esp_lcd_dpi_panel_register_event_callbacks(handles.panel, &dsi_cbs, disp);
-
-    // 6. Touch Input Device
-    lv_indev_t *indev = lv_indev_create();
-    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
-    lv_indev_set_user_data(indev, touch_handle);
-    lv_indev_set_read_cb(indev, lvgl_touch_read_cb);
-
-    // 7. Start LVGL Task
-    xTaskCreatePinnedToCore(lvgl_port_task, "lvgl_task", 8192, NULL, 5, NULL, 0);
-
-    // 8. Construct 1280x720 UI Layout
     setup_split_screen_ui();
 
-    // 9. Spawn camera streaming worker thread on Core 1
-    xTaskCreatePinnedToCore(
-        camera_stream_task,  // Task function entry point
-        "camera_task",       // Task name
-        8192,                // Stack size in bytes (V4L2 driver needs ~8 KB)
-        NULL,                // Task input parameter
-        5,                   // Priority (matching or higher than main worker loop)
-        NULL,                // Task handle reference
-        1                    // Core ID (Core 1 isolates V4L2 from LVGL on Core 0)
-    );
-
-    return 0;
-}
-
-int32_t p4_camera_init_v4l2_default(void) {
-    return p4_camera_init_v4l2(CONFIG_BIOMETRICS_CAM_WIDTH, CONFIG_BIOMETRICS_CAM_HEIGHT);
+    return ESP_OK;
 }
 
 int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
@@ -492,15 +571,21 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
 
     ESP_LOGI(TAG_CAM, "Initializing OV5647 via esp_video at %dx%d...", width, height);
 
-    i2c_master_bus_handle_t shared_i2c_bus = bsp_i2c_get_handle();
-    if (!shared_i2c_bus) {
-        ESP_LOGE(TAG_CAM, "bsp_i2c_get_handle() returned NULL!");
+    if (!s_i2c_bus_handle) {
+        ESP_LOGE(TAG_CAM, "I2C master bus not initialized! Run init_display_system first.");
         return -1;
     }
 
+    // Hardware power-on and reset pulse for OV5647
+    gpio_set_level(static_cast<gpio_num_t>(BoardPins::Camera::PWDN), 0);
+    gpio_set_level(static_cast<gpio_num_t>(BoardPins::Camera::RESET), 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(static_cast<gpio_num_t>(BoardPins::Camera::RESET), 1);
+    vTaskDelay(pdMS_TO_TICKS(20));
+
     esp_video_init_csi_config_t csi_cfg = {};
     csi_cfg.sccb_config.init_sccb = false;
-    csi_cfg.sccb_config.i2c_handle = shared_i2c_bus;
+    csi_cfg.sccb_config.i2c_handle = s_i2c_bus_handle;
     csi_cfg.sccb_config.freq = 100000;
     csi_cfg.reset_pin = static_cast<gpio_num_t>(BoardPins::Camera::RESET);
     csi_cfg.pwdn_pin  = static_cast<gpio_num_t>(BoardPins::Camera::PWDN);
@@ -511,8 +596,8 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
 
     esp_err_t ret = esp_video_init(&cam_cfg);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG_CAM, "esp_video_init failed: 0x%x", ret);
-        return ret;
+        ESP_LOGW(TAG_CAM, "esp_video_init failed: 0x%x. Continuing in headless camera mode...", ret);
+        return 0; // Allows state machine loop to run
     }
 
     s_video_fd = open("/dev/video0", O_RDWR | O_NONBLOCK);
@@ -565,6 +650,21 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
         ESP_LOGE(TAG_CAM, "Failed to start V4L2 stream");
         return -1;
     }
+
+    // Register task on CPU 1 (Core 1) to leave CPU 0 free for LVGL/OS tasks
+    BaseType_t res = xTaskCreatePinnedToCore(
+        process_camera_frame_task, // Task function pointer
+        "cam_frame_task",          // Task name
+        8192,                      // Stack size in bytes
+        NULL,                      // Task parameters
+        5,                         // Priority (Higher priority for low-latency video)
+        &s_camera_task_handle,     // Task handle pointer
+        1                          // Core ID (CPU 1)
+    );
+    if (res != pdPASS) {
+        ESP_LOGE("CAM_TASK", "Failed to spawn camera frame task!");
+    }
+    s_camera_streaming = true;
 
     ESP_LOGI(TAG_CAM, "OV5647 Camera streaming successfully on /dev/video0 (%dx%d RGB565)!", 
              fmt.fmt.pix.width, fmt.fmt.pix.height);
@@ -838,133 +938,118 @@ int32_t dl_mobilefacenet_run(const uint8_t *crop_rgb888, float *out_embedding, s
 }
 
 void setup_split_screen_ui(void) {
-    if (!lvgl_lock(200)) return;
+    if (lvgl_port_lock(100)) {
+        lv_obj_t *scr = lv_screen_active();
+        
+        // 1. Clean screen FIRST before creating new widgets!
+        lv_obj_clean(scr);
+        lv_obj_set_size(scr, 1280, 720);
 
-    lv_obj_t *scr = lv_screen_active();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x121212), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+        // 2. Allocate 128-byte aligned canvas buffer in PSRAM
+        const size_t raw_buf_size = 360 * 640 * sizeof(uint16_t);
+        size_t aligned_canvas_buf_size = (raw_buf_size + C_LINE_SIZE - 1) & ~(C_LINE_SIZE - 1);
 
-    // Left Column: 640x720 Video Viewport
-    s_camera_img = lv_image_create(scr);
-    lv_obj_set_size(s_camera_img, 640, 720);
-    lv_obj_align(s_camera_img, LV_ALIGN_LEFT_MID, 0, 0);
+        if (!s_ui_canvas_buf) {
+            s_ui_canvas_buf = heap_caps_aligned_alloc(C_LINE_SIZE, aligned_canvas_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
 
-    // Right Column: 640x720 Control Panel
-    lv_obj_t *panel = lv_obj_create(scr);
-    lv_obj_set_size(panel, 640, 720);
-    lv_obj_align(panel, LV_ALIGN_RIGHT_MID, 0, 0);
-    
-    // Explicit dark styling to replace default LVGL light-grey box
-    lv_obj_set_style_bg_color(panel, lv_color_hex(0x1E1E1E), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(panel, 0, LV_PART_MAIN);
-    lv_obj_set_style_radius(panel, 0, LV_PART_MAIN);
+        if (!s_ui_canvas_buf) {
+            ESP_LOGE("UI", "Failed to allocate canvas buffer in PSRAM!");
+            lvgl_port_unlock();
+            return;
+        }
 
-    lv_obj_t *title = lv_label_create(panel);
-    lv_label_set_text(title, "MULTIMODAL BIOMETRICS");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
+        // 3. Create Left Viewport: Camera Canvas Widget
+        s_camera_canvas_obj = lv_canvas_create(scr);
+        lv_canvas_set_buffer(s_camera_canvas_obj, s_ui_canvas_buf, 360, 640, LV_COLOR_FORMAT_RGB565);
+        lv_obj_set_size(s_camera_canvas_obj, 360, 640);
+        lv_obj_align(s_camera_canvas_obj, LV_ALIGN_LEFT_MID, 10, 0);
 
-    lvgl_unlock();
+        // 4. Create Right Viewport: System Control Panel (640x720 at x=640)
+        lv_obj_t *panel = lv_obj_create(scr);
+        lv_obj_set_size(panel, 640, 720);
+        lv_obj_set_pos(panel, 640, 0);
+
+        lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_pad_all(panel, 0, LV_PART_MAIN);
+        lv_obj_set_style_border_width(panel, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(panel, 0, LV_PART_MAIN);
+        
+        // Set BRIGHT RED background for visual verification
+        lv_obj_set_style_bg_color(panel, lv_color_hex(0xFF0000), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, LV_PART_MAIN);
+
+        // 5. Title Label
+        lv_obj_t *title = lv_label_create(panel);
+        lv_label_set_text(title, "MULTIMODAL BIOMETRICS");
+        lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+        lv_obj_set_style_text_opa(title, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
+
+        lv_obj_move_foreground(panel);
+
+        s_ui_ready = true;
+        lvgl_port_unlock();
+        ESP_LOGI("UI", "Split-screen UI setup complete. Canvas Obj: %p", (void*)s_camera_canvas_obj);
+    } else {
+        ESP_LOGE("UI", "Failed to acquire LVGL port lock for UI setup!");
+    }
 }
 
 void update_camera_viewport(const p4_camera_frame_t *frame) {
-    if (!s_ppa_client) {
-        ESP_LOGE("PPA_SYS", "PPA client handle is NULL!");
-        return;
+    if (!frame || !frame->data || !s_camera_img) return;
+
+    // 1. Allocate 128-byte cache-aligned PSRAM buffer for 640x720 viewport (921.6 KB)
+    if (!s_crop_buf) {
+        s_crop_buf = (uint16_t *)heap_caps_aligned_alloc(
+            128, 640 * 720 * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+        if (!s_crop_buf) return;
     }
-    if (!s_camera_img || !frame || !frame->data) return;
 
-    const size_t cache_line_size = 128;
-    const uint16_t out_w = 640;
-    const uint16_t out_h = 480;
-    const uint32_t out_stride = out_w * sizeof(uint16_t); // 1280 bytes
-    const size_t raw_out_bytes = out_stride * out_h;      // 614,400 bytes
+    const uint16_t *src = (const uint16_t *)frame->data;
+    uint32_t src_w = frame->width ? frame->width : 1280;
+    uint32_t src_h = frame->height ? frame->height : 720;
 
-    // Round output size up to 128-byte cache line boundary
-    const size_t out_bytes = (raw_out_bytes + cache_line_size - 1) & ~(cache_line_size - 1);
+    // 2. Center-crop 640x720 from input camera frame
+    uint32_t crop_x = (src_w > 640) ? (src_w - 640) / 2 : 0;
+    uint32_t crop_y = (src_h > 720) ? (src_h - 720) / 2 : 0;
+    uint32_t copy_w = (src_w < 640) ? src_w : 640;
+    uint32_t copy_h = (src_h < 720) ? src_h : 720;
 
-    // 128-byte aligned PSRAM buffers for PPA DMA
-    if (!s_ppa_buf[0]) {
-        s_ppa_buf[0] = (uint16_t *)heap_caps_aligned_alloc(
-            128, out_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-        );
-        s_ppa_buf[1] = (uint16_t *)heap_caps_aligned_alloc(
-            128, out_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-        );
-        if (!s_ppa_buf[0] || !s_ppa_buf[1]) {
-            ESP_LOGE("PPA_SYS", "Failed to allocate 128-byte aligned PSRAM buffers!");
-            return;
+    // Fast 32-bit row copying (transfers 2 pixels per iteration)
+    const uint32_t copy_w_words = (copy_w * sizeof(uint16_t)) / sizeof(uint32_t);
+    for (uint32_t y = 0; y < copy_h; y++) {
+        const uint32_t *src_row_32 = (const uint32_t *)(src + (y + crop_y) * src_w + crop_x);
+        uint32_t *dst_row_32 = (uint32_t *)(s_crop_buf + y * 640);
+
+        for (uint32_t x = 0; x < copy_w_words; x++) {
+            dst_row_32[x] = src_row_32[x];
         }
     }
 
-    uint16_t *current_ppa_out = s_ppa_buf[s_ppa_idx];
-    s_ppa_idx ^= 1;
+    // 3. Flush L2 Cache line to PSRAM for DSI controller DMA reads
+    esp_cache_msync((void *)s_crop_buf, 640 * 720 * sizeof(uint16_t), ESP_CACHE_MSYNC_FLAG_DIR_C2M);
 
-    uint32_t in_width = (frame->width > 0) ? frame->width : 1280;
-    uint32_t in_height = (frame->height > 0) ? frame->height : 960;
-    uint32_t bytesperline = (frame->data_len > 0 && in_height > 0) 
-                            ? (frame->data_len / in_height) 
-                            : (in_width * sizeof(uint16_t));
-    uint32_t in_stride_pixels = bytesperline / sizeof(uint16_t);
-
-    ppa_srm_oper_config_t srm_cfg = {};
-
-    // --- INPUT PICTURE CONFIGURATION ---
-    srm_cfg.in.buffer = frame->data;
-    srm_cfg.in.pic_w = in_stride_pixels;
-    srm_cfg.in.pic_h = in_height;
-    srm_cfg.in.block_w = in_width;
-    srm_cfg.in.block_h = in_height;
-    srm_cfg.in.block_offset_x = 0;
-    srm_cfg.in.block_offset_y = 0;
-    srm_cfg.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
-
-    // --- OUTPUT PICTURE CONFIGURATION ---
-    srm_cfg.out.buffer = current_ppa_out;
-    srm_cfg.out.buffer_size = out_bytes;       // Explicit output buffer size in bytes
-    srm_cfg.out.pic_w = out_w;
-    srm_cfg.out.pic_h = out_h;
-    srm_cfg.out.block_offset_x = 0;
-    srm_cfg.out.block_offset_y = 0;
-    srm_cfg.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
-
-    // --- TRANSFORMATIONS ---
-    srm_cfg.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
-    srm_cfg.scale_x = 0.5f;
-    srm_cfg.scale_y = 0.5f;
-    srm_cfg.mirror_x = false;
-    srm_cfg.mirror_y = false;
-    srm_cfg.rgb_swap = false;
-    srm_cfg.byte_swap = false;
-    srm_cfg.mode = PPA_TRANS_MODE_BLOCKING;
-
-    // Execute PPA hardware scaling
-    esp_err_t err = ppa_do_scale_rotate_mirror(s_ppa_client, &srm_cfg);
-    if (err != ESP_OK) {
-        static uint32_t err_cnt = 0;
-        if (++err_cnt % 30 == 1) {
-            ESP_LOGE("PPA_SYS", "ppa_do_scale_rotate_mirror failed: 0x%x", err);
+    // 4. Update LVGL image object safely under lock
+    if (lvgl_port_lock(16)) {
+        // Fully zero-initialize descriptor once
+        static bool dsc_inited = false;
+        if (!dsc_inited) {
+            memset(&s_camera_dsc, 0, sizeof(lv_image_dsc_t));
+            s_camera_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+            s_camera_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+            s_camera_dsc.header.w = 640;
+            s_camera_dsc.header.h = 720;
+            s_camera_dsc.header.stride = 640 * sizeof(uint16_t);
+            s_camera_dsc.data_size = 640 * 720 * sizeof(uint16_t);
+            s_camera_dsc.data = (const uint8_t *)s_crop_buf;
+            dsc_inited = true;
         }
-        return;
-    }
 
-    // --- PASS HARDWARE-SCALED BUFFER TO LVGL 9 ---
-    if (lvgl_lock(16)) {
-        s_camera_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
-        s_camera_dsc.header.w = out_w; 
-        s_camera_dsc.header.h = out_h;
-        s_camera_dsc.header.stride = out_stride;
-        s_camera_dsc.data_size = raw_out_bytes;
-        s_camera_dsc.data = (const uint8_t *)current_ppa_out;
-
-        lv_image_set_src(s_camera_img, NULL);
         lv_image_set_src(s_camera_img, &s_camera_dsc);
-        lv_image_set_scale(s_camera_img, 256);
-
-        lv_obj_move_foreground(s_camera_img);
         lv_obj_invalidate(s_camera_img);
-        
-        lvgl_unlock();
+        lvgl_port_unlock();
     }
 }
 

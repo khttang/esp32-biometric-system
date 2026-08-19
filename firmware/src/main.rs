@@ -19,8 +19,7 @@ mod biometrics;
 
 use anyhow::{Context, Result};
 use log::{info, error};
-use std::thread;
-use std::time::Duration;
+use esp_idf_svc::hal::delay::FreeRtos;
 use system::SystemResources;
 use crate::biometrics::BiometricSystem;
 
@@ -63,8 +62,8 @@ fn main() -> Result<()>{
         // Advance state machine by one tick
         biometric_system.tick(&mut resources, admin_pressed, has_network_update);
 
-        // ~60 FPS loop rate
-        thread::sleep(Duration::from_millis(16));
+        // Yield CPU 0 and feed FreeRTOS watchdog (~60 FPS)
+        FreeRtos::delay_ms(16);
     }
 }
 
