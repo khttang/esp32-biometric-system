@@ -51,39 +51,11 @@ serde_json = "1.0.151"
 [package.metadata.esp-idf-sys]
 sdkconfig_defaults = ["sdkconfig.defaults"]
 esp_idf_tools_install_dir = "workspace"
+extra_clang_args = ["-DISP_LL_EVENT_ERROR_MASK=0"]
 
 # Local C/C++ Subcomponents Directory
 [[package.metadata.esp-idf-sys.extra_components]]
 component_dirs = ["components"]
-
-# Remote Managed Espressif Components
-[[package.metadata.esp-idf-sys.extra_components]]
-remote_component = { name = "espressif/esp-dl", version = "^3.3.0" }
-
-[[package.metadata.esp-idf-sys.extra_components]]
-remote_component = { name = "espressif/esp_video", version = "^2.3.0" }
-
-[[package.metadata.esp-idf-sys.extra_components]]
-remote_component = { name = "espressif/es8311", version = "^1.0.0" }
-
-[[package.metadata.esp-idf-sys.extra_components]]
-remote_component = { name = "waveshare/esp_lcd_hx8394", version = "^2.1.0" }
-
-[[package.metadata.esp-idf-sys.extra_components]]
-remote_component = { name = "espressif/esp_codec_dev", version = "^1.6.2" }
-
-[[package.metadata.esp-idf-sys.extra_components]]
-remote_component = { name = "espressif/esp_lcd_touch", version = "^1.2.0" }
-
-[[package.metadata.esp-idf-sys.extra_components]]
-remote_component = { name = "espressif/esp_lcd_touch_gt911", version = "^1.2.0" }
-
-# LVGL & LVGL Porting Layer
-[[package.metadata.esp-idf-sys.extra_components]]
-remote_component = { name = "lvgl/lvgl", version = "^9.2.2" }
-
-[[package.metadata.esp-idf-sys.extra_components]]
-remote_component = { name = "espressif/esp_lvgl_port", version = "^2.3.2" }
 
 # -----------------------------------------------------------------------------
 # Build Dependencies (C Bindgen & IDF CMake Integration)
