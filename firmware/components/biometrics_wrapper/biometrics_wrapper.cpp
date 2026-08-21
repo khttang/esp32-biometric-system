@@ -384,6 +384,69 @@ int32_t init_audio_system(void) {
     return init_i2s_duplex_c(SAMPLE_RATE, BoardPins::Audio::BCLK, BoardPins::Audio::WS, BoardPins::Audio::DIN, BoardPins::Audio::DOUT);
 }
 
+static void custom_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
+    static i2c_master_dev_handle_t s_gt911_i2c_dev = NULL;
+
+    // Lazily create dedicated I2C handle on I2C0 at 100 kHz for stability
+    if (!s_gt911_i2c_dev && s_i2c_bus_handle) {
+        i2c_device_config_t dev_cfg = {};
+        dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+        dev_cfg.device_address = 0x5D;
+        dev_cfg.scl_speed_hz = 100000;
+        i2c_master_bus_add_device(s_i2c_bus_handle, &dev_cfg, &s_gt911_i2c_dev);
+    }
+
+    if (!s_gt911_i2c_dev) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
+
+    // 1. Read GT911 Status Register (0x814E) with 10ms timeout
+    uint8_t status_reg[2] = {0x81, 0x4E};
+    uint8_t status_val = 0;
+    esp_err_t err = i2c_master_transmit_receive(s_gt911_i2c_dev, status_reg, 2, &status_val, 1, 10);
+
+    // Bit 7 (0x80) indicates buffer is ready, lower 4 bits (0x0F) indicate touch count
+    if (err == ESP_OK && (status_val & 0x80)) {
+        uint8_t touch_count = status_val & 0x0F;
+
+        if (touch_count > 0 && touch_count <= 5) {
+            // 2. Read Point 1 Coordinates starting at 0x8150 (6 bytes payload)
+            uint8_t point_reg[2] = {0x81, 0x50};
+            uint8_t point_buf[6] = {0};
+            if (i2c_master_transmit_receive(s_gt911_i2c_dev, point_reg, 2, point_buf, 6, 10) == ESP_OK) {
+                
+                // Mask lower 12 bits to eliminate high-byte noise/overflow
+                uint16_t raw_x = (uint16_t)(point_buf[0] | ((point_buf[1] & 0x0F) << 8));
+                uint16_t raw_y = (uint16_t)(point_buf[2] | ((point_buf[3] & 0x0F) << 8));
+
+                // Validate raw coordinates are within portrait panel bounds (720x1280)
+                if (raw_x < 720 && raw_y < 1280) {
+                    // Remap to LVGL 270 deg landscape display (1280x720)
+                    data->point.x = 1280 - raw_y;
+                    data->point.y = raw_x;
+                    data->state = LV_INDEV_STATE_PRESSED;
+
+                    ESP_LOGI("GT911_READ", "Touch Active -> Remapped X: %d, Y: %d (Raw X:%d Y:%d)",
+                             data->point.x, data->point.y, raw_x, raw_y);
+                } else {
+                    data->state = LV_INDEV_STATE_RELEASED;
+                }
+            } else {
+                data->state = LV_INDEV_STATE_RELEASED;
+            }
+        } else {
+            data->state = LV_INDEV_STATE_RELEASED;
+        }
+
+        // 3. Clear GT911 Status Register (0x814E -> 0x00) to allow next touch event
+        uint8_t clear_buf[3] = {0x81, 0x4E, 0x00};
+        i2c_master_transmit(s_gt911_i2c_dev, clear_buf, 3, 10);
+    } else {
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
+}
+
 int32_t init_display_system(void) {
     ESP_LOGI(TAG_LVGL, "Initializing Hardware via esp_lvgl_port...");
 
@@ -444,7 +507,7 @@ int32_t init_display_system(void) {
     dpi_config.dpi_clock_freq_mhz = 60;
     dpi_config.virtual_channel = 0;
     dpi_config.pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB565;
-    dpi_config.num_fbs = 2;                           // Allocates 1 DPI framebuffer
+    dpi_config.num_fbs = 2;                           // Allocates double framebuffers
     dpi_config.flags.use_dma2d = true;                 // Enables PPA/DMA2D acceleration
     dpi_config.video_timing.h_size = 720;
     dpi_config.video_timing.v_size = 1280;
@@ -534,32 +597,38 @@ int32_t init_display_system(void) {
     // Apply software rotation without triggering panel driver swap_xy/mirror calls
     lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
 
-    // 7. Install GT911 Touch Controller over Shared I2C0
-    esp_lcd_panel_io_i2c_config_t touch_io_cfg = {};
-    touch_io_cfg.dev_addr = ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS; // 0x5D or 0x14
-    touch_io_cfg.scl_speed_hz = 400000;
-    touch_io_cfg.control_phase_bytes = 1;  // Standard for GT911
-    touch_io_cfg.dc_bit_offset = 0;        // MUST BE 0 (GT911 has no D/C bit)
-    touch_io_cfg.lcd_cmd_bits = 16;        // GT911 uses 16-bit register addresses
-    touch_io_cfg.lcd_param_bits = 0;
-    esp_lcd_panel_io_handle_t touch_io = NULL;
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(s_i2c_bus_handle, &touch_io_cfg, &touch_io));
+    // 7. Waveshare GT911 Direct Input Registration
+    
+    // A. Send Soft-Reset Command Payload (0x8040 -> 0x02) to wake GT911 MCU core
+    i2c_device_config_t gt911_raw_cfg = {};
+    gt911_raw_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    gt911_raw_cfg.device_address = ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS; // 0x5D
+    gt911_raw_cfg.scl_speed_hz = 100000;
 
-    esp_lcd_touch_config_t touch_cfg = {
-        .x_max = 720,
-        .y_max = 1280,
-        .rst_gpio_num = GPIO_NUM_NC,
-        .int_gpio_num = GPIO_NUM_NC,
-        .levels = { .reset = 0, .interrupt = 0 },
-        .flags = { .swap_xy = 0, .mirror_x = 0, .mirror_y = 0 },
-    };
-    ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_gt911(touch_io, &touch_cfg, &s_touch_handle));
+    i2c_master_dev_handle_t gt911_dev = NULL;
+    if (i2c_master_bus_add_device(s_i2c_bus_handle, &gt911_raw_cfg, &gt911_dev) == ESP_OK) {
+        ESP_LOGI("GT911_TOUCH", "Sending soft-reset payload (0x8040 -> 0x02) to 0x5D...");
+        uint8_t soft_reset_payload[3] = {0x80, 0x40, 0x02};
+        i2c_master_transmit(gt911_dev, soft_reset_payload, 3, 100);
+        i2c_master_bus_rm_device(gt911_dev);
+        
+        // Allow 100ms for GT911 internal firmware to initialize and re-calibrate glass baseline
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 
-    const lvgl_port_touch_cfg_t lvgl_touch_cfg = {
-        .disp = disp,
-        .handle = s_touch_handle,
-    };
-    lvgl_port_add_touch(&lvgl_touch_cfg);
+    // B. Register Custom Direct Touch Callback directly with LVGL 9
+    if (lvgl_port_lock(0)) {
+        lv_indev_t *indev = lv_indev_create();
+        if (indev) {
+            lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+            lv_indev_set_read_cb(indev, custom_touchpad_read);
+            lv_indev_set_display(indev, disp);
+            lv_indev_set_mode(indev, LV_INDEV_MODE_TIMER);
+
+            ESP_LOGI("GT911_TOUCH", "Custom GT911 touch callback successfully registered!");
+        }
+        lvgl_port_unlock();
+    }
 
     setup_split_screen_ui();
 
