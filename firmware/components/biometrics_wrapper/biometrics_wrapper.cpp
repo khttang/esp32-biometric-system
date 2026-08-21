@@ -118,8 +118,8 @@ namespace BoardPins {
 // Global Subsystem Handles
 static esp_lcd_panel_io_handle_t s_lcd_io = NULL;
 static esp_lcd_panel_handle_t s_lcd_panel = NULL;
-static esp_lcd_touch_handle_t s_touch_handle = NULL;
 static i2c_master_bus_handle_t s_i2c_bus_handle = NULL;
+static i2c_master_dev_handle_t s_gt911_i2c_dev = NULL;
 
 
 static i2s_chan_handle_t g_i2s_tx_handle = NULL;
@@ -148,9 +148,59 @@ static lv_obj_t *s_camera_canvas_obj = NULL;
 static TaskHandle_t s_camera_task_handle = NULL;
 static volatile bool s_ui_ready = false;
 
+static volatile uint16_t s_touch_x = 0;
+static volatile uint16_t s_touch_y = 0;
+static volatile bool s_touch_pressed = false;
+static lv_obj_t *s_touch_label = NULL;
+
 extern "C" {
     i2c_master_bus_handle_t bsp_i2c_get_handle(void);
     esp_err_t bsp_i2c_init(void);
+}
+
+// 1. High-frequency non-blocking background touch worker
+void touch_poll_task(void *pvParameters) {
+    uint8_t status_reg[2] = {0x81, 0x4E};
+    uint8_t point_reg[2]  = {0x81, 0x50};
+    uint8_t clear_buf[3]  = {0x81, 0x4E, 0x00};
+
+    while (1) {
+        if (s_gt911_i2c_dev != NULL) {
+            uint8_t status_val = 0;
+            esp_err_t err = i2c_master_transmit_receive(s_gt911_i2c_dev, status_reg, 2, &status_val, 1, 10);
+
+            if (err == ESP_OK && (status_val & 0x80)) {
+                uint8_t touch_count = status_val & 0x0F;
+
+                if (touch_count > 0 && touch_count <= 5) {
+                    uint8_t point_buf[6] = {0};
+                    if (i2c_master_transmit_receive(s_gt911_i2c_dev, point_reg, 2, point_buf, 6, 10) == ESP_OK) {
+                        uint16_t raw_x = (uint16_t)(point_buf[0] | ((point_buf[1] & 0x0F) << 8));
+                        uint16_t raw_y = (uint16_t)(point_buf[2] | ((point_buf[3] & 0x0F) << 8));
+
+                        if (raw_x < 720 && raw_y < 1280) {
+                            //s_touch_x = 1280 - raw_y;
+                            //s_touch_y = raw_x;
+                            // Flips origin (0,0) from Bottom-Right to Top-Left
+                            s_touch_x = raw_y;
+                            s_touch_y = 720 - raw_x;
+                            s_touch_pressed = true;
+                        } else {
+                            s_touch_pressed = false;
+                        }
+                    } else {
+                        s_touch_pressed = false;
+                    }
+                } else {
+                    s_touch_pressed = false;
+                }
+
+                // Acknowledge read to clear touch register
+                i2c_master_transmit(s_gt911_i2c_dev, clear_buf, 3, 10);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(15)); // 66 Hz polling rate
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -385,63 +435,14 @@ int32_t init_audio_system(void) {
 }
 
 static void custom_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
-    static i2c_master_dev_handle_t s_gt911_i2c_dev = NULL;
+    if (s_touch_pressed) {
+        data->point.x = s_touch_x;
+        data->point.y = s_touch_y;
+        data->state = LV_INDEV_STATE_PRESSED;
 
-    // Lazily create dedicated I2C handle on I2C0 at 100 kHz for stability
-    if (!s_gt911_i2c_dev && s_i2c_bus_handle) {
-        i2c_device_config_t dev_cfg = {};
-        dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-        dev_cfg.device_address = 0x5D;
-        dev_cfg.scl_speed_hz = 100000;
-        i2c_master_bus_add_device(s_i2c_bus_handle, &dev_cfg, &s_gt911_i2c_dev);
-    }
-
-    if (!s_gt911_i2c_dev) {
-        data->state = LV_INDEV_STATE_RELEASED;
-        return;
-    }
-
-    // 1. Read GT911 Status Register (0x814E) with 10ms timeout
-    uint8_t status_reg[2] = {0x81, 0x4E};
-    uint8_t status_val = 0;
-    esp_err_t err = i2c_master_transmit_receive(s_gt911_i2c_dev, status_reg, 2, &status_val, 1, 10);
-
-    // Bit 7 (0x80) indicates buffer is ready, lower 4 bits (0x0F) indicate touch count
-    if (err == ESP_OK && (status_val & 0x80)) {
-        uint8_t touch_count = status_val & 0x0F;
-
-        if (touch_count > 0 && touch_count <= 5) {
-            // 2. Read Point 1 Coordinates starting at 0x8150 (6 bytes payload)
-            uint8_t point_reg[2] = {0x81, 0x50};
-            uint8_t point_buf[6] = {0};
-            if (i2c_master_transmit_receive(s_gt911_i2c_dev, point_reg, 2, point_buf, 6, 10) == ESP_OK) {
-                
-                // Mask lower 12 bits to eliminate high-byte noise/overflow
-                uint16_t raw_x = (uint16_t)(point_buf[0] | ((point_buf[1] & 0x0F) << 8));
-                uint16_t raw_y = (uint16_t)(point_buf[2] | ((point_buf[3] & 0x0F) << 8));
-
-                // Validate raw coordinates are within portrait panel bounds (720x1280)
-                if (raw_x < 720 && raw_y < 1280) {
-                    // Remap to LVGL 270 deg landscape display (1280x720)
-                    data->point.x = 1280 - raw_y;
-                    data->point.y = raw_x;
-                    data->state = LV_INDEV_STATE_PRESSED;
-
-                    ESP_LOGI("GT911_READ", "Touch Active -> Remapped X: %d, Y: %d (Raw X:%d Y:%d)",
-                             data->point.x, data->point.y, raw_x, raw_y);
-                } else {
-                    data->state = LV_INDEV_STATE_RELEASED;
-                }
-            } else {
-                data->state = LV_INDEV_STATE_RELEASED;
-            }
-        } else {
-            data->state = LV_INDEV_STATE_RELEASED;
+        if (s_touch_label != NULL) {
+            lv_label_set_text_fmt(s_touch_label, "Touch X: %d | Y: %d", s_touch_x, s_touch_y);
         }
-
-        // 3. Clear GT911 Status Register (0x814E -> 0x00) to allow next touch event
-        uint8_t clear_buf[3] = {0x81, 0x4E, 0x00};
-        i2c_master_transmit(s_gt911_i2c_dev, clear_buf, 3, 10);
     } else {
         data->state = LV_INDEV_STATE_RELEASED;
     }
@@ -480,7 +481,7 @@ int32_t init_display_system(void) {
         .voltage_mv = 2500,
     };
     ESP_ERROR_CHECK(esp_ldo_acquire_channel(&ldo_cfg, &ldo_mipi_phy));
-    vTaskDelay(pdMS_TO_TICKS(10)); // Allow 2.5V PHY rail and crystal oscillator to settle
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     // 3. Initialize MIPI-DSI Bus
     esp_lcd_dsi_bus_handle_t dsi_bus = NULL;
@@ -501,14 +502,14 @@ int32_t init_display_system(void) {
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_dbi(dsi_bus, &dbi_config, &dbi_io));
 
-    // 5. Configure DPI Timing explicitly for C++ compatibility
+    // 5. Configure DPI Timing
     esp_lcd_dpi_panel_config_t dpi_config = {};
     dpi_config.dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT;
     dpi_config.dpi_clock_freq_mhz = 60;
     dpi_config.virtual_channel = 0;
     dpi_config.pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB565;
-    dpi_config.num_fbs = 2;                           // Allocates double framebuffers
-    dpi_config.flags.use_dma2d = true;                 // Enables PPA/DMA2D acceleration
+    dpi_config.num_fbs = 2;
+    dpi_config.flags.use_dma2d = true;
     dpi_config.video_timing.h_size = 720;
     dpi_config.video_timing.v_size = 1280;
     dpi_config.video_timing.hsync_back_porch = 44;
@@ -531,7 +532,7 @@ int32_t init_display_system(void) {
     panel_dev_config.bits_per_pixel = 16;
     panel_dev_config.vendor_config = &vendor_config;
 
-    // Power on & reset panel via IO expander at I2C address 0x45 using s_i2c_bus_handle
+    // Power on & reset panel via IO expander at 0x45
     i2c_device_config_t io_exp_cfg = {};
     io_exp_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
     io_exp_cfg.device_address = 0x45;
@@ -541,28 +542,22 @@ int32_t init_display_system(void) {
     ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus_handle, &io_exp_cfg, &io_exp_dev));
 
     uint8_t write_buf[2];
-
-    // Register 0x95 -> 0x11
     write_buf[0] = 0x95; write_buf[1] = 0x11;
     i2c_master_transmit(io_exp_dev, write_buf, 2, 100);
 
-    // Register 0x95 -> 0x17
     write_buf[0] = 0x95; write_buf[1] = 0x17;
     i2c_master_transmit(io_exp_dev, write_buf, 2, 100);
 
-    // Register 0x96 -> 0x00
     write_buf[0] = 0x96; write_buf[1] = 0x00;
     i2c_master_transmit(io_exp_dev, write_buf, 2, 100);
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // Register 0x96 -> 0xFF (Release Reset)
     write_buf[0] = 0x96; write_buf[1] = 0xFF;
     i2c_master_transmit(io_exp_dev, write_buf, 2, 100);
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // Remove the temporary device handle when finished
     i2c_master_bus_rm_device(io_exp_dev);
 
     ESP_ERROR_CHECK(esp_lcd_new_panel_hx8394(dbi_io, &panel_dev_config, &s_lcd_panel));
@@ -570,7 +565,7 @@ int32_t init_display_system(void) {
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_lcd_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_lcd_panel, true));
 
-    // 6. Initialize ESP-LVGL-PORT for MIPI-DSI Panel
+    // 6. Initialize ESP-LVGL-PORT
     const lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     ESP_ERROR_CHECK(lvgl_port_init(&port_cfg));
 
@@ -583,7 +578,7 @@ int32_t init_display_system(void) {
     lvgl_disp_cfg.vres = 1280;
     lvgl_disp_cfg.monochrome = false;
     lvgl_disp_cfg.flags.buff_spiram = true;
-    lvgl_disp_cfg.flags.sw_rotate = true; // Prevents esp_lcd_panel_swap_xy/mirror calls
+    lvgl_disp_cfg.flags.sw_rotate = true;
 
     lvgl_port_display_dsi_cfg_t dsi_cfg = {};
     dsi_cfg.flags.avoid_tearing = 0;
@@ -594,29 +589,28 @@ int32_t init_display_system(void) {
         return ESP_FAIL;
     }
 
-    // Apply software rotation without triggering panel driver swap_xy/mirror calls
     lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
 
-    // 7. Waveshare GT911 Direct Input Registration
-    
-    // A. Send Soft-Reset Command Payload (0x8040 -> 0x02) to wake GT911 MCU core
-    i2c_device_config_t gt911_raw_cfg = {};
-    gt911_raw_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-    gt911_raw_cfg.device_address = ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS; // 0x5D
-    gt911_raw_cfg.scl_speed_hz = 100000;
+    // 7. Waveshare GT911 Device Setup
+    if (s_gt911_i2c_dev == NULL) {
+        i2c_device_config_t gt911_raw_cfg = {};
+        gt911_raw_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+        gt911_raw_cfg.device_address = 0x5D;
+        gt911_raw_cfg.scl_speed_hz = 100000;
 
-    i2c_master_dev_handle_t gt911_dev = NULL;
-    if (i2c_master_bus_add_device(s_i2c_bus_handle, &gt911_raw_cfg, &gt911_dev) == ESP_OK) {
-        ESP_LOGI("GT911_TOUCH", "Sending soft-reset payload (0x8040 -> 0x02) to 0x5D...");
-        uint8_t soft_reset_payload[3] = {0x80, 0x40, 0x02};
-        i2c_master_transmit(gt911_dev, soft_reset_payload, 3, 100);
-        i2c_master_bus_rm_device(gt911_dev);
-        
-        // Allow 100ms for GT911 internal firmware to initialize and re-calibrate glass baseline
-        vTaskDelay(pdMS_TO_TICKS(100));
+        if (i2c_master_bus_add_device(s_i2c_bus_handle, &gt911_raw_cfg, &s_gt911_i2c_dev) == ESP_OK) {
+            ESP_LOGI("GT911_TOUCH", "GT911 persistent I2C handle created successfully!");
+            
+            // Soft-reset payload
+            uint8_t soft_reset_payload[3] = {0x80, 0x40, 0x02};
+            i2c_master_transmit(s_gt911_i2c_dev, soft_reset_payload, 3, 100);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        } else {
+            ESP_LOGE("GT911_TOUCH", "Failed to add GT911 device to I2C bus!");
+        }
     }
 
-    // B. Register Custom Direct Touch Callback directly with LVGL 9
+    // Register LVGL indev callback
     if (lvgl_port_lock(0)) {
         lv_indev_t *indev = lv_indev_create();
         if (indev) {
@@ -631,6 +625,9 @@ int32_t init_display_system(void) {
     }
 
     setup_split_screen_ui();
+
+    // Spawn background poller on Core 1
+    xTaskCreatePinnedToCore(touch_poll_task, "gt911_poller", 3072, NULL, 5, NULL, 1);
 
     return ESP_OK;
 }
@@ -1054,6 +1051,19 @@ void setup_split_screen_ui(void) {
         lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
         lv_obj_set_style_text_opa(title, LV_OPA_COVER, LV_PART_MAIN);
         lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
+
+        s_touch_label = lv_label_create(panel); 
+        
+        // Position and style
+        lv_label_set_text(s_touch_label, "Touch: Idle");
+        lv_obj_align(s_touch_label, LV_ALIGN_TOP_MID, 0, 20); // Top center of right panel
+        
+        // Set text styling
+        static lv_style_t style_label;
+        lv_style_init(&style_label);
+        lv_style_set_text_color(&style_label, lv_color_hex(0x00FF00)); // Bright Green
+        lv_style_set_text_font(&style_label, &lv_font_montserrat_16);   // Readable font size
+        lv_obj_add_style(s_touch_label, &style_label, 0);
 
         lv_obj_move_foreground(panel);
 
