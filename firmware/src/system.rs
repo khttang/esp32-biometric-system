@@ -419,28 +419,6 @@ pub fn validate_running_app() {
     unsafe { ffi::p4_mark_app_valid() };
 }
 
-pub fn test_camera_capture() {
-    let mut frame = P4CameraFrame {
-        data: std::ptr::null_mut(),
-        data_len: 0,
-        width: 0,
-        height: 0,
-        buffer_index: 0
-    };
-
-    info!("Attempting to capture frame from OV5647 MIPI-CSI camera...");
-    let ret = unsafe { ffi::p4_camera_capture_frame(&mut frame as *mut _, 1000) };
-
-    if ret == 0 {
-        info!(
-            "SUCCESS! Captured {}x{} frame ({} bytes) in PSRAM!",
-            frame.width, frame.height, frame.data_len
-        );
-    } else {
-        error!("Camera capture failed with error code: {}", ret);
-    }
-}
-
 /// Crops a face region from the raw RGB565 camera frame and resizes it to 112x112 RGB888 for ESP-DL
 pub fn crop_face_112x112(frame_rgb565: &[u16], frame_w: usize, frame_h: usize, face: &FaceBox) -> Option<Vec<u8>> {
 

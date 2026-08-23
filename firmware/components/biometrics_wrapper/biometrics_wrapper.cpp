@@ -52,14 +52,6 @@
 #include "sdkconfig.h"
 #include "biometrics_wrapper.h"
 
-#ifndef CONFIG_BIOMETRICS_CAM_WIDTH
-#define CONFIG_BIOMETRICS_CAM_WIDTH 1280
-#endif
-
-#ifndef CONFIG_BIOMETRICS_CAM_HEIGHT
-#define CONFIG_BIOMETRICS_CAM_HEIGHT 720        // working but less captured area 720, 960 is experimenting
-#endif
-
 struct v4l2_frame_buffer_t {
     void  *start;
     size_t length;
@@ -102,6 +94,25 @@ namespace BoardPins {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Video Pipeline & Display Layout Constants
+// -----------------------------------------------------------------------------
+namespace VideoConfig {
+    // OV5647 Native Sensor Stream Dimensions (DO NOT CHANGE FROM 960)
+    constexpr uint16_t SENSOR_WIDTH   = 1280;
+    constexpr uint16_t SENSOR_HEIGHT  = 960;
+
+    // Display Geometry (1280x720 Landscape)
+    constexpr uint16_t DISPLAY_WIDTH  = 1280;
+    constexpr uint16_t DISPLAY_HEIGHT = 720;  
+
+    // Split-Screen Layout Dimensions
+    constexpr uint16_t VIEWPORT_WIDTH  = 640; // Left column width
+    constexpr uint16_t VIEWPORT_HEIGHT = 360; // Centered 16:9 canvas height
+    constexpr uint16_t PANEL_WIDTH    = 640; // Right control panel width
+    constexpr uint16_t PANEL_HEIGHT   = 720; // Right control panel height
+}
+
 #define TAG_HW      "p4_hardware"
 #define TAG_CAM     "p4_camera"
 #define TAG_ETH     "p4_ethernet"
@@ -135,14 +146,9 @@ static int s_video_fd = -1;
 struct v4l2_frame_buffer_t s_cam_buffers[CAM_BUF_COUNT] = {};
 static size_t s_cam_buf_lengths[CAM_BUF_COUNT] = {0};
 
-// LVGL Camera Image Descriptor Handles
-static lv_obj_t *s_camera_img = NULL;
-static lv_image_dsc_t s_camera_dsc = {};
-
 static uint16_t *s_ppa_buf[2] = {NULL, NULL};
 static uint8_t s_ppa_idx = 0;
 
-static uint16_t *s_crop_buf = NULL;
 static void *s_ui_canvas_buf = NULL;
 static lv_obj_t *s_camera_canvas_obj = NULL;
 static TaskHandle_t s_camera_task_handle = NULL;
@@ -251,35 +257,34 @@ void process_camera_frame_task(void *pvParameters) {
             if (s_ui_ready && s_camera_canvas_obj != NULL && s_ui_canvas_buf != NULL) {
                 if (lvgl_port_lock(0)) {
                     ppa_srm_oper_config_t srm_cfg = {};
-                    memset(&srm_cfg, 0, sizeof(srm_cfg));
 
-                    // 1. Input Image Configuration (OV5647 1280x960)
+                    // 1. Input Image Configuration (OV5647 1280x720)
                     srm_cfg.in.buffer = cam_buf;
-                    srm_cfg.in.pic_w = 1280;
-                    srm_cfg.in.pic_h = 960;
-                    srm_cfg.in.block_w = 1280;
-                    srm_cfg.in.block_h = 960;
+                    srm_cfg.in.pic_w = VideoConfig::SENSOR_WIDTH;
+                    srm_cfg.in.pic_h = VideoConfig::SENSOR_HEIGHT;
+                    srm_cfg.in.block_w = VideoConfig::SENSOR_WIDTH;
+                    srm_cfg.in.block_h = VideoConfig::SENSOR_HEIGHT;
                     srm_cfg.in.block_offset_x = 0;
                     srm_cfg.in.block_offset_y = 0;
                     srm_cfg.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
 
-                    // 2. Output Canvas Configuration
+                    // 2. Output Canvas Configuration (640x360 RGB565)
                     srm_cfg.out.buffer = s_ui_canvas_buf;
-                    srm_cfg.out.buffer_size = 360 * 640 * sizeof(uint16_t);
-                    srm_cfg.out.pic_w = 360;
-                    srm_cfg.out.pic_h = 640;
+                    srm_cfg.out.buffer_size = VideoConfig::VIEWPORT_WIDTH * VideoConfig::VIEWPORT_HEIGHT * sizeof(uint16_t);
+                    srm_cfg.out.pic_w = VideoConfig::VIEWPORT_WIDTH;
+                    srm_cfg.out.pic_h = VideoConfig::VIEWPORT_HEIGHT;
                     srm_cfg.out.block_offset_x = 0;
                     srm_cfg.out.block_offset_y = 0;
                     srm_cfg.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
 
-                    // 3. Scaling Ratios
-                    srm_cfg.scale_x = 360.0f / 1280.0f;
-                    srm_cfg.scale_y = 640.0f / 960.0f;
+                    // 3. Precise 2:1 Scaling Ratios
+                    srm_cfg.scale_x = (float)VideoConfig::VIEWPORT_WIDTH / (float)VideoConfig::SENSOR_WIDTH;   // 0.5f
+                    srm_cfg.scale_y = (float)VideoConfig::VIEWPORT_HEIGHT / (float)VideoConfig::SENSOR_HEIGHT; // 0.5f
                     srm_cfg.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
                     srm_cfg.mirror_x = false;
                     srm_cfg.mirror_y = false;
 
-                    // 4. Hardware Scale Execution
+                    // 4. Execute Hardware Scaling via ESP32-P4 PPA
                     esp_err_t ppa_err = ppa_do_scale_rotate_mirror(s_ppa_client, &srm_cfg);
                     if (ppa_err != ESP_OK) {
                         ESP_LOGE("CAM_TASK", "PPA scaling failed: 0x%x", ppa_err);
@@ -512,9 +517,9 @@ int32_t init_display_system(void) {
     dpi_config.flags.use_dma2d = true;
     dpi_config.video_timing.h_size = 720;
     dpi_config.video_timing.v_size = 1280;
-    dpi_config.video_timing.hsync_back_porch = 44;
-    dpi_config.video_timing.hsync_front_porch = 46;
-    dpi_config.video_timing.hsync_pulse_width = 8;
+    dpi_config.video_timing.hsync_back_porch = 40;
+    dpi_config.video_timing.hsync_front_porch = 40;
+    dpi_config.video_timing.hsync_pulse_width = 10;
     dpi_config.video_timing.vsync_back_porch = 16;
     dpi_config.video_timing.vsync_front_porch = 16;
     dpi_config.video_timing.vsync_pulse_width = 4;
@@ -751,8 +756,8 @@ int32_t p4_camera_capture_frame(p4_camera_frame_t *frame, uint32_t timeout_ms) {
 
     frame->data = (uint8_t *)s_cam_buffers[buf.index].start;
     frame->data_len = buf.bytesused;
-    frame->width = CONFIG_BIOMETRICS_CAM_WIDTH;   // 1280
-    frame->height = CONFIG_BIOMETRICS_CAM_HEIGHT; // 720
+    frame->width = VideoConfig::SENSOR_WIDTH;   // Dynamically reads 1280
+    frame->height = VideoConfig::SENSOR_HEIGHT; // Reads 720 or 960 from VideoConfig
     frame->buffer_index = buf.index;
     return 0;
 }
@@ -787,7 +792,7 @@ int32_t p4_hardware_init_all(const p4_hardware_config_t *config) {
     ret = init_display_system();
     if (ret != ESP_OK) return ret;
 
-    ret = p4_camera_init_v4l2(CONFIG_BIOMETRICS_CAM_WIDTH, CONFIG_BIOMETRICS_CAM_HEIGHT);
+    ret = p4_camera_init_v4l2(VideoConfig::SENSOR_WIDTH, VideoConfig::SENSOR_HEIGHT);
     if (ret != ESP_OK) return ret;
     ESP_LOGI(TAG_HW, "Display Systems Initialized Successfully!");
 
@@ -1007,12 +1012,12 @@ void setup_split_screen_ui(void) {
     if (lvgl_port_lock(100)) {
         lv_obj_t *scr = lv_screen_active();
         
-        // 1. Clean screen FIRST before creating new widgets!
         lv_obj_clean(scr);
-        lv_obj_set_size(scr, 1280, 720);
+        lv_obj_set_size(scr, VideoConfig::DISPLAY_WIDTH, VideoConfig::DISPLAY_HEIGHT);
+        lv_obj_set_style_pad_all(scr, 0, LV_PART_MAIN);
 
-        // 2. Allocate 128-byte aligned canvas buffer in PSRAM
-        const size_t raw_buf_size = 360 * 640 * sizeof(uint16_t);
+        // Allocate PSRAM canvas buffer for 640x720 RGB565
+        const size_t raw_buf_size = VideoConfig::VIEWPORT_WIDTH * VideoConfig::VIEWPORT_HEIGHT * sizeof(uint16_t);
         size_t aligned_canvas_buf_size = (raw_buf_size + C_LINE_SIZE - 1) & ~(C_LINE_SIZE - 1);
 
         if (!s_ui_canvas_buf) {
@@ -1025,47 +1030,43 @@ void setup_split_screen_ui(void) {
             return;
         }
 
-        // 3. Create Left Viewport: Camera Canvas Widget
+        // 1. Create Left Viewport Canvas (640x720 spanning entire left half)
         s_camera_canvas_obj = lv_canvas_create(scr);
-        lv_canvas_set_buffer(s_camera_canvas_obj, s_ui_canvas_buf, 360, 640, LV_COLOR_FORMAT_RGB565);
-        lv_obj_set_size(s_camera_canvas_obj, 360, 640);
-        lv_obj_align(s_camera_canvas_obj, LV_ALIGN_LEFT_MID, 10, 0);
+        lv_canvas_set_buffer(s_camera_canvas_obj, s_ui_canvas_buf, VideoConfig::VIEWPORT_WIDTH, VideoConfig::VIEWPORT_HEIGHT, LV_COLOR_FORMAT_RGB565);
+        lv_obj_set_size(s_camera_canvas_obj, VideoConfig::VIEWPORT_WIDTH, VideoConfig::VIEWPORT_HEIGHT);
+        lv_obj_set_pos(s_camera_canvas_obj, 0, 0);
 
-        // 4. Create Right Viewport: System Control Panel (640x720 at x=640)
+        // 2. Create Right System Control Panel (640x720 at x=640)
         lv_obj_t *panel = lv_obj_create(scr);
-        lv_obj_set_size(panel, 640, 720);
-        lv_obj_set_pos(panel, 640, 0);
+        lv_obj_set_size(panel, VideoConfig::PANEL_WIDTH, VideoConfig::PANEL_HEIGHT);
+        lv_obj_set_pos(panel, VideoConfig::VIEWPORT_WIDTH, 0);
 
         lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_pad_all(panel, 0, LV_PART_MAIN);
         lv_obj_set_style_border_width(panel, 0, LV_PART_MAIN);
         lv_obj_set_style_radius(panel, 0, LV_PART_MAIN);
-        
-        // Set BRIGHT RED background for visual verification
-        lv_obj_set_style_bg_color(panel, lv_color_hex(0xFF0000), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(panel, lv_color_hex(0x181818), LV_PART_MAIN);
         lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, LV_PART_MAIN);
 
-        // 5. Title Label
+        // Title Label
         lv_obj_t *title = lv_label_create(panel);
         lv_label_set_text(title, "MULTIMODAL BIOMETRICS");
         lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
         lv_obj_set_style_text_opa(title, LV_OPA_COVER, LV_PART_MAIN);
         lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
 
-        s_touch_label = lv_label_create(panel); 
-        
-        // Position and style
-        lv_label_set_text(s_touch_label, "Touch: Idle");
-        lv_obj_align(s_touch_label, LV_ALIGN_TOP_MID, 0, 20); // Top center of right panel
-        
-        // Set text styling
-        static lv_style_t style_label;
-        lv_style_init(&style_label);
-        lv_style_set_text_color(&style_label, lv_color_hex(0x00FF00)); // Bright Green
-        lv_style_set_text_font(&style_label, &lv_font_montserrat_16);   // Readable font size
-        lv_obj_add_style(s_touch_label, &style_label, 0);
-
-        lv_obj_move_foreground(panel);
+        // Touch Label
+        s_touch_label = lv_label_create(panel);
+        if (s_touch_label) {
+            lv_label_set_text(s_touch_label, "Touch: Idle");
+            lv_obj_align(s_touch_label, LV_ALIGN_TOP_MID, 0, 15);
+            
+            static lv_style_t style_label;
+            lv_style_init(&style_label);
+            lv_style_set_text_color(&style_label, lv_color_hex(0x00FF00));
+            lv_style_set_text_font(&style_label, LV_FONT_DEFAULT);
+            lv_obj_add_style(s_touch_label, &style_label, 0);
+        }
 
         s_ui_ready = true;
         lvgl_port_unlock();
@@ -1076,58 +1077,50 @@ void setup_split_screen_ui(void) {
 }
 
 void update_camera_viewport(const p4_camera_frame_t *frame) {
-    if (!frame || !frame->data || !s_camera_img) return;
-
-    // 1. Allocate 128-byte cache-aligned PSRAM buffer for 640x720 viewport (921.6 KB)
-    if (!s_crop_buf) {
-        s_crop_buf = (uint16_t *)heap_caps_aligned_alloc(
-            128, 640 * 720 * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-        );
-        if (!s_crop_buf) return;
+    if (!frame || !frame->data || !s_ui_ready || !s_camera_canvas_obj || !s_ui_canvas_buf) {
+        return;
     }
 
-    const uint16_t *src = (const uint16_t *)frame->data;
-    uint32_t src_w = frame->width ? frame->width : 1280;
-    uint32_t src_h = frame->height ? frame->height : 720;
+    if (lvgl_port_lock(0)) {
+        ppa_srm_oper_config_t srm_cfg = {};
 
-    // 2. Center-crop 640x720 from input camera frame
-    uint32_t crop_x = (src_w > 640) ? (src_w - 640) / 2 : 0;
-    uint32_t crop_y = (src_h > 720) ? (src_h - 720) / 2 : 0;
-    uint32_t copy_w = (src_w < 640) ? src_w : 640;
-    uint32_t copy_h = (src_h < 720) ? src_h : 720;
+        uint32_t in_w = VideoConfig::SENSOR_WIDTH;   // 1280
+        uint32_t in_h = VideoConfig::SENSOR_HEIGHT;  // 960
 
-    // Fast 32-bit row copying (transfers 2 pixels per iteration)
-    const uint32_t copy_w_words = (copy_w * sizeof(uint16_t)) / sizeof(uint32_t);
-    for (uint32_t y = 0; y < copy_h; y++) {
-        const uint32_t *src_row_32 = (const uint32_t *)(src + (y + crop_y) * src_w + crop_x);
-        uint32_t *dst_row_32 = (uint32_t *)(s_crop_buf + y * 640);
+        // 1. Input Image Configuration (1280x720)
+        srm_cfg.in.buffer = frame->data;
+        srm_cfg.in.pic_w = in_w;
+        srm_cfg.in.pic_h = in_h;
+        srm_cfg.in.block_w = in_w;
+        srm_cfg.in.block_h = in_h;
+        srm_cfg.in.block_offset_x = 0;
+        srm_cfg.in.block_offset_y = 0;
+        srm_cfg.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
 
-        for (uint32_t x = 0; x < copy_w_words; x++) {
-            dst_row_32[x] = src_row_32[x];
+        // 2. Output Canvas Configuration (640x360)
+        srm_cfg.out.buffer = s_ui_canvas_buf;
+        srm_cfg.out.buffer_size = VideoConfig::VIEWPORT_WIDTH * VideoConfig::VIEWPORT_HEIGHT * sizeof(uint16_t);
+        srm_cfg.out.pic_w = VideoConfig::VIEWPORT_WIDTH;   // 640
+        srm_cfg.out.pic_h = VideoConfig::VIEWPORT_HEIGHT;  // 360
+        srm_cfg.out.block_offset_x = 0;
+        srm_cfg.out.block_offset_y = 0;
+        srm_cfg.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+
+        // 3. Precise Hardware Scaling Ratios (1280->640 [0.5x] and 960->360 [0.375x])
+        srm_cfg.scale_x = (float)VideoConfig::VIEWPORT_WIDTH / (float)in_w;   // 0.5f
+        srm_cfg.scale_y = (float)VideoConfig::VIEWPORT_HEIGHT / (float)in_h;  // 0.375f
+        srm_cfg.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
+        srm_cfg.mirror_x = false;
+        srm_cfg.mirror_y = false;
+
+        // 4. Run PPA hardware scale step
+        esp_err_t ppa_err = ppa_do_scale_rotate_mirror(s_ppa_client, &srm_cfg);
+        if (ppa_err == ESP_OK) {
+            lv_obj_invalidate(s_camera_canvas_obj);
+        } else {
+            ESP_LOGE("PPA_VIEWPORT", "Scaling failed: 0x%x", ppa_err);
         }
-    }
 
-    // 3. Flush L2 Cache line to PSRAM for DSI controller DMA reads
-    esp_cache_msync((void *)s_crop_buf, 640 * 720 * sizeof(uint16_t), ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-
-    // 4. Update LVGL image object safely under lock
-    if (lvgl_port_lock(16)) {
-        // Fully zero-initialize descriptor once
-        static bool dsc_inited = false;
-        if (!dsc_inited) {
-            memset(&s_camera_dsc, 0, sizeof(lv_image_dsc_t));
-            s_camera_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-            s_camera_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
-            s_camera_dsc.header.w = 640;
-            s_camera_dsc.header.h = 720;
-            s_camera_dsc.header.stride = 640 * sizeof(uint16_t);
-            s_camera_dsc.data_size = 640 * 720 * sizeof(uint16_t);
-            s_camera_dsc.data = (const uint8_t *)s_crop_buf;
-            dsc_inited = true;
-        }
-
-        lv_image_set_src(s_camera_img, &s_camera_dsc);
-        lv_obj_invalidate(s_camera_img);
         lvgl_port_unlock();
     }
 }

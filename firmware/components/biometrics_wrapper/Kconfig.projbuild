@@ -1,17 +1,5 @@
 menu "Biometrics Wrapper Configuration"
 
-    config BIOMETRICS_CAM_WIDTH
-        int "Camera Frame Width"
-        default 1280
-        help
-            Target horizontal resolution for camera capture and V4L2 stream.
-
-    config BIOMETRICS_CAM_HEIGHT
-        int "Camera Frame Height"
-        default 720
-        help
-            Target vertical resolution for camera capture and V4L2 stream.
-
     config BIOMETRICS_ENABLE_FACE_DETECTION
         bool "Enable ESP-DL MobileFaceNet Acceleration"
         default y
