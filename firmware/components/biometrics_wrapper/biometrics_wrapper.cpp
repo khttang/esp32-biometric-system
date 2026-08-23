@@ -108,7 +108,7 @@ namespace VideoConfig {
 
     // Split-Screen Layout Dimensions
     constexpr uint16_t VIEWPORT_WIDTH  = 640; // Left column width
-    constexpr uint16_t VIEWPORT_HEIGHT = 360; // Centered 16:9 canvas height
+    constexpr uint16_t VIEWPORT_HEIGHT = 480; // Centered 16:9 canvas height
     constexpr uint16_t PANEL_WIDTH    = 640; // Right control panel width
     constexpr uint16_t PANEL_HEIGHT   = 720; // Right control panel height
 }
@@ -1022,6 +1022,10 @@ void setup_split_screen_ui(void) {
 
         if (!s_ui_canvas_buf) {
             s_ui_canvas_buf = heap_caps_aligned_alloc(C_LINE_SIZE, aligned_canvas_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (s_ui_canvas_buf) {
+                // Clear buffer to solid black (0x0000) to prevent white background artifacts
+                memset(s_ui_canvas_buf, 0, aligned_canvas_buf_size);
+            }
         }
 
         if (!s_ui_canvas_buf) {
@@ -1084,31 +1088,31 @@ void update_camera_viewport(const p4_camera_frame_t *frame) {
     if (lvgl_port_lock(0)) {
         ppa_srm_oper_config_t srm_cfg = {};
 
-        uint32_t in_w = VideoConfig::SENSOR_WIDTH;   // 1280
-        uint32_t in_h = VideoConfig::SENSOR_HEIGHT;  // 960
+        uint32_t in_w = VideoConfig::SENSOR_WIDTH;
+        uint32_t in_h = VideoConfig::SENSOR_HEIGHT;
 
         // 1. Input Image Configuration (1280x720)
         srm_cfg.in.buffer = frame->data;
-        srm_cfg.in.pic_w = in_w;
+        srm_cfg.in.pic_w = in_w;          
         srm_cfg.in.pic_h = in_h;
-        srm_cfg.in.block_w = in_w;
+        srm_cfg.in.block_w = in_h;          // crop height to be the same as width
         srm_cfg.in.block_h = in_h;
-        srm_cfg.in.block_offset_x = 0;
-        srm_cfg.in.block_offset_y = 0;
+        srm_cfg.in.block_offset_x = (in_w - in_h) / 2;  // Offset X = 160 (crops 160px from left & right)
+        srm_cfg.in.block_offset_y = 0;                  // Full vertical coverage
         srm_cfg.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
 
         // 2. Output Canvas Configuration (640x360)
         srm_cfg.out.buffer = s_ui_canvas_buf;
         srm_cfg.out.buffer_size = VideoConfig::VIEWPORT_WIDTH * VideoConfig::VIEWPORT_HEIGHT * sizeof(uint16_t);
-        srm_cfg.out.pic_w = VideoConfig::VIEWPORT_WIDTH;   // 640
-        srm_cfg.out.pic_h = VideoConfig::VIEWPORT_HEIGHT;  // 360
+        srm_cfg.out.pic_w = VideoConfig::VIEWPORT_WIDTH;
+        srm_cfg.out.pic_h = VideoConfig::VIEWPORT_HEIGHT;
         srm_cfg.out.block_offset_x = 0;
         srm_cfg.out.block_offset_y = 0;
         srm_cfg.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
 
         // 3. Precise Hardware Scaling Ratios (1280->640 [0.5x] and 960->360 [0.375x])
-        srm_cfg.scale_x = (float)VideoConfig::VIEWPORT_WIDTH / (float)in_w;   // 0.5f
-        srm_cfg.scale_y = (float)VideoConfig::VIEWPORT_HEIGHT / (float)in_h;  // 0.375f
+        srm_cfg.scale_x = (float)VideoConfig::VIEWPORT_WIDTH / (float)in_h;   // 0.666f
+        srm_cfg.scale_y = (float)VideoConfig::VIEWPORT_HEIGHT / (float)in_h;  // 0.500f
         srm_cfg.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
         srm_cfg.mirror_x = false;
         srm_cfg.mirror_y = false;
