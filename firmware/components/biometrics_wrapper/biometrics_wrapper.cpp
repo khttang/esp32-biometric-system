@@ -105,8 +105,11 @@ namespace VideoConfig {
     constexpr uint16_t DISPLAY_HEIGHT = 720;  
 
     // Split-Screen Layout Dimensions
-    constexpr uint16_t VIEWPORT_WIDTH  = 640; // Left column width
-    constexpr uint16_t VIEWPORT_HEIGHT = 720; // Full display height
+    // Camera canvas: exactly the 4:3 image area, centred vertically in the 640x720 left column
+    // (black screen background above/below). Keeping the canvas to the image means LVGL only
+    // re-renders/rotates image pixels when a new frame is presented.
+    constexpr uint16_t VIEWPORT_WIDTH  = 640;
+    constexpr uint16_t VIEWPORT_HEIGHT = 480;
     constexpr uint16_t PANEL_WIDTH    = 640; // Right control panel width
     constexpr uint16_t PANEL_HEIGHT   = 720; // Right control panel height
 }
@@ -808,8 +811,11 @@ void setup_split_screen_ui(void) {
         lv_obj_clean(scr);
         lv_obj_set_size(scr, VideoConfig::DISPLAY_WIDTH, VideoConfig::DISPLAY_HEIGHT);
         lv_obj_set_style_pad_all(scr, 0, LV_PART_MAIN);
+        // Black behind the camera canvas (fills the left column above/below the image).
+        lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
 
-        // Allocate PSRAM canvas buffer for 640x720 RGB565
+        // Allocate PSRAM canvas buffer for the 640x480 RGB565 image
         const size_t raw_buf_size = VideoConfig::VIEWPORT_WIDTH * VideoConfig::VIEWPORT_HEIGHT * sizeof(uint16_t);
         size_t aligned_canvas_buf_size = (raw_buf_size + C_LINE_SIZE - 1) & ~(C_LINE_SIZE - 1);
 
@@ -827,11 +833,11 @@ void setup_split_screen_ui(void) {
             return;
         }
 
-        // 1. Create Left Viewport Canvas (640x720 spanning entire left half)
+        // 1. Create the camera canvas, centred vertically in the left column
         s_camera_canvas_obj = lv_canvas_create(scr);
         lv_canvas_set_buffer(s_camera_canvas_obj, s_ui_canvas_buf, VideoConfig::VIEWPORT_WIDTH, VideoConfig::VIEWPORT_HEIGHT, LV_COLOR_FORMAT_RGB565);
         lv_obj_set_size(s_camera_canvas_obj, VideoConfig::VIEWPORT_WIDTH, VideoConfig::VIEWPORT_HEIGHT);
-        lv_obj_set_pos(s_camera_canvas_obj, 0, 0);
+        lv_obj_set_pos(s_camera_canvas_obj, 0, (VideoConfig::DISPLAY_HEIGHT - VideoConfig::VIEWPORT_HEIGHT) / 2);
 
         // Face overlay boxes: children of the canvas (so they are clipped to it), hidden until used.
         for (lv_obj_t *&box : s_face_boxes) {

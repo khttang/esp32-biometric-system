@@ -15,7 +15,6 @@
 //! the detector downscale when someone will consume it.
 
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
@@ -35,14 +34,14 @@ use log::{error, info, warn};
 use crate::biometrics::{best_match, GroupMember};
 use crate::camera::Camera;
 use crate::ffi;
-use crate::ppa::{image_len, DmaBuf, PixelFormat, Ppa, Rect, Target};
+use crate::ppa::{image_len, DmaBuf, ImageRef, PixelFormat, Ppa, Rect, Target};
 
 // Sensor stream; must match VideoConfig::SENSOR_* in biometrics_wrapper.cpp
 const SENSOR_W: u32 = 1280;
 const SENSOR_H: u32 = 960;
-// Preview canvas on the left half of the screen; must match VideoConfig::VIEWPORT_*
+// Camera canvas (the image area only, centred by the UI); must match VideoConfig::VIEWPORT_*
 const VIEW_W: u32 = 640;
-const VIEW_H: u32 = 720;
+const VIEW_H: u32 = 480;
 
 /// Max time the camera thread waits for LVGL before skipping one preview update.
 const PRESENT_LOCK_TIMEOUT_MS: u32 = 5;
@@ -57,9 +56,6 @@ const MAX_FACES: usize = ffi::P4_UI_MAX_FACE_BOXES as usize;
 /// Interval between inference performance log lines.
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const INFERENCE_STACK_SIZE: usize = 32 * 1024;
-
-/// Frames dequeued by the camera thread; read and reset by the inference thread's stats log.
-static CAMERA_FRAMES: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug)]
 pub enum InferenceEvent {
@@ -139,12 +135,16 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
     // Declared after `previews` so it drops first.
     let _guard = PreviewGuard;
 
-    // Whole sensor frame, unstretched, letterboxed in the viewport: 1280×960 → 640×480 at y=120.
-    // The bars stay black because preview buffers start zeroed and the PPA never writes there.
+    // Whole sensor frame, unstretched, scaled into the 4:3 canvas: 1280×960 → 640×480. The UI
+    // centres the canvas in the left column; the bars are the black screen background.
     let full_frame = Rect::full(SENSOR_W, SENSOR_H);
     let view_rect = fit_rect(SENSOR_W, SENSOR_H, VIEW_W, VIEW_H);
     let mut pending_request: Option<DmaBuf> = None;
     let mut inference_running = true;
+    let mut preview_ppa = LatencyStats::default();
+    let mut detector_ppa = LatencyStats::default();
+    let mut frames_in_window = 0u32;
+    let mut window_start = Instant::now();
 
     info!("[Pipeline] camera thread running on core 1");
     loop {
@@ -156,9 +156,10 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
                 continue;
             }
         };
-        CAMERA_FRAMES.fetch_add(1, Ordering::Relaxed);
+        frames_in_window += 1;
         let image = frame.image();
 
+        // 1. Preview: full sensor frame -> 640x480 RGB565 in the back buffer.
         let preview = Target {
             buf: &mut previews[back],
             width: VIEW_W,
@@ -166,33 +167,37 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
             rect: view_rect,
             format: PixelFormat::Rgb565,
         };
-        match ppa.scale_crop(image, full_frame, preview) {
-            Ok(()) => {
-                // Safety: the buffer stays alive (and unwritten) until the next swap.
-                let presented = unsafe {
-                    ffi::p4_ui_present_camera(
-                        previews[back].as_ptr().cast(),
-                        PRESENT_LOCK_TIMEOUT_MS,
-                    )
-                };
-                if presented {
-                    back ^= 1;
-                }
-            }
-            Err(e) => warn!("[Pipeline] preview PPA failed: {e}"),
+        let ppa_started = Instant::now();
+        let preview_result = ppa.scale_crop(image, full_frame, preview);
+        preview_ppa.record(ppa_started.elapsed());
+        if let Err(e) = preview_result {
+            warn!("[Pipeline] preview PPA failed: {e}");
+            continue;
         }
 
+        // 2. Detector image (on request), converted from the preview area rather than the sensor
+        //    frame: same field of view and pixels, a quarter of the PPA input. Runs before the
+        //    swap, so LVGL is not reading this buffer yet.
         if inference_running && pending_request.is_none() {
             pending_request = requests.try_recv().ok();
         }
         if let Some(mut detector_buf) = pending_request.take() {
+            let preview_image = ImageRef {
+                data: previews[back].as_slice(),
+                width: VIEW_W,
+                height: VIEW_H,
+                format: PixelFormat::Rgb565,
+            };
             let detector = Target::full(
                 &mut detector_buf,
                 DETECTOR_WIDTH,
                 DETECTOR_HEIGHT,
                 DETECTOR_FORMAT,
             );
-            match ppa.scale_crop(image, full_frame, detector) {
+            let ppa_started = Instant::now();
+            let result = ppa.scale_crop(preview_image, view_rect, detector);
+            detector_ppa.record(ppa_started.elapsed());
+            match result {
                 Ok(()) => {
                     if frames.send(detector_buf).is_err() {
                         // Keep the preview running even if inference is unavailable.
@@ -206,8 +211,45 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
                 }
             }
         }
-        // `frame` drops here and its buffer goes back to the ISP.
+
+        // 3. Present: swap the canvas to the back buffer; the other one is filled next frame.
+        // Safety: the buffer stays alive (and unwritten) until the next swap.
+        let presented = unsafe {
+            ffi::p4_ui_present_camera(previews[back].as_ptr().cast(), PRESENT_LOCK_TIMEOUT_MS)
+        };
+        if presented {
+            back ^= 1;
+        }
+        // Return the sensor buffer only now: re-queueing it earlier lets the ISP stream the next
+        // 2.4 MB frame into PSRAM while the PPA is working, which measurably slowed every stage.
+        drop(frame);
+
+        if window_start.elapsed() >= STATS_LOG_INTERVAL {
+            log_camera_stats(
+                frames_in_window,
+                window_start.elapsed(),
+                preview_ppa.take(),
+                detector_ppa.take(),
+            );
+            frames_in_window = 0;
+            window_start = Instant::now();
+        }
     }
+}
+
+fn log_camera_stats(frames: u32, window: Duration, preview: LatencyStats, detector: LatencyStats) {
+    let ms = |d: Option<Duration>| d.map_or(0.0, |d| d.as_secs_f32() * 1000.0);
+    info!(
+        "[Pipeline] camera {:.1} fps over {:.0}s | preview PPA avg {:.1} ms max {:.1} ms | \
+         detector PPA n={} avg {:.1} ms max {:.1} ms",
+        frames as f32 / window.as_secs_f32(),
+        window.as_secs_f32(),
+        ms(preview.mean()),
+        ms(preview.max()),
+        detector.count(),
+        ms(detector.mean()),
+        ms(detector.max()),
+    );
 }
 
 fn inference_loop(
@@ -379,10 +421,8 @@ fn show_overlay(
 fn log_stats(detect: LatencyStats, embed: LatencyStats, frames_with_faces: u32, window: Duration) {
     let ms = |d: Option<Duration>| d.map_or(0.0, |d| d.as_secs_f32() * 1000.0);
     info!(
-        "[Pipeline] camera {:.1} fps | {:.1} inferences/s over {:.0}s | \
-         detect avg {:.1} ms max {:.1} ms | embed n={} avg {:.1} ms max {:.1} ms | \
-         frames with faces {}",
-        CAMERA_FRAMES.swap(0, Ordering::Relaxed) as f32 / window.as_secs_f32(),
+        "[Pipeline] inference {:.1}/s over {:.0}s | detect avg {:.1} ms max {:.1} ms | \
+         embed n={} avg {:.1} ms max {:.1} ms | frames with faces {}",
         detect.count() as f32 / window.as_secs_f32(),
         window.as_secs_f32(),
         ms(detect.mean()),
