@@ -1,11 +1,11 @@
 // src/power.rs
 
 use esp_idf_sys::{
-    esp_deep_sleep_enable_gpio_wakeup, esp_sleep_enable_timer_wakeup,
-    esp_deep_sleep_start, esp_deepsleep_gpio_wake_up_mode_t_ESP_GPIO_WAKEUP_GPIO_LOW,
-    esp_restart, fflush, gpio_config, gpio_config_t, gpio_int_type_t_GPIO_INTR_DISABLE,
-    gpio_mode_t_GPIO_MODE_INPUT, gpio_pulldown_t_GPIO_PULLDOWN_DISABLE,
-    gpio_pullup_t_GPIO_PULLUP_ENABLE,
+    esp_deep_sleep_enable_gpio_wakeup, esp_deep_sleep_start,
+    esp_deepsleep_gpio_wake_up_mode_t_ESP_GPIO_WAKEUP_GPIO_LOW, esp_restart,
+    esp_sleep_enable_timer_wakeup, fflush, gpio_config, gpio_config_t,
+    gpio_int_type_t_GPIO_INTR_DISABLE, gpio_mode_t_GPIO_MODE_INPUT,
+    gpio_pulldown_t_GPIO_PULLDOWN_DISABLE, gpio_pullup_t_GPIO_PULLUP_ENABLE,
 };
 use log::{error, info, warn};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -44,8 +44,10 @@ impl InactivityTimer {
     /// Reset inactivity watchdog (call on touch or button events)
     pub fn reset(&self) {
         let elapsed_secs = self.start_time.elapsed().as_secs();
-        self.last_activity
-            .store(elapsed_secs.try_into().unwrap_or(u32::MAX), Ordering::Relaxed);
+        self.last_activity.store(
+            elapsed_secs.try_into().unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// Returns seconds elapsed since last registered user action
@@ -59,7 +61,10 @@ impl InactivityTimer {
 /// Spawns a background thread that monitors idle time and triggers sleep transition
 pub fn spawn_inactivity_watchdog(timer: InactivityTimer, timeout_secs: u64) {
     thread::spawn(move || {
-        info!("[Power] Inactivity watchdog active (Timeout: {}s)", timeout_secs);
+        info!(
+            "[Power] Inactivity watchdog active (Timeout: {}s)",
+            timeout_secs
+        );
 
         loop {
             thread::sleep(Duration::from_secs(1));
@@ -105,7 +110,10 @@ pub fn handle_fatal_init_error(err: anyhow::Error) -> ! {
         let crash_count = RTC_BOOT_CRASH_COUNT;
 
         error!("==================================================");
-        error!(" [PROD MODE] Hardware Init Failed (Attempt {}/3)", crash_count);
+        error!(
+            " [PROD MODE] Hardware Init Failed (Attempt {}/3)",
+            crash_count
+        );
         error!(" Error: {}", err);
         error!("==================================================");
 
@@ -115,7 +123,7 @@ pub fn handle_fatal_init_error(err: anyhow::Error) -> ! {
             esp_restart();
         } else {
             error!("CRITICAL: Max boot retries reached. Sleeping 1hr to preserve battery.");
-            
+
             // Sleep for 1 hour OR until GPIO wake event (button/touch)
             enter_deep_sleep(Some(Duration::from_secs(3600)));
         }

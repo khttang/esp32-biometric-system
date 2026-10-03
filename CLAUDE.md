@@ -15,6 +15,6 @@ When requested to perform a trend analysis, you must format your output using th
 - `### 3. Practical Sandbox Concepts`
 
 ## Development Rules
-- Rust code must target **Rust compiler v1.90**.
+- Rust code must target **Rust compiler v1.99**.
 - Rely on native safe concurrency and zero-overhead traits; do not generate boilerplate code containing unnecessary `RefCell` or excessive dynamic allocations unless explicitly asked.
 

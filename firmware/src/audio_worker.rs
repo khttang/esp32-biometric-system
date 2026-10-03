@@ -60,7 +60,10 @@ pub fn spawn_audio_capture_thread(
             match worker.capture_frame(&mut pcm_buffer) {
                 Ok(samples_read) => {
                     if samples_read > 0 {
-                        let frame = AudioFrame { samples: pcm_buffer, len: samples_read };
+                        let frame = AudioFrame {
+                            samples: pcm_buffer,
+                            len: samples_read,
+                        };
                         match audio_tx.try_send(frame) {
                             Ok(()) | Err(TrySendError::Full(_)) => {} // drop newest frame when no consumer keeps up
                             Err(TrySendError::Disconnected(_)) => {

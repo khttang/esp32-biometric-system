@@ -34,7 +34,10 @@ impl Camera {
         if ret != 0 || raw.data.is_null() {
             bail!("p4_camera_capture_frame failed: {ret}");
         }
-        Ok(Frame { raw, _camera: PhantomData })
+        Ok(Frame {
+            raw,
+            _camera: PhantomData,
+        })
     }
 }
 
@@ -63,7 +66,10 @@ impl Drop for Frame<'_> {
         // Safety: `raw` came from a successful dequeue and is released exactly once.
         let ret = unsafe { ffi::p4_camera_release_frame(&self.raw) };
         if ret != 0 {
-            error!("[Camera] failed to re-queue buffer {}: {ret}", self.raw.buffer_index);
+            error!(
+                "[Camera] failed to re-queue buffer {}: {ret}",
+                self.raw.buffer_index
+            );
         }
     }
 }

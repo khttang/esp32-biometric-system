@@ -1,9 +1,11 @@
 # ESP32-P4 Multimodal Biometric Agent Firmware
 
+[![CI](https://github.com/khttang/esp32-biometric-system/actions/workflows/ci.yml/badge.svg)](https://github.com/khttang/esp32-biometric-system/actions/workflows/ci.yml)
 ![Target](https://img.shields.io/badge/Target-ESP32--P4-red?style=flat-square)
 ![Version](https://img.shields.io/badge/Version-v0.1.0-blue?style=flat-square)
 ![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.4.4-green?style=flat-square)
 ![LVGL](https://img.shields.io/badge/UI-LVGL%209-orange?style=flat-square)
+![Rust](https://img.shields.io/badge/Rust-1.99-brightgreen?style=flat-square)
 ![Language](https://img.shields.io/badge/Language-Rust%20%7C%20C%2B%2B-brightgreen?style=flat-square)
 
 Edge-AI biometrics firmware for the Waveshare **ESP32-P4-NANO** (dual-core RISC-V). It streams an
@@ -213,12 +215,15 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 
 ## Toolchain
 
-Tested on macOS (Apple Silicon). Most of the toolchain is fetched automatically on the first build.
+The project targets **Rust 1.99** (see `CLAUDE.md`); `rust-version = "1.99"` is set in every crate.
+Tested on macOS (Apple Silicon) locally and Ubuntu in CI. Most of the toolchain is fetched
+automatically on the first build. Run `rustup toolchain install` once in `firmware/` and in
+`crates/biometric-core/` to install the pinned toolchains.
 
 | Tool | Version | How it's installed |
 |---|---|---|
-| Rust (firmware) | `nightly-2026-07-21` + `rust-src` | Pinned in `firmware/rust-toolchain.toml`; rustup installs it automatically. Nightly is required for `build-std` on `riscv32imafc-esp-espidf` (no `espup` needed for RISC-V). |
-| Rust (host tests) | stable | `rustup toolchain install stable` |
+| Rust (firmware) | `nightly-2026-07-21` (1.99.0-nightly) + `rust-src`, `rustfmt`, `clippy` | Pinned in `firmware/rust-toolchain.toml`. Nightly is required for `build-std` on `riscv32imafc-esp-espidf` (no `espup` needed for RISC-V). |
+| Rust (host tests) | `1.99.0` + `rustfmt`, `clippy` | Pinned in `crates/biometric-core/rust-toolchain.toml` |
 | `ldproxy` | latest | `cargo install ldproxy` (linker wrapper used by `.cargo/config.toml`) |
 | `espflash` | 4.x | `cargo install espflash` |
 | Python | 3.12 | `brew install python@3.12`. **Path is hardcoded** as `PYTHON=/opt/homebrew/bin/python3.12` in `firmware/.cargo/config.toml`; adjust for your machine. |
@@ -237,13 +242,21 @@ and used as `crate::ffi`.
 ```sh
 # Host unit tests (no board needed)
 cd crates/biometric-core
-cargo test
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 
 # Firmware: always use the release profile
 cd firmware
 cargo build --release          # first build downloads ESP-IDF + tools (needs network, takes a while)
 cargo run --release            # build, flash (espflash, partitions.csv) and open the serial monitor
+cargo fmt --check && cargo clippy --release -- -D warnings   # same checks as CI
 ```
+
+- **CI** (`.github/workflows/ci.yml`) runs on every pull request and push to `main`:
+  - rustfmt, clippy (`-D warnings`) and unit tests for `biometric-core` on Rust 1.99.0;
+  - rustfmt, clippy and a release build of the firmware.
+
+  ESP-IDF (`firmware/.embuild`, about 5 GB) is cached between runs. The first run is slow.
+  CI overrides the macOS `PYTHON` path from `.cargo/config.toml` with the runner's Python.
 
 - **Serial port:** `espflash` prompts when several ports exist. To pick one non-interactively,
   set `ESPFLASH_PORT`, e.g. `ESPFLASH_PORT=/dev/cu.usbmodem5B5E1311931 cargo run --release`.

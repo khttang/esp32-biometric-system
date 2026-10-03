@@ -13,7 +13,7 @@ on its own.
 
 - **Scope:** one milestone per PR. Unrelated fixes go in their own PR.
 - **Guidelines:** follows [`CLAUDE.md`](../CLAUDE.md):
-  - targets Rust 1.90;
+  - targets Rust 1.99;
   - native safe concurrency and zero-overhead abstractions;
   - no needless `RefCell` or per-frame heap allocation.
 - **Tests:**
@@ -76,18 +76,18 @@ Status: ✅ done · 🚧 in progress · ⬜ planned
 - Accurate README.
 - LVGL pinned to Core 0.
 
-### ⬜ M0: Toolchain & Quality Gates
+### ✅ M0: Toolchain & Quality Gates
 
 Make every later PR verifiable by anyone.
 
-- **Rust 1.90 compliance:** pin the firmware toolchain to Rust 1.90, either
-  - a nightly from the 1.90 cycle, or
-  - stable 1.90 with `build-std`.
-
-  Set `rust-version = "1.90"` everywhere and verify that `biometric-core` builds and tests on stable 1.90.
-- `rustfmt` and `clippy` configuration; fix findings.
-- Continuous integration (GitHub Actions):
-  - host tests on stable 1.90;
+- **Rust 1.99 compliance:** the target moved from 1.90 to 1.99 (current stable).
+  - Firmware: pinned to a 1.99-cycle nightly (needed for `build-std`).
+  - Host crate: pinned to stable 1.99.0.
+  - `rust-version = "1.99"` in every `Cargo.toml`.
+- `rustfmt` (default style) and `clippy` (`-D warnings`) clean on both crates. The one clippy finding was
+  `Ppa::scale_crop` taking 8 arguments; the destination is now grouped into a `ppa::Target`.
+- Continuous integration (GitHub Actions, `.github/workflows/ci.yml`):
+  - host tests on stable 1.99;
   - firmware release build (with cached ESP-IDF);
   - fmt/clippy checks.
 
