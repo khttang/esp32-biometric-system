@@ -49,6 +49,9 @@ pub const EMBEDDING_DIM: usize = 512;
 /// Max time the camera thread waits for LVGL before skipping one preview update.
 const PRESENT_LOCK_TIMEOUT_MS: u32 = 5;
 const EVENT_QUEUE_DEPTH: usize = 8;
+/// Upper bound on inference rate. Face ID doesn't need camera rate, and each request costs a
+/// full-frame PPA downscale on the camera thread.
+const MIN_INFERENCE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Face location in detector-image coordinates.
 #[derive(Debug, Clone, Copy)]
@@ -201,6 +204,7 @@ fn inference_loop(
 
     info!("[Pipeline] inference thread running on core 1");
     while let Ok(detector_buf) = frames.recv() {
+        let started = std::time::Instant::now();
         let image = ImageRef {
             data: detector_buf.as_slice(),
             width: DET_W,
@@ -229,6 +233,9 @@ fn inference_loop(
         }
 
         // Hand the buffer back: this is the request for the next (fresh) frame.
+        if let Some(remaining) = MIN_INFERENCE_INTERVAL.checked_sub(started.elapsed()) {
+            thread::sleep(remaining);
+        }
         if requests.send(detector_buf).is_err() {
             break;
         }
