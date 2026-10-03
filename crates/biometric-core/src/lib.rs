@@ -4,7 +4,9 @@
 //! `cd crates/biometric-core && cargo test`
 
 pub mod contract;
+pub mod enrollment;
 pub mod geometry;
 pub mod manifest;
 pub mod matching;
 pub mod stats;
+pub mod template;

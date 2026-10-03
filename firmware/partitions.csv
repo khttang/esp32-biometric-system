@@ -2,6 +2,8 @@
 # App slots hold the firmware only (~3.6 MB). Face models live in their own partitions (one model
 # each, plus a manifest in the last 4 KiB) so they can be updated without reflashing the app; see
 # crates/model-packer. ESP-DL memory-maps model partitions, so they must be 64 KiB aligned.
+# Enrolled face templates are NVS blobs in `templates` (its own NVS partition, so erasing or
+# resizing the system `nvs` never touches them).
 # Name,    Type, SubType, Offset,   Size
 nvs,       data, nvs,     0x9000,   0x10000
 otadata,   data, ota,     0x19000,  0x2000
@@ -11,4 +13,5 @@ ota_1,     app,  ota_1,   0x520000, 0x500000
 face_msr,  data, spiffs,  0xA20000, 0x20000
 face_mnp,  data, spiffs,  0xA40000, 0x30000
 face_feat, data, spiffs,  0xA70000, 0x200000
-storage,   data, spiffs,  0xC70000, 0x390000
+templates, data, nvs,     0xC70000, 0x40000
+storage,   data, spiffs,  0xCB0000, 0x350000

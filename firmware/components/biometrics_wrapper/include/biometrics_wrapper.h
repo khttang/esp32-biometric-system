@@ -55,6 +55,32 @@ typedef struct {
 bool p4_ui_show_faces(const p4_ui_rect_t *rects, size_t count, uint32_t lock_timeout_ms);
 bool p4_touch_is_pressed(void);
 
+// Right-hand panel: a status line, and an admin view (name field + on-screen keyboard, member
+// list, Enroll / Delete / Done buttons) that replaces the idle view's "Admin" button.
+// Touch input is reported as events; Rust owns the enrollment logic and polls them.
+#define P4_UI_NAME_MAX 32      // bytes of member name the name field accepts
+#define P4_UI_EVENT_ADMIN 1    // "Admin" pressed in the idle view
+#define P4_UI_EVENT_ENROLL 2   // "Enroll" (or the keyboard's OK) pressed; `name` = name field
+#define P4_UI_EVENT_DELETE 3   // "Delete" pressed; `selected` = index into the member list
+#define P4_UI_EVENT_EXIT 4     // "Done" pressed
+
+typedef struct {
+    uint8_t kind; // P4_UI_EVENT_*
+    uint16_t selected;
+    char name[P4_UI_NAME_MAX + 1]; // NUL-terminated
+} p4_ui_event_t;
+
+// Fetches the oldest pending event; returns false if there is none. Never blocks.
+bool p4_ui_poll_event(p4_ui_event_t *event);
+// The functions below take the LVGL lock (lock_timeout_ms 0 = wait forever) and return false,
+// changing nothing, if it was not taken in time.
+bool p4_ui_set_status(const char *text, uint32_t lock_timeout_ms);
+// Shows the admin view (clearing the name field) or the idle view.
+bool p4_ui_set_admin_mode(bool enabled, uint32_t lock_timeout_ms);
+// Replaces the member list. `names` holds `count` names separated by '\n' (NULL or "" for none);
+// P4_UI_EVENT_DELETE reports an index into this list. Also clears the name field.
+bool p4_ui_set_members(const char *names, size_t count, uint32_t lock_timeout_ms);
+
 // Camera V4L2 Driver FFI
 int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height);
 int32_t p4_camera_capture_frame(p4_camera_frame_t *frame); // blocks until a frame is ready

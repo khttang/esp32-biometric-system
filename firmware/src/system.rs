@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use arc_swap::ArcSwap;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::{Input, PinDriver, Pull};
 use esp_idf_svc::hal::peripherals::Peripherals;
@@ -14,9 +13,10 @@ use std::sync::Arc;
 use crate::audio_worker::{AudioFrame, AUDIO_QUEUE_DEPTH};
 use crate::biometrics::GroupMember;
 use crate::ffi;
-use crate::pipeline::InferenceEvent;
+use crate::pipeline::{Command, InferenceEvent, Roster};
 use crate::power::InactivityTimer;
 use crate::speaker::Speaker;
+use crate::templates::TemplateStore;
 
 // Sleep Parameters (wake pins live in power.rs)
 const INACTIVITY_TIMEOUT_SECS: u64 = 180; // 3 mins
@@ -45,8 +45,10 @@ pub struct SystemResources {
     #[allow(dead_code)] // TODO: drained by the voice pipeline
     pub audio_rx: std::sync::mpsc::Receiver<AudioFrame>,
 
-    // Shared between Core 0 (Network) and Core 1 (Matcher)
-    pub group_members: Arc<ArcSwap<Vec<GroupMember>>>,
+    // Enrolled members as seen by the matcher on Core 1; republished after every change
+    pub group_members: Arc<Roster>,
+    // Their persistent copy; None if the `templates` partition is unusable (enrollment disabled)
+    templates: Option<TemplateStore>,
 
     // Peripheral Handles & Session State
     #[allow(dead_code)] // TODO: success chime on match
@@ -56,6 +58,8 @@ pub struct SystemResources {
 
     // Detection / recognition results from the Core 1 vision pipeline
     pub vision_events: std::sync::mpsc::Receiver<InferenceEvent>,
+    // Enrollment requests to the Core 1 inference thread
+    pub vision_commands: std::sync::mpsc::SyncSender<Command>,
 }
 
 pub struct SystemResourcesBuilder {
@@ -112,9 +116,16 @@ impl SystemResourcesBuilder {
             INACTIVITY_TIMEOUT_SECS
         );
 
-        // 6. Vision pipeline (camera + inference threads on Core 1; loads the face models)
-        let group_members = Arc::new(ArcSwap::from_pointee(Vec::new()));
-        let vision_events = crate::pipeline::spawn(group_members.clone())
+        // 6. Enrolled templates. Recognition of nobody is better than no device, so a broken
+        //    store only disables enrollment.
+        let templates = TemplateStore::open()
+            .inspect_err(|e| warn!("[SystemResources] enrollment disabled: {e:#}"))
+            .ok();
+        let members = templates.as_ref().map(TemplateStore::members);
+        let group_members = Arc::new(Roster::from_pointee(members.unwrap_or_default()));
+
+        // 7. Vision pipeline (camera + inference threads on Core 1; loads the face models)
+        let vision = crate::pipeline::spawn(group_members.clone())
             .context("[SystemResources] Failed to start vision pipeline")?;
 
         info!("[SystemResources] All hardware subsystems and LVGL 9 split-screen ready!");
@@ -127,11 +138,13 @@ impl SystemResourcesBuilder {
             audio_rx,
             admin_button,
             group_members,
+            templates,
             net_session: EthernetSession {
                 is_connected: false,
                 ip_address: None,
             },
-            vision_events,
+            vision_events: vision.events,
+            vision_commands: vision.commands,
         })
     }
 }
@@ -149,7 +162,39 @@ impl SystemResources {
         unsafe { ffi::p4_touch_is_pressed() }
     }
 
-    /// Fetch group members over network with local Flash fallback
+    /// Persists a new member and publishes the updated list to the matcher.
+    pub fn enroll_member(
+        &mut self,
+        name: &str,
+        embedding: Vec<f32>,
+        model_version: &str,
+    ) -> Result<Arc<GroupMember>> {
+        let store = self.template_store()?;
+        let member = store.enroll(name, embedding, model_version)?;
+        let members = store.members();
+        self.group_members.store(Arc::new(members));
+        Ok(member)
+    }
+
+    /// Erases the member at `index` of the published list and publishes the updated list.
+    pub fn delete_member(&mut self, index: usize) -> Result<Arc<GroupMember>> {
+        let store = self.template_store()?;
+        let member = store.delete(index)?;
+        let members = store.members();
+        self.group_members.store(Arc::new(members));
+        Ok(member)
+    }
+
+    fn template_store(&mut self) -> Result<&mut TemplateStore> {
+        self.templates
+            .as_mut()
+            .context("template storage is unavailable (see the boot log)")
+    }
+
+    /// Fetch group members over network with local Flash fallback.
+    ///
+    /// Not reachable yet (no update trigger is wired). M4 replaces it with a sync that goes
+    /// through the template store; until then a fetched list is only held in RAM.
     pub fn fetch_runtime_templates(&mut self) -> Result<()> {
         info!("Attempting HTTP template fetch from: {}", TEMPLATE_ENDPOINT);
 
@@ -160,7 +205,7 @@ impl SystemResources {
                     members.len()
                 );
                 let _ = Self::save_members_to_flash("/spiffs/members.json", &members);
-                self.group_members.store(Arc::new(members));
+                self.publish_fetched(members);
                 Ok(())
             }
             Err(err) => {
@@ -169,10 +214,15 @@ impl SystemResources {
                     err
                 );
                 let cached_members = Self::load_members_from_flash("/spiffs/members.json")?;
-                self.group_members.store(Arc::new(cached_members));
+                self.publish_fetched(cached_members);
                 Ok(())
             }
         }
+    }
+
+    fn publish_fetched(&self, members: Vec<GroupMember>) {
+        let members = members.into_iter().map(Arc::new).collect();
+        self.group_members.store(Arc::new(members));
     }
 
     /// HTTP GET stream downloader using EspHttpConnection directly
