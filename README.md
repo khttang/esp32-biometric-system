@@ -30,7 +30,7 @@ Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP
 | Face embedding | Working: ESP-DL MobileFaceNet, 512-d, aligned from 5 landmarks |
 | Model updates | Models live in their own flash partitions with a verified manifest; update them without reflashing the firmware ([Model Partitions](#model-partitions)) |
 | Enrollment | On-device: the admin view on the touch panel enrolls the face in view and deletes members; templates persist in flash ([Enrollment & Templates](#enrollment--templates)) |
-| Matching | Cosine similarity against enrolled templates of the same model release; the threshold (0.5) is Espressif's default and has **not** been measured on a test set yet |
+| Matching | Cosine similarity against enrolled templates of the same model release. Enroll → reboot → recognise → delete works on the board. The threshold (0.5) is Espressif's default and has **not** been measured on a test set yet |
 | Template download | Not yet (M4): the HTTP fetch code is not triggered by the state machine |
 | Voice recognition | Not implemented |
 
@@ -210,8 +210,8 @@ the script.
 Members are enrolled on the device itself; no server is involved.
 
 **Flow.** The right-hand panel shows a status line and an **Admin** button (the admin button on
-GPIO 0 does the same). The admin view has a name field with an on-screen keyboard, the member
-list, and **Enroll**, **Delete** and **Done**:
+GPIO 0 does the same). The admin view has a name field and the member list on the left,
+**Enroll**, **Delete** and **Done** on the right, and an on-screen keyboard along the bottom:
 
 1. **Enroll** asks the inference thread for a template. It needs exactly one face in view (with
    several, there is no telling whose it should be).
@@ -244,8 +244,11 @@ leaves enrollments alone. NVS provides wear levelling, a CRC per entry and power
 Templates are loaded at boot; a record that fails to decode is logged and skipped.
 
 **Threshold.** `MATCH_THRESHOLD` is 0.5, the default of Espressif's `HumanFaceRecognizer` for this
-model. It has not been measured with this pipeline yet. To measure it, watch the inference log
-line, which reports the similarity of each embedded face to its closest template every 10 s:
+model. It has not been measured on a test set with this pipeline yet. The one data point so far:
+a single enrolled person scored 0.32–0.87 per frame (0.77 on average) and was recognised at 0.84
+and, after a reboot, 0.77. Nothing is known yet about how people who are not enrolled score. To
+measure it, watch the inference log line, which reports the similarity of each embedded face to
+its closest template every 10 s:
 
 ```text
 … | closest template n=42 min 0.61 avg 0.74 max 0.83 (threshold 0.5)
