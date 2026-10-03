@@ -24,6 +24,15 @@ pub const LANDMARK_COUNT: usize = 5;
 /// Length of the face embedding produced by the feature model.
 pub const EMBEDDING_DIM: usize = 512;
 
-/// Identifies the feature model that produced an embedding. Enrolled templates are only
-/// comparable with live embeddings from the same model version.
-pub const FEATURE_MODEL_VERSION: &str = "human_face_feat_mfn_s8_v1";
+/// Model partitions (one model each); must match `firmware/partitions.csv` and
+/// `face_inference.cpp`.
+pub const MSR_PARTITION: &str = "face_msr";
+pub const MNP_PARTITION: &str = "face_mnp";
+pub const FEATURE_PARTITION: &str = "face_feat";
+
+/// Model identifiers the firmware accepts in each partition's manifest
+/// (see [`crate::manifest`]); the manifest's `version` identifies the specific release.
+/// They are the `.espdl` file stems in Espressif's model components.
+pub const MSR_MODEL_ID: &str = "human_face_detect_msr_s8_v1";
+pub const MNP_MODEL_ID: &str = "human_face_detect_mnp_s8_v1";
+pub const FEATURE_MODEL_ID: &str = "human_face_feat_mfn_s8_v1";

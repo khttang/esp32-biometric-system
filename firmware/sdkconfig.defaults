@@ -90,13 +90,8 @@ CONFIG_CAMERA_OV5647_MIPI_RAW10_1280X960_BINNING_45FPS=y
 CONFIG_CAMERA_OV5647_DEFAULT_IPA_JSON_CONFIGURATION_FILE=y
 CONFIG_CAMERA_OV5647_MIPI_DEFAULT_FMT_RAW10_1280X960_BINNING_45FPS=y
 
-# Face models (ESP-DL human_face_detect / human_face_recognition), embedded in the app image
-CONFIG_FLASH_HUMAN_FACE_DETECT_MSRMNP_S8_V1=y
-CONFIG_HUMAN_FACE_DETECT_MSRMNP_S8_V1=y
-CONFIG_HUMAN_FACE_DETECT_MODEL_IN_FLASH_RODATA=y
-CONFIG_FLASH_HUMAN_FACE_FEAT_MFN_S8_V1=y
-CONFIG_HUMAN_FACE_FEAT_MFN_S8_V1=y
-CONFIG_HUMAN_FACE_FEAT_MODEL_IN_FLASH_RODATA=y
+# Face models are not part of the firmware build: they are loaded at runtime from the face_msr /
+# face_mnp / face_feat flash partitions (images built by crates/model-packer, see the README).
 
 # ESP-DL pixel conversions: the pipeline feeds the models RGB888 only. Each enabled pair
 # instantiates large templates (~1 MB of code for all of them), so keep just the one in use.

@@ -233,28 +233,6 @@ dependencies:
     - esp32c61
     - esp32s31
     version: 2.2.0
-  espressif/human_face_detect:
-    component_hash: b6f898ba69e0355641db0f2974f5810fb26c265ab3e1b1a03a37469976ad4591
-    dependencies:
-    - name: espressif/esp-dl
-      registry_url: https://components.espressif.com
-      require: private
-      version: ~3.3.0
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 0.4.2
-  espressif/human_face_recognition:
-    component_hash: ebdce22800621739386c8c5ae0e974cd5ee59f9d3d0735bf6cfe4c8040313ae4
-    dependencies:
-    - name: espressif/human_face_detect
-      registry_url: https://components.espressif.com
-      require: private
-      version: ~0.4.1
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 0.3.2
   espressif/i2c_bus:
     component_hash: 483112c1619c54c38d0b734fb25f1678733267858a77b7af2f48cc7db6dbbd84
     dependencies:
@@ -356,10 +334,8 @@ direct_dependencies:
 - espressif/esp_lcd_touch_gt911
 - espressif/esp_lvgl_port
 - espressif/esp_video
-- espressif/human_face_detect
-- espressif/human_face_recognition
 - lvgl/lvgl
 - waveshare/esp_lcd_hx8394
-manifest_hash: 9795c3f4f04b10948ee38f89f43bbcc19d2f52108b98992446601918fc54af13
+manifest_hash: acadd68da2ca4396289a798bb0cb30bfa2a054e4efab0422a81f2389402fc954
 target: esp32p4
 version: 2.0.0

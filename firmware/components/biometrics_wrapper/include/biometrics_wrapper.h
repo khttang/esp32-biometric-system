@@ -82,9 +82,11 @@ typedef struct {
     int32_t landmarks[2 * P4_FACE_LANDMARKS]; // (x, y) pairs as reported by the detector
 } p4_face_t;
 
-// Loads the detection and feature models. Idempotent.
-int32_t p4_face_init(void);
-// Embedding length of the loaded feature model (0 before p4_face_init).
+// Load the detection / feature model from its flash partition (human_face_det / human_face_feat).
+// Idempotent. ESP-DL aborts on an unreadable partition, so verify it (Rust models.rs) first.
+int32_t p4_face_init_detector(void);
+int32_t p4_face_init_embedder(void);
+// Embedding length of the loaded feature model (0 before p4_face_init_embedder).
 size_t p4_face_embedding_len(void);
 // Images are packed PPA RGB888 (ESP-IDF layout: B, G, R bytes per pixel).
 // Detects faces in a packed RGB888 image. Writes up to `capacity` faces (highest score first) and
