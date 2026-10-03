@@ -1,30 +1,22 @@
-// Import auto-generated FFI bindings from build.rs (crucial for making ffi bindings work with Rust)
-// Allow C-style type naming from bindgen FFI output
-#[allow(non_camel_case_types)]
-#[allow(non_snake_case)]
-#[allow(dead_code)]
-mod ffi {
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-}
+// C/C++ bindings: esp-idf-sys generates them from components/biometrics_wrapper/include/bindings.h
+// (our wrapper API + PPA/heap headers) alongside the regular ESP-IDF bindings.
+use esp_idf_svc::sys as ffi;
 
 mod system;
 mod audio_worker;
-mod hdmi_audio;
-mod storage;
-mod ota;
-mod thingsboard;
+mod speaker;
 mod power;
-mod video;
+mod camera;
+mod ppa;
+mod pipeline;
 mod biometrics;
 
-use anyhow::{Context, Result};
-use log::{info, error};
+use anyhow::Result;
+use log::info;
 use esp_idf_svc::hal::delay::FreeRtos;
 use system::SystemResources;
 use crate::biometrics::BiometricSystem;
 
-const WIFI_SSID: &str = "YOUR_WIFI_SSID";
-const WIFI_PASS: &str = "YOUR_WIFI_PASSWORD";
 
 
 fn main() -> Result<()>{
@@ -65,17 +57,4 @@ fn main() -> Result<()>{
         // Yield CPU 0 and feed FreeRTOS watchdog (~60 FPS)
         FreeRtos::delay_ms(16);
     }
-}
-
-pub fn verify_face(live_embedding: &[f32; 128], enrolled_embedding: &[f32; 128], threshold: f32) -> bool {
-    let dot_product: f32 = live_embedding.iter().zip(enrolled_embedding.iter()).map(|(a, b)| a * b).sum();
-    let norm_a: f32 = live_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = enrolled_embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return false;
-    }
-
-    let similarity = dot_product / (norm_a * norm_b);
-    similarity >= threshold
 }

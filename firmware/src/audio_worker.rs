@@ -1,9 +1,20 @@
 use anyhow::Result;
 use log::{error, info, warn};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::thread;
 
 use crate::ffi;
+
+pub const AUDIO_FRAME_SAMPLES: usize = 512;
+/// ~0.5s of 16 kHz audio buffered before new frames are dropped
+pub const AUDIO_QUEUE_DEPTH: usize = 16;
+
+/// Fixed-size PCM frame moved through the channel by value (no per-frame heap allocation)
+#[allow(dead_code)] // TODO: consumed by the voice pipeline
+pub struct AudioFrame {
+    pub samples: [i16; AUDIO_FRAME_SAMPLES],
+    pub len: usize,
+}
 
 pub struct AudioWorker {
     port: i32,
@@ -36,23 +47,26 @@ impl AudioWorker {
 
 pub fn spawn_audio_capture_thread(
     i2s_port: i32,
-    audio_tx: Sender<Vec<i16>>,
+    audio_tx: SyncSender<AudioFrame>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let worker = AudioWorker::new(i2s_port);
 
         info!("[Audio] I2S MEMS Microphone capture thread running...");
-        let mut pcm_buffer = [0i16; 512];
+        let mut pcm_buffer = [0i16; AUDIO_FRAME_SAMPLES];
 
         loop {
             // Blocking read from DMA in C—thread yields until buffer is filled
             match worker.capture_frame(&mut pcm_buffer) {
                 Ok(samples_read) => {
                     if samples_read > 0 {
-                        let active_samples = pcm_buffer[..samples_read].to_vec();
-                        if audio_tx.send(active_samples).is_err() {
-                            warn!("[Audio] Receiver dropped. Exiting audio worker loop.");
-                            break;
+                        let frame = AudioFrame { samples: pcm_buffer, len: samples_read };
+                        match audio_tx.try_send(frame) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {} // drop newest frame when no consumer keeps up
+                            Err(TrySendError::Disconnected(_)) => {
+                                warn!("[Audio] Receiver dropped. Exiting audio worker loop.");
+                                break;
+                            }
                         }
                     }
                 }

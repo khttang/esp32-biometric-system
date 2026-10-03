@@ -30,16 +30,14 @@ opt-level = 3
 # Dependencies
 # -----------------------------------------------------------------------------
 [dependencies]
-libc = "0.2"
 log = "0.4"
 anyhow = "1.0.104"
 
 # --- Essential Espressif & Async Ecosystem ---
 esp-idf-sys = { version = "0.37.2", features = ["binstart"] }
-esp-idf-svc = { version = "0.52.1", features = ["alloc", "std", "critical-section", "embassy-time-driver", "embassy-sync"] }
-embassy-time = { version = "0.5.1", features = ["generic-queue-8"] }
-tokio = { version = "1.38", default-features = false, features = ["rt", "sync", "time", "macros"] }
+esp-idf-svc = { version = "0.52.1", features = ["alloc", "std", "critical-section"] }
 arc-swap = "1.9.2"
+biometric-core = { path = "../crates/biometric-core" }
 
 # --- Serialization for Biometric Templates & Config ---
 serde = { version = "1.0.229", features = ["derive"] }
@@ -56,11 +54,11 @@ extra_clang_args = ["-DISP_LL_EVENT_ERROR_MASK=0"]
 # Local C/C++ Subcomponents Directory
 [[package.metadata.esp-idf-sys.extra_components]]
 component_dirs = ["components"]
+bindings_header = "components/biometrics_wrapper/include/bindings.h"
 
 # -----------------------------------------------------------------------------
 # Build Dependencies (C Bindgen & IDF CMake Integration)
 # -----------------------------------------------------------------------------
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }
-bindgen = "0.72.1"
 
