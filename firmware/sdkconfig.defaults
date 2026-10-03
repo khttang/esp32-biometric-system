@@ -25,6 +25,8 @@ CONFIG_SPIRAM_SPEED_200M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+# Run code and read-only data (incl. embedded face models) from PSRAM instead of flash.
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
 
 # =============================================================================
 # 4. Flash & Partition Table Configuration (16MB)
@@ -37,12 +39,14 @@ CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 # =============================================================================
 # 5. Processor L2 Cache Boost (ESP-DL Neural Engine Acceleration)
 # =============================================================================
-CONFIG_CACHE_L2_CACHE_128KB=y
+CONFIG_CACHE_L2_CACHE_256KB=y
 CONFIG_CACHE_L2_CACHE_LINE_128B=y
 
 # =============================================================================
 # 6. Peripheral Drivers & Compiler Features
 # =============================================================================
+# -O2, as in Espressif's ESP-DL examples (inference speed; larger code than -Os)
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
 CONFIG_COMPILER_CXX_EXCEPTIONS_EMG_BUFF_SIZE=256
 CONFIG_COMPILER_CXX_RTTI=y
@@ -83,7 +87,30 @@ CONFIG_CAMERA_OV5647_MIPI_RAW10_1280X960_BINNING_45FPS=y
 CONFIG_CAMERA_OV5647_DEFAULT_IPA_JSON_CONFIGURATION_FILE=y
 CONFIG_CAMERA_OV5647_MIPI_DEFAULT_FMT_RAW10_1280X960_BINNING_45FPS=y
 
-# Biometrics Wrapper Custom Kconfig
-CONFIG_BIOMETRICS_ENABLE_FACE_DETECTION=y
+# Face models (ESP-DL human_face_detect / human_face_recognition), embedded in the app image
+CONFIG_FLASH_HUMAN_FACE_DETECT_MSRMNP_S8_V1=y
+CONFIG_HUMAN_FACE_DETECT_MSRMNP_S8_V1=y
+CONFIG_HUMAN_FACE_DETECT_MODEL_IN_FLASH_RODATA=y
+CONFIG_FLASH_HUMAN_FACE_FEAT_MFN_S8_V1=y
+CONFIG_HUMAN_FACE_FEAT_MFN_S8_V1=y
+CONFIG_HUMAN_FACE_FEAT_MODEL_IN_FLASH_RODATA=y
+
+# ESP-DL pixel conversions: the pipeline feeds the models RGB888 only. Each enabled pair
+# instantiates large templates (~1 MB of code for all of them), so keep just the one in use.
+CONFIG_PIX_CVT_RGB888_TO_RGB888_SUPPORT=y
+# CONFIG_PIX_CVT_RGB565_TO_RGB565_SUPPORT is not set
+# CONFIG_PIX_CVT_RGB565_TO_RGB888_SUPPORT is not set
+# CONFIG_PIX_CVT_RGB565_TO_GRAY_SUPPORT is not set
+# CONFIG_PIX_CVT_RGB565_TO_HSV_SUPPORT is not set
+# CONFIG_PIX_CVT_RGB888_TO_RGB565_SUPPORT is not set
+# CONFIG_PIX_CVT_RGB888_TO_GRAY_SUPPORT is not set
+# CONFIG_PIX_CVT_RGB888_TO_HSV_SUPPORT is not set
+# CONFIG_PIX_CVT_GRAY_TO_GRAY_SUPPORT is not set
+# CONFIG_PIX_CVT_HSV_TO_HSV_MASK_SUPPORT is not set
+# CONFIG_PIX_CVT_YUV_TO_RGB888_SUPPORT is not set
+# CONFIG_PIX_CVT_YUV_TO_RGB565_SUPPORT is not set
+# CONFIG_PIX_CVT_YUV_TO_GRAY_SUPPORT is not set
+# CONFIG_PIX_CVT_YUV_TO_HSV_SUPPORT is not set
+# CONFIG_PIX_CVT_YUV_TO_YUV_SUPPORT is not set
 
 CONFIG_ESP_LCD_HX8394_SKIP_I2C_INIT=y

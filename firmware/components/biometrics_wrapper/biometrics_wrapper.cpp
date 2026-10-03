@@ -46,8 +46,6 @@
 #include "lvgl.h"
 
 // Core esp-dl Headers
-#include "dl_model_base.hpp"
-#include "dl_tensor_base.hpp"
 
 #include "sdkconfig.h"
 #include "biometrics_wrapper.h"
@@ -120,7 +118,6 @@ namespace VideoConfig {
 #define TAG_LVGL    "p4_lvgl"
 #define TAG_AUDIO   "p4_audio"
 #define TAG_OTA     "p4_ota"
-#define TAG_FACENET "ESP_DL_FACENET"
 #define TAG_I2S     "I2S_WRAPPER"
 
 #define CAM_BUF_COUNT 3
@@ -137,7 +134,6 @@ static i2s_chan_handle_t g_i2s_rx_handle = NULL;
 
 
 static bool s_hardware_initialized = false;
-static dl::Model *g_mobilefacenet_model = NULL;
 
 static volatile bool s_camera_streaming = false;
 static int s_video_fd = -1;
@@ -151,6 +147,7 @@ static volatile uint16_t s_touch_x = 0;
 static volatile uint16_t s_touch_y = 0;
 static volatile bool s_touch_pressed = false;
 static lv_obj_t *s_touch_label = NULL;
+static lv_obj_t *s_face_boxes[P4_UI_MAX_FACE_BOXES] = {};
 
 extern "C" {
     i2c_master_bus_handle_t bsp_i2c_get_handle(void);
@@ -804,79 +801,6 @@ int32_t init_p4_ethernet(void) {
     return esp_eth_start(eth_handle);
 }
 
-// -----------------------------------------------------------------------------
-// ESP-DL Model Inference Entry Points
-// -----------------------------------------------------------------------------
-int32_t dl_mobilefacenet_init(const uint8_t *model_buf, size_t model_size) {
-    if (!model_buf || model_size == 0) {
-        ESP_LOGE(TAG_FACENET, "Invalid model buffer or size");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    g_mobilefacenet_model = new (std::nothrow) dl::Model(
-        (const char *)model_buf,
-        model_size
-    );
-
-    if (!g_mobilefacenet_model) {
-        ESP_LOGE(TAG_FACENET, "Failed to allocate dl::Model");
-        return ESP_FAIL;
-    }
-
-    ESP_LOGI(TAG_FACENET, "MobileFaceNet loaded successfully! (Flash addr: %p)", model_buf);
-    return ESP_OK;
-}
-
-int32_t dl_mobilefacenet_run(const uint8_t *crop_rgb888, float *out_embedding, size_t embedding_len) {
-    if (!g_mobilefacenet_model) {
-        ESP_LOGE(TAG_FACENET, "Model not initialized!");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (!crop_rgb888 || !out_embedding || embedding_len < 512) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    std::map<std::string, dl::TensorBase *> &inputs = g_mobilefacenet_model->get_inputs();
-    if (inputs.empty()) return ESP_FAIL;
-
-    dl::TensorBase *input_tensor = inputs.begin()->second;
-    void *tensor_buf = input_tensor->get_element_ptr();
-    if (!tensor_buf) return ESP_FAIL;
-
-    size_t input_bytes = input_tensor->get_bytes();
-    memcpy(tensor_buf, crop_rgb888, input_bytes);
-
-    g_mobilefacenet_model->run();
-
-    std::map<std::string, dl::TensorBase *> &outputs = g_mobilefacenet_model->get_outputs();
-    if (outputs.empty()) return ESP_FAIL;
-
-    dl::TensorBase *output_tensor = outputs.begin()->second;
-    int8_t *quant_data = (int8_t *)output_tensor->get_element_ptr();
-    if (!quant_data) return ESP_FAIL;
-
-    int exponent = output_tensor->get_exponent();
-    float scale = powf(2.0f, (float)exponent);
-
-    float sum_squares = 0.0f;
-    for (size_t i = 0; i < 512; i++) {
-        float dequant_val = (float)quant_data[i] * scale;
-        out_embedding[i] = dequant_val;
-        sum_squares += dequant_val * dequant_val;
-    }
-
-    float l2_norm = sqrtf(sum_squares);
-    if (l2_norm > 1e-6f) {
-        float inv_norm = 1.0f / l2_norm;
-        for (size_t i = 0; i < 512; i++) {
-            out_embedding[i] *= inv_norm;
-        }
-    }
-
-    return ESP_OK;
-}
-
 void setup_split_screen_ui(void) {
     if (lvgl_port_lock(100)) {
         lv_obj_t *scr = lv_screen_active();
@@ -908,6 +832,18 @@ void setup_split_screen_ui(void) {
         lv_canvas_set_buffer(s_camera_canvas_obj, s_ui_canvas_buf, VideoConfig::VIEWPORT_WIDTH, VideoConfig::VIEWPORT_HEIGHT, LV_COLOR_FORMAT_RGB565);
         lv_obj_set_size(s_camera_canvas_obj, VideoConfig::VIEWPORT_WIDTH, VideoConfig::VIEWPORT_HEIGHT);
         lv_obj_set_pos(s_camera_canvas_obj, 0, 0);
+
+        // Face overlay boxes: children of the canvas (so they are clipped to it), hidden until used.
+        for (lv_obj_t *&box : s_face_boxes) {
+            box = lv_obj_create(s_camera_canvas_obj);
+            lv_obj_remove_style_all(box);
+            lv_obj_set_style_border_width(box, 3, LV_PART_MAIN);
+            lv_obj_set_style_border_color(box, lv_color_hex(0x00FF00), LV_PART_MAIN);
+            lv_obj_set_style_border_opa(box, LV_OPA_COVER, LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, LV_PART_MAIN);
+            lv_obj_remove_flag(box, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_flag(box, LV_OBJ_FLAG_HIDDEN);
+        }
 
         // 2. Create Right System Control Panel (640x720 at x=640)
         lv_obj_t *panel = lv_obj_create(scr);
@@ -962,6 +898,30 @@ bool p4_ui_present_camera(const void *buf, uint32_t lock_timeout_ms) {
     lv_canvas_set_buffer(s_camera_canvas_obj, target, VideoConfig::VIEWPORT_WIDTH,
                          VideoConfig::VIEWPORT_HEIGHT, LV_COLOR_FORMAT_RGB565);
     lv_obj_invalidate(s_camera_canvas_obj);
+    lvgl_port_unlock();
+    return true;
+}
+
+bool p4_ui_show_faces(const p4_ui_rect_t *rects, size_t count, uint32_t lock_timeout_ms) {
+    if (!s_ui_ready || (count > 0 && !rects)) {
+        return false;
+    }
+    if (!lvgl_port_lock(lock_timeout_ms)) {
+        return false;
+    }
+    for (size_t i = 0; i < P4_UI_MAX_FACE_BOXES; ++i) {
+        lv_obj_t *box = s_face_boxes[i];
+        if (!box) {
+            continue;
+        }
+        if (i < count) {
+            lv_obj_set_pos(box, rects[i].x, rects[i].y);
+            lv_obj_set_size(box, rects[i].w, rects[i].h);
+            lv_obj_remove_flag(box, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(box, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
     lvgl_port_unlock();
     return true;
 }

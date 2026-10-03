@@ -1,9 +1,0 @@
-menu "Biometrics Wrapper Configuration"
-
-    config BIOMETRICS_ENABLE_FACE_DETECTION
-        bool "Enable ESP-DL MobileFaceNet Acceleration"
-        default y
-        help
-            Enable hardware-accelerated neural network inference for facial recognition.
-
-endmenu

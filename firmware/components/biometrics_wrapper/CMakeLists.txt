@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "biometrics_wrapper.cpp"
+    SRCS "biometrics_wrapper.cpp" "face_inference.cpp"
     INCLUDE_DIRS "include" "."
     REQUIRES 
         cxx 
@@ -16,6 +16,8 @@ idf_component_register(
         lvgl
         # Managed components
         espressif__esp-dl 
+        espressif__human_face_detect
+        espressif__human_face_recognition
         espressif__esp_video
         espressif__esp_lvgl_port
         espressif__esp_lcd_touch

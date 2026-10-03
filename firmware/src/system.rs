@@ -22,15 +22,6 @@ use crate::speaker::Speaker;
 const INACTIVITY_TIMEOUT_SECS: u64 = 180; // 3 mins
 const TEMPLATE_ENDPOINT: &str = "http://192.168.1.100:8080/api/v1/members";
 
-// Force 16-byte alignment required by ESP32-P4 ESP-DL hardware acceleration
-#[repr(C, align(16))]
-struct AlignedModel<const N: usize>([u8; N]);
-
-const RAW_MODEL_BYTES: &[u8; include_bytes!("../assets/mobilefacenet_quantized.espdl").len()] =
-    include_bytes!("../assets/mobilefacenet_quantized.espdl");
-
-static MODEL_WEIGHTS: AlignedModel<{ RAW_MODEL_BYTES.len() }> = AlignedModel(*RAW_MODEL_BYTES);
-
 pub type P4HardwareConfig = ffi::p4_hardware_config_t;
 
 #[allow(dead_code)] // TODO: populate from ETHERNET_EVENT_* / IP_EVENT_ETH_GOT_IP
@@ -121,23 +112,7 @@ impl SystemResourcesBuilder {
             INACTIVITY_TIMEOUT_SECS
         );
 
-        // 6. Neural Model Setup
-        let model: &'static [u8] = &MODEL_WEIGHTS.0;
-        info!(
-            "[ESP-DL] MobileFaceNet model mapped at flash addr {:p} (Size: {} bytes)",
-            model.as_ptr(),
-            model.len()
-        );
-
-        let dl_err = unsafe { ffi::dl_mobilefacenet_init(model.as_ptr(), model.len()) };
-        if dl_err != 0 {
-            bail!(
-                "[SystemResources] MobileFaceNet Init Failed with code: {}",
-                dl_err
-            );
-        }
-
-        // 7. Vision pipeline (camera + inference threads on Core 1)
+        // 6. Vision pipeline (camera + inference threads on Core 1; loads the face models)
         let group_members = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let vision_events = crate::pipeline::spawn(group_members.clone())
             .context("[SystemResources] Failed to start vision pipeline")?;
