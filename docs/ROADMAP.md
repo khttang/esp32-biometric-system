@@ -131,7 +131,9 @@ compiled into the firmware.
     and holding sensor buffers until a frame is processed.
   - The remaining limit is PSRAM bandwidth (see README, Measured Performance).
 - Embedding latency: about 2× Espressif's figure.
-- ESP-IDF 5.5.5 plus the esp-idf-* 0.53/0.47/0.38 crates.
+- ESP-IDF 5.5.5 plus the esp-idf-* 0.53/0.47/0.38 crates. *Done:*
+  - Builds needed `CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y` for the board's v1.3 silicon.
+  - Performance-neutral for the pipeline (measured).
 
 ### ⬜ M2: On-Device Enrollment
 
@@ -189,5 +191,6 @@ Know whether the model is working in the field.
 ### Out of Scope (for now)
 
 - On-device voice recognition: `tools/enroll_user.py` computes speaker embeddings on the host only.
-- ESP-IDF 5.5 / `esp-idf-*` crate upgrades: tracked separately, as their own PR.
+- ESP-IDF 6.x: wait for mature `esp-idf-sys` support. 6.0 removes the legacy I2C driver, moves Ethernet
+  PHY drivers out of IDF, and changes the DSI 2D-DMA API.
 - The occasional white/cyan display flashes: suspected cable or power; tracked as an issue.

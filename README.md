@@ -3,7 +3,7 @@
 [![CI](https://github.com/khttang/esp32-biometric-system/actions/workflows/ci.yml/badge.svg)](https://github.com/khttang/esp32-biometric-system/actions/workflows/ci.yml)
 ![Target](https://img.shields.io/badge/Target-ESP32--P4-red?style=flat-square)
 ![Version](https://img.shields.io/badge/Version-v0.1.0-blue?style=flat-square)
-![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.4.4-green?style=flat-square)
+![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.5.5-green?style=flat-square)
 ![LVGL](https://img.shields.io/badge/UI-LVGL%209-orange?style=flat-square)
 ![Rust](https://img.shields.io/badge/Rust-1.99-brightgreen?style=flat-square)
 ![Language](https://img.shields.io/badge/Language-Rust%20%7C%20C%2B%2B-brightgreen?style=flat-square)
@@ -44,7 +44,7 @@ Known issues:
 
 | Component | Part | Interface / Notes |
 |---|---|---|
-| SoC | ESP32-P4, 2× RISC-V @ 360 MHz | 32 MB PSRAM @ 200 MHz, 16 MB flash |
+| SoC | ESP32-P4 (silicon v1.3), 2× RISC-V @ 360 MHz | 32 MB PSRAM @ 200 MHz, 16 MB flash |
 | Display | HX8394 720×1280 IPS | MIPI-DSI, 2 lanes @ 1000 Mbps, 60 MHz DPI clock, RGB565; rotated 270° in software to 1280×720 landscape |
 | Touch | GT911 | I2C `0x5D`, polled at ~66 Hz (INT pin not used) |
 | Camera | OV5647 | MIPI-CSI, RAW10 1280×960 @ 45 fps (binning) → ISP → RGB565 via `esp_video` (`/dev/video0`) |
@@ -158,6 +158,8 @@ The two components must be upgraded together: `human_face_recognition` 0.3.x req
 
 ### Measured Performance (ESP32-P4 rev 1.3, 360 MHz)
 
+Measured on ESP-IDF 5.4.4 and re-measured on 5.5.5, with the same results within run-to-run noise.
+
 | Stage | Time | Notes |
 |---|---|---|
 | Detection (MSR+MNP) | 19–40 ms | Espressif publishes about 17 ms; rises with PSRAM load and face candidates |
@@ -175,7 +177,7 @@ running from PSRAM all share it. Measured evidence:
 Remaining levers:
 - YUV420 ISP output (25% less frame data);
 - a lower display refresh rate;
-- ESP-IDF 5.5.x cache/PSRAM fixes.
+- (ESP-IDF 5.5.5's cache/PSRAM fixes were measured: no change.)
 
 These numbers need the ESP-DL-oriented settings in `sdkconfig.defaults`:
 - `CONFIG_SPIRAM_XIP_FROM_PSRAM` (run code and models from PSRAM);
@@ -295,7 +297,7 @@ automatically on the first build. Run `rustup toolchain install` once in `firmwa
 | `ldproxy` | latest | `cargo install ldproxy` (linker wrapper used by `.cargo/config.toml`) |
 | `espflash` | 4.x | `cargo install espflash` |
 | Python | 3.12 | `brew install python@3.12`. **Path is hardcoded** as `PYTHON=/opt/homebrew/bin/python3.12` in `firmware/.cargo/config.toml`; adjust for your machine. |
-| ESP-IDF | v5.4.4 | Downloaded by `esp-idf-sys` into `firmware/.embuild/` on the first build |
+| ESP-IDF | v5.5.5 | Downloaded by `esp-idf-sys` into `firmware/.embuild/` on the first build. The NANO's P4 is silicon v1.x, so `CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y` is required: ESP-IDF 5.5 otherwise targets v3.01+ and the image crashes at boot. |
 | CMake, Ninja, RISC-V GCC 14.2, esp-clang, ROM ELFs | n/a | Installed by `esp-idf-sys` into `firmware/.embuild/espressif/tools/` |
 | ESP-IDF managed components (esp-dl, esp_video, LVGL, esp_lvgl_port, HX8394, GT911, …) | see `components_esp32p4.lock` | Fetched by the IDF Component Manager from `idf_component.yml` |
 
