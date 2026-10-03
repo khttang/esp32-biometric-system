@@ -108,7 +108,7 @@ namespace VideoConfig {
 
     // Split-Screen Layout Dimensions
     constexpr uint16_t VIEWPORT_WIDTH  = 640; // Left column width
-    constexpr uint16_t VIEWPORT_HEIGHT = 480; // Centered 16:9 canvas height
+    constexpr uint16_t VIEWPORT_HEIGHT = 720; // Full display height
     constexpr uint16_t PANEL_WIDTH    = 640; // Right control panel width
     constexpr uint16_t PANEL_HEIGHT   = 720; // Right control panel height
 }
@@ -1091,17 +1091,22 @@ void update_camera_viewport(const p4_camera_frame_t *frame) {
         uint32_t in_w = VideoConfig::SENSOR_WIDTH;
         uint32_t in_h = VideoConfig::SENSOR_HEIGHT;
 
-        // 1. Input Image Configuration (1280x720)
+        // Uniform scale that maps full sensor height onto the viewport (960 -> 720 = 0.75x),
+        // then crop the sensor width to the viewport's aspect ratio (640 / 0.75 = 853px).
+        const float scale = (float)VideoConfig::VIEWPORT_HEIGHT / (float)in_h;
+        const uint32_t crop_w = (uint32_t)((float)VideoConfig::VIEWPORT_WIDTH / scale);
+
+        // 1. Input Image Configuration (centered 853x960 crop of 1280x960)
         srm_cfg.in.buffer = frame->data;
-        srm_cfg.in.pic_w = in_w;          
+        srm_cfg.in.pic_w = in_w;
         srm_cfg.in.pic_h = in_h;
-        srm_cfg.in.block_w = in_h;          // crop height to be the same as width
+        srm_cfg.in.block_w = crop_w;
         srm_cfg.in.block_h = in_h;
-        srm_cfg.in.block_offset_x = (in_w - in_h) / 2;  // Offset X = 160 (crops 160px from left & right)
-        srm_cfg.in.block_offset_y = 0;                  // Full vertical coverage
+        srm_cfg.in.block_offset_x = (in_w - crop_w) / 2;  // Offset X = 213 (crops 213px from left & right)
+        srm_cfg.in.block_offset_y = 0;                    // Full vertical coverage
         srm_cfg.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
 
-        // 2. Output Canvas Configuration (640x360)
+        // 2. Output Canvas Configuration (640x720)
         srm_cfg.out.buffer = s_ui_canvas_buf;
         srm_cfg.out.buffer_size = VideoConfig::VIEWPORT_WIDTH * VideoConfig::VIEWPORT_HEIGHT * sizeof(uint16_t);
         srm_cfg.out.pic_w = VideoConfig::VIEWPORT_WIDTH;
@@ -1110,9 +1115,9 @@ void update_camera_viewport(const p4_camera_frame_t *frame) {
         srm_cfg.out.block_offset_y = 0;
         srm_cfg.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
 
-        // 3. Precise Hardware Scaling Ratios (1280->640 [0.5x] and 960->360 [0.375x])
-        srm_cfg.scale_x = (float)VideoConfig::VIEWPORT_WIDTH / (float)in_h;   // 0.666f
-        srm_cfg.scale_y = (float)VideoConfig::VIEWPORT_HEIGHT / (float)in_h;  // 0.500f
+        // 3. Uniform Hardware Scaling (0.75x both axes, preserves aspect ratio)
+        srm_cfg.scale_x = scale;
+        srm_cfg.scale_y = scale;
         srm_cfg.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
         srm_cfg.mirror_x = false;
         srm_cfg.mirror_y = false;
