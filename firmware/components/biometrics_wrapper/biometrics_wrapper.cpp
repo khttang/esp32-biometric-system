@@ -135,7 +135,6 @@ static i2c_master_dev_handle_t s_gt911_i2c_dev = NULL;
 static i2s_chan_handle_t g_i2s_tx_handle = NULL;
 static i2s_chan_handle_t g_i2s_rx_handle = NULL;
 
-static ppa_client_handle_t s_ppa_client = NULL;
 
 static bool s_hardware_initialized = false;
 static dl::Model *g_mobilefacenet_model = NULL;
@@ -206,17 +205,6 @@ static void touch_poll_task(void *pvParameters) {
 // -----------------------------------------------------------------------------
 // LVGL 9 Callbacks & Task Loop
 // -----------------------------------------------------------------------------
-
-static esp_err_t init_ppa_hardware_engine(void) {
-    ppa_client_config_t ppa_cfg = {};
-    ppa_cfg.oper_type = PPA_OPERATION_SRM; // Scaling, Rotation, Mirroring Engine
-    
-    esp_err_t err = ppa_register_client(&ppa_cfg, &s_ppa_client);
-    if (err == ESP_OK) {
-        ESP_LOGI("PPA_SYS", "ESP32-P4 PPA Hardware Accelerator Initialized Successfully.");
-    }
-    return err;
-}
 
 // -----------------------------------------------------------------------------
 // Ethernet Event Handlers
@@ -389,11 +377,6 @@ int32_t init_display_system(void) {
             return err;
         }
         ESP_LOGI(TAG_LVGL, "I2C Master Bus (I2C_NUM_0) created successfully!");
-    }
-
-    if (init_ppa_hardware_engine() != ESP_OK) {
-        ESP_LOGE(TAG_LVGL, "Failed to initialize PPA hardware client!");
-        return ESP_FAIL;
     }
 
     // 2. Power on MIPI-DSI PHY (2.5V on LDO Channel 3)
@@ -588,7 +571,7 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
         return ret;
     }
 
-    s_video_fd = open("/dev/video0", O_RDWR | O_NONBLOCK);
+    s_video_fd = open("/dev/video0", O_RDWR); // blocking DQBUF: the Rust camera thread sleeps until a frame arrives
     if (s_video_fd < 0) {
         ESP_LOGE(TAG_CAM, "Failed to open /dev/video0");
         return -1;
@@ -645,7 +628,7 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
     return 0;
 }
 
-int32_t p4_camera_capture_frame(p4_camera_frame_t *frame, uint32_t timeout_ms) {
+int32_t p4_camera_capture_frame(p4_camera_frame_t *frame) {
     if (s_video_fd < 0 || !frame) return -1;
 
     struct v4l2_buffer buf = {};
@@ -654,7 +637,7 @@ int32_t p4_camera_capture_frame(p4_camera_frame_t *frame, uint32_t timeout_ms) {
 
     int ret = ioctl(s_video_fd, VIDIOC_DQBUF, &buf);
     if (ret < 0) {
-        return (errno == EAGAIN || errno == EWOULDBLOCK) ? -2 : -1;
+        return -1;
     }
 
     frame->data = (uint8_t *)s_cam_buffers[buf.index].start;
@@ -965,58 +948,21 @@ void setup_split_screen_ui(void) {
     }
 }
 
-void update_camera_viewport(const p4_camera_frame_t *frame) {
-    if (!frame || !frame->data || !s_ui_ready || !s_camera_canvas_obj || !s_ui_canvas_buf) {
-        return;
+bool p4_ui_present_camera(const void *buf, uint32_t lock_timeout_ms) {
+    if (!s_ui_ready || !s_camera_canvas_obj) {
+        return false;
     }
-
-    if (lvgl_port_lock(0)) {
-        ppa_srm_oper_config_t srm_cfg = {};
-
-        uint32_t in_w = VideoConfig::SENSOR_WIDTH;
-        uint32_t in_h = VideoConfig::SENSOR_HEIGHT;
-
-        // Uniform scale that maps full sensor height onto the viewport (960 -> 720 = 0.75x),
-        // then crop the sensor width to the viewport's aspect ratio (640 / 0.75 = 853px).
-        const float scale = (float)VideoConfig::VIEWPORT_HEIGHT / (float)in_h;
-        const uint32_t crop_w = (uint32_t)((float)VideoConfig::VIEWPORT_WIDTH / scale);
-
-        // 1. Input Image Configuration (centered 853x960 crop of 1280x960)
-        srm_cfg.in.buffer = frame->data;
-        srm_cfg.in.pic_w = in_w;
-        srm_cfg.in.pic_h = in_h;
-        srm_cfg.in.block_w = crop_w;
-        srm_cfg.in.block_h = in_h;
-        srm_cfg.in.block_offset_x = (in_w - crop_w) / 2;  // Offset X = 213 (crops 213px from left & right)
-        srm_cfg.in.block_offset_y = 0;                    // Full vertical coverage
-        srm_cfg.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
-
-        // 2. Output Canvas Configuration (640x720)
-        srm_cfg.out.buffer = s_ui_canvas_buf;
-        srm_cfg.out.buffer_size = VideoConfig::VIEWPORT_WIDTH * VideoConfig::VIEWPORT_HEIGHT * sizeof(uint16_t);
-        srm_cfg.out.pic_w = VideoConfig::VIEWPORT_WIDTH;
-        srm_cfg.out.pic_h = VideoConfig::VIEWPORT_HEIGHT;
-        srm_cfg.out.block_offset_x = 0;
-        srm_cfg.out.block_offset_y = 0;
-        srm_cfg.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
-
-        // 3. Uniform Hardware Scaling (0.75x both axes, preserves aspect ratio)
-        srm_cfg.scale_x = scale;
-        srm_cfg.scale_y = scale;
-        srm_cfg.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
-        srm_cfg.mirror_x = false;
-        srm_cfg.mirror_y = false;
-
-        // 4. Run PPA hardware scale step
-        esp_err_t ppa_err = ppa_do_scale_rotate_mirror(s_ppa_client, &srm_cfg);
-        if (ppa_err == ESP_OK) {
-            lv_obj_invalidate(s_camera_canvas_obj);
-        } else {
-            ESP_LOGE("PPA_VIEWPORT", "Scaling failed: 0x%x", ppa_err);
-        }
-
-        lvgl_port_unlock();
+    if (!lvgl_port_lock(lock_timeout_ms)) {
+        return false; // LVGL busy: caller keeps filling the same back buffer
     }
+    // Swap only the canvas' buffer pointer; LVGL renders under this lock, so the previously
+    // presented buffer is no longer read once we return.
+    void *target = buf ? const_cast<void *>(buf) : s_ui_canvas_buf;
+    lv_canvas_set_buffer(s_camera_canvas_obj, target, VideoConfig::VIEWPORT_WIDTH,
+                         VideoConfig::VIEWPORT_HEIGHT, LV_COLOR_FORMAT_RGB565);
+    lv_obj_invalidate(s_camera_canvas_obj);
+    lvgl_port_unlock();
+    return true;
 }
 
 } // extern "C"

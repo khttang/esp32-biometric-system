@@ -1,26 +1,11 @@
-use serde::{Deserialize, Serialize};
-
 use log::{error, info, warn};
 use std::time::{Duration, Instant};
 
-use crate::system::{SystemResources, crop_face_112x112};
+use crate::pipeline::InferenceEvent;
+use crate::system::SystemResources;
 
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Role {
-    ADMIN,
-    USER,
-    GUEST,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GroupMember {
-    pub id: String,      // First_Last
-    pub name: String,
-    pub role: Role,
-    pub face_embedding: Vec<f32>,
-}
+pub use biometric_core::matching::{best_match, GroupMember};
 
 #[derive(Debug)]
 #[allow(dead_code)] // TODO: UpdatingRuntimeData/Error become reachable once network triggers are wired
@@ -81,46 +66,17 @@ impl BiometricSystem {
                     return;
                 }
 
-                // B. Capture frame and detect faces using SystemResources
-                if resources.capture_camera_frame() {
-                    resources.fail_count = 0;
-                    
-                    if let Some(frame_slice) = resources.raw_frame.as_slice() {
-                        let detected_faces = resources.detect_faces(frame_slice);
-
-                        // Render camera preview on the left half of the display via PPA hardware
-                        resources.video_pipeline.render_camera_half(&resources.raw_frame, &detected_faces);
-
-                        if !detected_faces.is_empty() {
+                // B. Consume results from the Core 1 vision pipeline
+                while let Ok(event) = resources.vision_events.try_recv() {
+                    match event {
+                        InferenceEvent::FaceSeen => resources.inactivity_timer.reset(),
+                        InferenceEvent::Match(member) => {
+                            info!("Biometric match confirmed for: {}", member.name);
                             resources.inactivity_timer.reset();
-
-                            // 1. Crop face box to 112x112 RGB888 buffer
-                            if let Some(crop_112x112) = crop_face_112x112(
-                                frame_slice, 
-                                resources.raw_frame.width as usize, 
-                                resources.raw_frame.height as usize, 
-                                &detected_faces[0]
-                            ) {
-                                if let Ok(live_embedding) = resources.extract_face_embedding(&crop_112x112) {
-                                    let members_guard = resources.group_members.load();
-                                    if let Some(matched_member) = self.try_match_biometrics(&live_embedding, &members_guard) {
-                                        info!("Biometric match confirmed for: {}", matched_member.name);
-                                        self.action_display_timer = Some(now + Duration::from_secs(3));
-                                        self.state = SystemState::ActionExecuted { member: matched_member };
-                                        
-                                        resources.release_camera_frame();
-                                        return;
-                                    }
-                                }
-                            }
+                            self.action_display_timer = Some(now + Duration::from_secs(3));
+                            self.state = SystemState::ActionExecuted { member };
+                            return;
                         }
-                    }
-                    resources.release_camera_frame();
-                } else {
-                    // Log if capture returns false
-                    resources.fail_count += 1;
-                    if resources.fail_count % 120 == 0 {
-                        info!("[CAM_DEBUG] capture_camera_frame() returned false {} times!", resources.fail_count);
                     }
                 }
             }
@@ -183,38 +139,5 @@ impl BiometricSystem {
                 error!("Catastrophic error encountered: {}", err_msg);
             }
         }
-    }
-
-    pub fn try_match_biometrics(
-        &self,
-        live_embedding: &[f32; 512],
-        enrolled_templates: &[GroupMember],
-    ) -> Option<GroupMember> {
-        let mut best_match: Option<(&GroupMember, f32)> = None;
-        const MATCH_THRESHOLD: f32 = 0.75; // Cosine similarity threshold
-
-        for member in enrolled_templates {
-            let similarity = self.cosine_similarity(live_embedding, &member.face_embedding);
-
-            if similarity >= MATCH_THRESHOLD {
-                match best_match {
-                    Some((_, highest_sim)) if similarity > highest_sim => {
-                        best_match = Some((member, similarity));
-                    }
-                    None => {
-                        best_match = Some((member, similarity));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Return a clone of the matched enrolled member
-        best_match.map(|(member, _)| member.clone())
-    }
-
-    /// Computes dot product of normalized L2 embeddings (Cosine Similarity)
-    fn cosine_similarity(&self, a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
     }
 }

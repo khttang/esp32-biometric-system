@@ -35,12 +35,15 @@ int32_t init_p4_ethernet(void);
 
 // UI & Camera Operations
 void setup_split_screen_ui(void);
-void update_camera_viewport(const p4_camera_frame_t *frame);
+// Shows `buf` (VIEWPORT_WIDTH x VIEWPORT_HEIGHT RGB565, caller-owned, must stay valid until the
+// next call) in the camera canvas. NULL restores the internal buffer. lock_timeout_ms 0 = wait forever.
+// Returns false (nothing changed) if the LVGL lock could not be taken in time.
+bool p4_ui_present_camera(const void *buf, uint32_t lock_timeout_ms);
 bool p4_touch_is_pressed(void);
 
 // Camera V4L2 Driver FFI
 int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height);
-int32_t p4_camera_capture_frame(p4_camera_frame_t *frame, uint32_t timeout_ms);
+int32_t p4_camera_capture_frame(p4_camera_frame_t *frame); // blocks until a frame is ready
 int32_t p4_camera_release_frame(const p4_camera_frame_t *frame);
 
 // Audio FFI

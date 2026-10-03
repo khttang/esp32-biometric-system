@@ -1,17 +1,14 @@
-// Import auto-generated FFI bindings from build.rs (crucial for making ffi bindings work with Rust)
-// Allow C-style type naming from bindgen FFI output
-#[allow(non_camel_case_types)]
-#[allow(non_snake_case)]
-#[allow(dead_code)]
-mod ffi {
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-}
+// C/C++ bindings: esp-idf-sys generates them from components/biometrics_wrapper/include/bindings.h
+// (our wrapper API + PPA/heap headers) alongside the regular ESP-IDF bindings.
+use esp_idf_svc::sys as ffi;
 
 mod system;
 mod audio_worker;
 mod speaker;
 mod power;
-mod video;
+mod camera;
+mod ppa;
+mod pipeline;
 mod biometrics;
 
 use anyhow::Result;
