@@ -14,6 +14,9 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
 # =============================================================================
 CONFIG_IDF_TARGET="esp32p4"
 CONFIG_IDF_TARGET_ESP32P4=y
+# The ESP32-P4-NANO uses silicon v1.x. ESP-IDF 5.5+ defaults to v3.01+ (different memory layout);
+# without this the bootloader/app crash at boot on <v3 chips.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
 
 # =============================================================================
 # 3. External RAM (PSRAM) Configuration (32MB @ 200MHz)

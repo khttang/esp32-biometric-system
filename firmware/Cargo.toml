@@ -34,8 +34,8 @@ log = "0.4"
 anyhow = "1.0.104"
 
 # --- Essential Espressif & Async Ecosystem ---
-esp-idf-sys = { version = "0.37.2", features = ["binstart"] }
-esp-idf-svc = { version = "0.52.1", features = ["alloc", "std", "critical-section"] }
+esp-idf-sys = { version = "0.38.1", features = ["binstart"] }
+esp-idf-svc = { version = "0.53.0", features = ["alloc", "std", "critical-section"] }
 arc-swap = "1.9.2"
 biometric-core = { path = "../crates/biometric-core" }
 
