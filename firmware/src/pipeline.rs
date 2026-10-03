@@ -29,7 +29,7 @@ use log::{error, info, warn};
 use crate::biometrics::{best_match, GroupMember};
 use crate::camera::Camera;
 use crate::ffi;
-use biometric_core::geometry::centered_aspect_crop;
+use biometric_core::geometry::fit_rect;
 
 use crate::ppa::{image_len, DmaBuf, ImageRef, PixelFormat, Ppa, Rect};
 
@@ -132,9 +132,11 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
     // Declared after `previews` so it drops first.
     let _guard = PreviewGuard;
 
-    // Centered crop with the viewport's aspect ratio: 853×960 of 1280×960 → 640×720 (0.75×)
-    let view_crop = centered_aspect_crop(SENSOR_W, SENSOR_H, VIEW_W, VIEW_H);
+    // Whole sensor frame, unstretched, letterboxed in the viewport: 1280×960 → 640×480 at y=120.
+    // The bars stay black because preview buffers start zeroed and the PPA never writes there.
     let full_frame = Rect::full(SENSOR_W, SENSOR_H);
+    let view_rect = fit_rect(SENSOR_W, SENSOR_H, VIEW_W, VIEW_H);
+    let det_rect = Rect::full(DET_W, DET_H);
     let mut pending_request: Option<DmaBuf> = None;
 
     info!("[Pipeline] camera thread running on core 1");
@@ -149,7 +151,7 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
         };
         let image = frame.image();
 
-        match ppa.scale_crop(image, view_crop, &mut previews[back], VIEW_W, VIEW_H, PixelFormat::Rgb565) {
+        match ppa.scale_crop(image, full_frame, &mut previews[back], VIEW_W, VIEW_H, view_rect, PixelFormat::Rgb565) {
             Ok(()) => {
                 // Safety: the buffer stays alive (and unwritten) until the next swap.
                 let presented = unsafe {
@@ -166,7 +168,7 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
             pending_request = requests.try_recv().ok();
         }
         if let Some(mut detector_buf) = pending_request.take() {
-            match ppa.scale_crop(image, full_frame, &mut detector_buf, DET_W, DET_H, PixelFormat::Rgb888) {
+            match ppa.scale_crop(image, full_frame, &mut detector_buf, DET_W, DET_H, det_rect, PixelFormat::Rgb888) {
                 Ok(()) => {
                     if frames.send(detector_buf).is_err() {
                         return warn!("[Pipeline] inference thread gone; camera thread exiting");
@@ -212,7 +214,7 @@ fn inference_loop(
         }
         for face in &faces {
             let Some(rect) = face.rect.clamp_to(DET_W, DET_H) else { continue };
-            if let Err(e) = ppa.scale_crop(image, rect, &mut face_buf, FACE_SIZE, FACE_SIZE, PixelFormat::Rgb888) {
+            if let Err(e) = ppa.scale_crop(image, rect, &mut face_buf, FACE_SIZE, FACE_SIZE, Rect::full(FACE_SIZE, FACE_SIZE), PixelFormat::Rgb888) {
                 warn!("[Pipeline] face crop failed: {e}");
                 continue;
             }

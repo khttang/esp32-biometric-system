@@ -60,6 +60,22 @@ pub fn centered_aspect_crop(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> R
     }
 }
 
+/// Largest `src_w`×`src_h`-shaped rectangle centered inside a `dst_w`×`dst_h` area
+/// (letterbox / pillarbox placement: the whole source stays visible, unstretched).
+///
+/// E.g. a 1280×960 frame in the 640×720 preview → 640×480 at y = 120.
+pub fn fit_rect(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Rect {
+    if u64::from(src_w) * u64::from(dst_h) >= u64::from(dst_w) * u64::from(src_h) {
+        // Source is wider: full width, bars above and below.
+        let h = (u64::from(dst_w) * u64::from(src_h) / u64::from(src_w)) as u32;
+        Rect { x: 0, y: (dst_h - h) / 2, w: dst_w, h }
+    } else {
+        // Source is taller: full height, bars left and right.
+        let w = (u64::from(dst_h) * u64::from(src_w) / u64::from(src_h)) as u32;
+        Rect { x: (dst_w - w) / 2, y: 0, w, h: dst_h }
+    }
+}
+
 /// Borrowed, read-only view of a packed image.
 #[derive(Clone, Copy, Debug)]
 pub struct ImageRef<'a> {
@@ -111,6 +127,22 @@ mod tests {
     #[test]
     fn centered_crop_with_same_aspect_is_identity() {
         assert_eq!(centered_aspect_crop(1280, 960, 640, 480), Rect::full(1280, 960));
+    }
+
+    #[test]
+    fn preview_fit_for_ov5647_into_left_half() {
+        // The firmware's actual configuration: whole 1280×960 frame letterboxed in 640×720.
+        assert_eq!(fit_rect(1280, 960, 640, 720), Rect { x: 0, y: 120, w: 640, h: 480 });
+    }
+
+    #[test]
+    fn fit_taller_source_pillarboxes() {
+        assert_eq!(fit_rect(480, 640, 640, 480), Rect { x: 140, y: 0, w: 360, h: 480 });
+    }
+
+    #[test]
+    fn fit_same_aspect_fills_area() {
+        assert_eq!(fit_rect(1280, 960, 640, 480), Rect::full(640, 480));
     }
 
     #[test]

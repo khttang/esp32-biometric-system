@@ -45,10 +45,6 @@ impl DmaBuf {
         Some(Self { ptr, len })
     }
 
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
     pub fn as_slice(&self) -> &[u8] {
         // Safety: `ptr` is valid for `len` initialised bytes for as long as `self` lives.
         unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
@@ -85,8 +81,9 @@ impl Ppa {
         Ok(Self { client })
     }
 
-    /// Crops `crop` out of `src`, scales it to `dst_w`×`dst_h`, converts it to `dst_format`
-    /// and writes it to the top-left of `dst`. Blocks until the hardware is done.
+    /// Crops `crop` out of `src`, scales it to fill `dst_rect` of a `dst_w`×`dst_h` picture in
+    /// `dst`, converting to `dst_format`. Pixels of `dst` outside `dst_rect` are left untouched.
+    /// Blocks until the hardware is done.
     ///
     /// The PPA quantises scale factors to 1/16 steps, so the written area can be a pixel
     /// smaller than requested on non-integer ratios.
@@ -97,9 +94,11 @@ impl Ppa {
         dst: &mut DmaBuf,
         dst_w: u32,
         dst_h: u32,
+        dst_rect: Rect,
         dst_format: PixelFormat,
     ) -> Result<(), EspError> {
-        if !src.contains(crop) || !src.is_well_formed() || dst.len() < image_len(dst_w, dst_h, dst_format) {
+        let dst_area = ImageRef { data: dst.as_slice(), width: dst_w, height: dst_h, format: dst_format };
+        if !src.contains(crop) || !src.is_well_formed() || !dst_area.contains(dst_rect) || !dst_area.is_well_formed() {
             return Err(EspError::from_infallible::<{ sys::ESP_ERR_INVALID_ARG as sys::esp_err_t }>());
         }
 
@@ -117,12 +116,12 @@ impl Ppa {
         op.out.buffer_size = dst.len as u32;
         op.out.pic_w = dst_w;
         op.out.pic_h = dst_h;
-        op.out.block_offset_x = 0;
-        op.out.block_offset_y = 0;
+        op.out.block_offset_x = dst_rect.x;
+        op.out.block_offset_y = dst_rect.y;
         op.out.__bindgen_anon_1.srm_cm = srm_color_mode(dst_format);
 
-        op.scale_x = dst_w as f32 / crop.w as f32;
-        op.scale_y = dst_h as f32 / crop.h as f32;
+        op.scale_x = dst_rect.w as f32 / crop.w as f32;
+        op.scale_y = dst_rect.h as f32 / crop.h as f32;
         op.rotation_angle = sys::ppa_srm_rotation_angle_t_PPA_SRM_ROTATION_ANGLE_0;
         op.mode = sys::ppa_trans_mode_t_PPA_TRANS_MODE_BLOCKING;
 
