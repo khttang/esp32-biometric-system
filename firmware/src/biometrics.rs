@@ -101,9 +101,7 @@ impl BiometricSystem {
                     info!("Entering admin mode.");
                     show_member_list(resources);
                     ui::set_admin_mode(true);
-                    ui::set_status(
-                        "Admin: enter a name and press Enroll, or pick a member to delete.",
-                    );
+                    ui::set_status("Admin: type a name and Enroll, or pick a member and Delete.");
                     self.state = SystemState::Admin {
                         idle_deadline: now + ADMIN_IDLE_TIMEOUT,
                     };

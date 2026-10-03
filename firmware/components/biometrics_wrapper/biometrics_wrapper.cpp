@@ -872,9 +872,11 @@ static void make_button(lv_obj_t *parent, const char *text, int32_t x, int32_t y
 // Status line plus the idle and admin views of the right-hand panel. Called under the LVGL lock.
 static void build_control_panel(lv_obj_t *panel) {
     constexpr int32_t MARGIN = 20;
-    constexpr int32_t VIEWS_Y = 180;
+    constexpr int32_t STATUS_Y = 64;   // two lines of status text fit above the views
+    constexpr int32_t VIEWS_Y = 140;
     constexpr int32_t VIEWS_HEIGHT = VideoConfig::PANEL_HEIGHT - VIEWS_Y;
-    constexpr int32_t KEYBOARD_HEIGHT = 280;
+    constexpr int32_t ROW = 68;        // button height plus gap
+    constexpr int32_t KEYBOARD_Y = 3 * ROW;
     constexpr int32_t BUTTON_X = 430;
     constexpr int32_t BUTTON_WIDTH = VideoConfig::PANEL_WIDTH - BUTTON_X - MARGIN;
     constexpr int32_t FIELD_WIDTH = BUTTON_X - 2 * MARGIN;
@@ -886,10 +888,10 @@ static void build_control_panel(lv_obj_t *panel) {
     s_status_label = lv_label_create(panel);
     lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_width(s_status_label, VideoConfig::PANEL_WIDTH - 2 * MARGIN);
-    lv_obj_set_pos(s_status_label, MARGIN, 80);
+    lv_obj_set_pos(s_status_label, MARGIN, STATUS_Y);
     lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-#if LV_FONT_MONTSERRAT_24
-    lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_24, LV_PART_MAIN);
+#if LV_FONT_MONTSERRAT_28
+    lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_28, LV_PART_MAIN);
 #endif
     lv_label_set_text(s_status_label, "Starting...");
 
@@ -897,7 +899,8 @@ static void build_control_panel(lv_obj_t *panel) {
     s_idle_view = make_view(panel, VIEWS_Y, VIEWS_HEIGHT);
     make_button(s_idle_view, "Admin", BUTTON_X, 0, BUTTON_WIDTH, P4_UI_EVENT_ADMIN);
 
-    // Admin view: name + Enroll, member list + Delete / Done, keyboard along the bottom.
+    // Admin view: name field and member list on the left, Enroll / Delete / Done on the right,
+    // keyboard along the bottom.
     s_admin_view = make_view(panel, VIEWS_Y, VIEWS_HEIGHT);
     lv_obj_add_flag(s_admin_view, LV_OBJ_FLAG_HIDDEN);
 
@@ -911,14 +914,13 @@ static void build_control_panel(lv_obj_t *panel) {
 
     s_member_roller = lv_roller_create(s_admin_view);
     lv_roller_set_options(s_member_roller, "(no members)", LV_ROLLER_MODE_NORMAL);
-    lv_roller_set_visible_row_count(s_member_roller, 3);
-    lv_obj_set_width(s_member_roller, FIELD_WIDTH);
-    lv_obj_set_pos(s_member_roller, MARGIN, 76);
-    make_button(s_admin_view, "Delete", BUTTON_X, 76, BUTTON_WIDTH, P4_UI_EVENT_DELETE);
-    make_button(s_admin_view, "Done", BUTTON_X, 152, BUTTON_WIDTH, P4_UI_EVENT_EXIT);
+    lv_obj_set_size(s_member_roller, FIELD_WIDTH, 2 * ROW - 12);
+    lv_obj_set_pos(s_member_roller, MARGIN, ROW);
+    make_button(s_admin_view, "Delete", BUTTON_X, ROW, BUTTON_WIDTH, P4_UI_EVENT_DELETE);
+    make_button(s_admin_view, "Done", BUTTON_X, 2 * ROW, BUTTON_WIDTH, P4_UI_EVENT_EXIT);
 
     lv_obj_t *keyboard = lv_keyboard_create(s_admin_view);
-    lv_obj_set_size(keyboard, VideoConfig::PANEL_WIDTH, KEYBOARD_HEIGHT);
+    lv_obj_set_size(keyboard, VideoConfig::PANEL_WIDTH, VIEWS_HEIGHT - KEYBOARD_Y);
     lv_obj_align(keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_keyboard_set_textarea(keyboard, s_name_input);
     // The keyboard's OK key enrolls, like the Enroll button.
@@ -990,13 +992,13 @@ void setup_split_screen_ui(void) {
         lv_label_set_text(title, "MULTIMODAL BIOMETRICS");
         lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
         lv_obj_set_style_text_opa(title, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 32);
 
         // Touch Label
         s_touch_label = lv_label_create(panel);
         if (s_touch_label) {
             lv_label_set_text(s_touch_label, "Touch: Idle");
-            lv_obj_align(s_touch_label, LV_ALIGN_TOP_MID, 0, 15);
+            lv_obj_align(s_touch_label, LV_ALIGN_TOP_MID, 0, 6);
             
             static lv_style_t style_label;
             lv_style_init(&style_label);
