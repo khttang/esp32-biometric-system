@@ -9,6 +9,10 @@
 //!   Frame dropped → buffer back to the ISP                └───────────────────────────────┘
 //! ```
 //!
+//! While an enrollment is running (started by [`Command::StartEnroll`] from the main thread),
+//! the inference thread collects embeddings of the one face in view instead of matching, and
+//! reports the finished template with [`InferenceEvent::EnrollCaptured`].
+//!
 //! The inference thread asks for a frame by handing its (single) detector buffer back, and
 //! the camera fills it from the very next frame. Inference therefore always works on a frame
 //! at most one sensor period old, the camera never waits for inference, and the PPA only does
@@ -26,14 +30,15 @@ use biometric_core::contract::{
     DETECTOR_FORMAT, DETECTOR_HEIGHT, DETECTOR_WIDTH, EMBEDDING_DIM, FEATURE_MODEL_ID,
     FEATURE_PARTITION, MNP_MODEL_ID, MNP_PARTITION, MSR_MODEL_ID, MSR_PARTITION,
 };
+use biometric_core::enrollment::Enrollment;
 use biometric_core::geometry::{fit_rect, map_rect};
 use biometric_core::manifest::ModelManifest;
-use biometric_core::stats::LatencyStats;
+use biometric_core::matching::{closest, GroupMember, MATCH_THRESHOLD};
+use biometric_core::stats::{LatencyStats, ScoreStats};
 use esp_idf_svc::hal::cpu::Core;
 use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
 use log::{error, info, warn};
 
-use crate::biometrics::{best_match, GroupMember};
 use crate::camera::Camera;
 use crate::ffi;
 use crate::models;
@@ -51,6 +56,7 @@ const PRESENT_LOCK_TIMEOUT_MS: u32 = 5;
 /// Max time the inference thread waits for LVGL before skipping one overlay update.
 const OVERLAY_LOCK_TIMEOUT_MS: u32 = 10;
 const EVENT_QUEUE_DEPTH: usize = 8;
+const COMMAND_QUEUE_DEPTH: usize = 2;
 /// Upper bound on inference rate. Face ID doesn't need camera rate, and each request costs a
 /// full-frame PPA downscale on the camera thread.
 const MIN_INFERENCE_INTERVAL: Duration = Duration::from_millis(100);
@@ -60,16 +66,48 @@ const MAX_FACES: usize = ffi::P4_UI_MAX_FACE_BOXES as usize;
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const INFERENCE_STACK_SIZE: usize = 32 * 1024;
 
+/// Enrolled members, shared with the main thread: it publishes a new list after every change,
+/// and the inference thread reads the current one without locking.
+pub type Roster = ArcSwap<Vec<Arc<GroupMember>>>;
+
 #[derive(Debug)]
 pub enum InferenceEvent {
     /// At least one face was detected (keeps the device awake).
     FaceSeen,
-    /// A detected face matched an enrolled member.
-    Match(GroupMember),
+    /// A detected face matched an enrolled member with cosine similarity `score`.
+    Match {
+        member: Arc<GroupMember>,
+        score: f32,
+    },
+    /// An enrollment accepted another sample.
+    EnrollProgress { collected: u8 },
+    /// An enrollment finished: the template embedding and the feature model release that
+    /// produced it.
+    EnrollCaptured {
+        embedding: Vec<f32>,
+        model_version: Arc<str>,
+    },
+    /// An enrollment could not start.
+    EnrollFailed(&'static str),
 }
 
-/// Starts the camera and inference threads; returns the stream of inference events.
-pub fn spawn(members: Arc<ArcSwap<Vec<GroupMember>>>) -> Result<Receiver<InferenceEvent>> {
+/// Requests from the main thread to the inference thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    /// Build a template from the single face in view (replaces a running enrollment).
+    StartEnroll,
+    /// Abandon the running enrollment, if any.
+    CancelEnroll,
+}
+
+/// The main thread's ends of the pipeline's channels.
+pub struct Vision {
+    pub events: Receiver<InferenceEvent>,
+    pub commands: SyncSender<Command>,
+}
+
+/// Starts the camera and inference threads.
+pub fn spawn(members: Arc<Roster>) -> Result<Vision> {
     let camera = Camera::take().context("camera handle already taken")?;
 
     // inference → camera: an empty detector buffer means "fill me from the next frame"
@@ -77,6 +115,7 @@ pub fn spawn(members: Arc<ArcSwap<Vec<GroupMember>>>) -> Result<Receiver<Inferen
     // camera → inference: the filled detector image
     let (frame_tx, frame_rx) = mpsc::sync_channel::<DmaBuf>(1);
     let (event_tx, event_rx) = mpsc::sync_channel::<InferenceEvent>(EVENT_QUEUE_DEPTH);
+    let (command_tx, command_rx) = mpsc::sync_channel::<Command>(COMMAND_QUEUE_DEPTH);
 
     let detector_buf = DmaBuf::new(image_len(DETECTOR_WIDTH, DETECTOR_HEIGHT, DETECTOR_FORMAT))
         .context("failed to allocate detector buffer")?;
@@ -88,9 +127,12 @@ pub fn spawn(members: Arc<ArcSwap<Vec<GroupMember>>>) -> Result<Receiver<Inferen
         camera_loop(camera, request_rx, frame_tx)
     })?;
     spawn_on_core1(c"inference", INFERENCE_STACK_SIZE, 3, move || {
-        inference_loop(frame_rx, request_tx, event_tx, members)
+        inference_loop(frame_rx, request_tx, event_tx, command_rx, members)
     })?;
-    Ok(event_rx)
+    Ok(Vision {
+        events: event_rx,
+        commands: command_tx,
+    })
 }
 
 fn spawn_on_core1<F>(name: &'static CStr, stack_size: usize, priority: u8, f: F) -> Result<()>
@@ -259,7 +301,8 @@ fn inference_loop(
     frames: Receiver<DmaBuf>,
     requests: SyncSender<DmaBuf>,
     events: SyncSender<InferenceEvent>,
-    members: Arc<ArcSwap<Vec<GroupMember>>>,
+    commands: Receiver<Command>,
+    members: Arc<Roster>,
 ) {
     // Each model loads only if its partition verifies, so a missing or corrupt model disables
     // just its stage. This thread is the only user of the p4_face_* API.
@@ -278,8 +321,9 @@ fn inference_loop(
         || unsafe { ffi::p4_face_init_embedder() },
     )
     .and_then(|mut manifests| manifests.pop());
-    // Model contract check: never compare embeddings of an unexpected length.
-    let recognition_enabled = match &embedder {
+    // Model contract check: never compare embeddings of an unexpected length. `Some` holds
+    // the feature model's release, which templates are bound to.
+    let model_version: Option<Arc<str>> = match &embedder {
         Some(manifest) => {
             // Safety: plain query, embedder is loaded.
             let len = unsafe { ffi::p4_face_embedding_len() };
@@ -288,20 +332,23 @@ fn inference_loop(
                     "[Pipeline] recognition ready: {} ({}), {len}-d",
                     manifest.model, manifest.version
                 );
-                true
+                Some(Arc::from(manifest.version.as_str()))
             } else {
                 error!(
                     "[Pipeline] embedding length {len} != contract {EMBEDDING_DIM}; \
                      recognition disabled, detection only"
                 );
-                false
+                None
             }
         }
         None => {
             error!("[Pipeline] recognition disabled, detection only");
-            false
+            None
         }
     };
+    if let Some(version) = &model_version {
+        log_stale_templates(&members.load(), version);
+    }
 
     let view_rect = fit_rect(SENSOR_W, SENSOR_H, VIEW_W, VIEW_H);
     let mut faces = [ffi::p4_face_t::default(); MAX_FACES];
@@ -309,6 +356,8 @@ fn inference_loop(
     let mut embedding = [0.0f32; EMBEDDING_DIM];
     let mut detect_stats = LatencyStats::default();
     let mut embed_stats = LatencyStats::default();
+    let mut score_stats = ScoreStats::default();
+    let mut enrollment: Option<Enrollment<EMBEDDING_DIM>> = None;
     let mut frames_with_faces = 0u32;
     let mut last_stats_log = Instant::now();
     let mut stack_reported = false;
@@ -317,6 +366,19 @@ fn inference_loop(
     while let Ok(detector_buf) = frames.recv() {
         let started = Instant::now();
         let image = detector_buf.as_slice();
+
+        while let Ok(command) = commands.try_recv() {
+            enrollment = match command {
+                Command::StartEnroll if model_version.is_some() => Some(Enrollment::new()),
+                Command::StartEnroll => {
+                    let _ = events.try_send(InferenceEvent::EnrollFailed(
+                        "Face recognition model is not loaded",
+                    ));
+                    None
+                }
+                Command::CancelEnroll => None,
+            };
+        }
 
         let face_count = match detect(image, &mut faces) {
             Ok(n) => n,
@@ -334,8 +396,15 @@ fn inference_loop(
             let _ = events.try_send(InferenceEvent::FaceSeen);
         }
 
-        if recognition_enabled {
-            for face in detected.iter().filter(|f| f.has_landmarks) {
+        if let Some(version) = &model_version {
+            // Enrolling needs exactly one face: with several in view there is no telling
+            // which one the admin means.
+            let candidates = match (&enrollment, detected) {
+                (Some(_), [single]) => core::slice::from_ref(single),
+                (Some(_), _) => &[],
+                (None, all) => all,
+            };
+            for face in candidates.iter().filter(|f| f.has_landmarks) {
                 let embed_started = Instant::now();
                 let result = embed(image, face, &mut embedding);
                 embed_stats.record(embed_started.elapsed());
@@ -347,9 +416,29 @@ fn inference_loop(
                     log_stack_headroom();
                     stack_reported = true;
                 }
-                if let Some(member) = best_match(&embedding, &members.load()) {
-                    let _ = events.try_send(InferenceEvent::Match(member));
-                    break;
+                if let Some(session) = &mut enrollment {
+                    if let Some(event) = enroll_sample(session, &embedding, version) {
+                        let finished = matches!(event, InferenceEvent::EnrollCaptured { .. });
+                        // The main thread is waiting for these, so the queue has room.
+                        if events.send(event).is_err() {
+                            return warn!("[Pipeline] main thread gone; inference exiting");
+                        }
+                        if finished {
+                            enrollment = None;
+                        }
+                    }
+                    continue;
+                }
+                let roster = members.load();
+                if let Some((index, score)) = closest(&embedding, version, &roster) {
+                    score_stats.record(score);
+                    if score >= MATCH_THRESHOLD {
+                        let _ = events.try_send(InferenceEvent::Match {
+                            member: roster[index].clone(),
+                            score,
+                        });
+                        break;
+                    }
                 }
             }
         }
@@ -358,6 +447,7 @@ fn inference_loop(
             log_stats(
                 detect_stats.take(),
                 embed_stats.take(),
+                score_stats.take(),
                 frames_with_faces,
                 last_stats_log.elapsed(),
             );
@@ -374,6 +464,42 @@ fn inference_loop(
         }
     }
     warn!("[Pipeline] camera thread gone; inference thread exiting");
+}
+
+/// Feeds one live embedding to a running enrollment; returns the event to report, if any.
+fn enroll_sample(
+    session: &mut Enrollment<EMBEDDING_DIM>,
+    embedding: &[f32; EMBEDDING_DIM],
+    model_version: &Arc<str>,
+) -> Option<InferenceEvent> {
+    match session.add(embedding) {
+        Ok(collected) => Some(match session.template() {
+            Some(embedding) => InferenceEvent::EnrollCaptured {
+                embedding,
+                model_version: model_version.clone(),
+            },
+            None => InferenceEvent::EnrollProgress { collected },
+        }),
+        Err(e) => {
+            warn!("[Pipeline] enrollment sample rejected: {e}");
+            None
+        }
+    }
+}
+
+/// Warns about templates the loaded feature model cannot be compared with.
+fn log_stale_templates(members: &[Arc<GroupMember>], model_version: &str) {
+    let stale = members
+        .iter()
+        .filter(|m| m.model_version != model_version)
+        .count();
+    if stale > 0 {
+        warn!(
+            "[Pipeline] {stale} of {} templates were enrolled with another model release and \
+             will not match; re-enroll those members",
+            members.len()
+        );
+    }
 }
 
 /// Verifies every `(partition, model id)` a stage needs and, only if all are intact, loads the
@@ -472,11 +598,18 @@ fn show_overlay(
     unsafe { ffi::p4_ui_show_faces(boxes.as_ptr(), n, OVERLAY_LOCK_TIMEOUT_MS) };
 }
 
-fn log_stats(detect: LatencyStats, embed: LatencyStats, frames_with_faces: u32, window: Duration) {
+fn log_stats(
+    detect: LatencyStats,
+    embed: LatencyStats,
+    scores: ScoreStats,
+    frames_with_faces: u32,
+    window: Duration,
+) {
     let ms = |d: Option<Duration>| d.map_or(0.0, |d| d.as_secs_f32() * 1000.0);
     info!(
         "[Pipeline] inference {:.1}/s over {:.0}s | detect avg {:.1} ms max {:.1} ms | \
-         embed n={} avg {:.1} ms max {:.1} ms | frames with faces {}",
+         embed n={} avg {:.1} ms max {:.1} ms | frames with faces {} | \
+         closest template n={} min {:.2} avg {:.2} max {:.2} (threshold {MATCH_THRESHOLD})",
         detect.count() as f32 / window.as_secs_f32(),
         window.as_secs_f32(),
         ms(detect.mean()),
@@ -485,6 +618,10 @@ fn log_stats(detect: LatencyStats, embed: LatencyStats, frames_with_faces: u32, 
         ms(embed.mean()),
         ms(embed.max()),
         frames_with_faces,
+        scores.count(),
+        scores.min().unwrap_or(0.0),
+        scores.mean().unwrap_or(0.0),
+        scores.max().unwrap_or(0.0),
     );
 }
 

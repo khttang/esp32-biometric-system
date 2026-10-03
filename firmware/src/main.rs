@@ -11,6 +11,8 @@ mod power;
 mod ppa;
 mod speaker;
 mod system;
+mod templates;
+mod ui;
 
 use crate::biometrics::BiometricSystem;
 use anyhow::Result;

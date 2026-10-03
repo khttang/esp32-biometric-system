@@ -148,9 +148,23 @@ static volatile bool s_ui_ready = false;
 
 static volatile uint16_t s_touch_x = 0;
 static volatile uint16_t s_touch_y = 0;
+// Panel coordinates as reported by the GT911 (native 720x1280 portrait); LVGL rotates these.
+static volatile uint16_t s_touch_raw_x = 0;
+static volatile uint16_t s_touch_raw_y = 0;
 static volatile bool s_touch_pressed = false;
 static lv_obj_t *s_touch_label = NULL;
 static lv_obj_t *s_face_boxes[P4_UI_MAX_FACE_BOXES] = {};
+
+// Right-hand panel widgets (created in setup_split_screen_ui, used under the LVGL lock)
+static lv_obj_t *s_status_label = NULL;
+static lv_obj_t *s_idle_view = NULL;
+static lv_obj_t *s_admin_view = NULL;
+static lv_obj_t *s_name_input = NULL;
+static lv_obj_t *s_member_roller = NULL;
+static size_t s_member_count = 0;
+// Touch events for the Rust state machine: sent by LVGL callbacks, drained by p4_ui_poll_event.
+static QueueHandle_t s_ui_events = NULL;
+constexpr UBaseType_t UI_EVENT_QUEUE_DEPTH = 4;
 
 extern "C" {
     i2c_master_bus_handle_t bsp_i2c_get_handle(void);
@@ -183,6 +197,8 @@ static void touch_poll_task(void *pvParameters) {
                             // Flips origin (0,0) from Bottom-Right to Top-Left
                             s_touch_x = raw_y;
                             s_touch_y = 720 - raw_x;
+                            s_touch_raw_x = raw_x;
+                            s_touch_raw_y = raw_y;
                             s_touch_pressed = true;
                         } else {
                             s_touch_pressed = false;
@@ -346,8 +362,10 @@ int32_t init_audio_system(void) {
 
 static void custom_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
     if (s_touch_pressed) {
-        data->point.x = s_touch_x;
-        data->point.y = s_touch_y;
+        // LVGL applies the display rotation to pointer input itself (lv_display_rotate_point),
+        // so it needs the panel's own coordinates; the rotated ones are only for the label.
+        data->point.x = s_touch_raw_x;
+        data->point.y = s_touch_raw_y;
         data->state = LV_INDEV_STATE_PRESSED;
 
         if (s_touch_label != NULL) {
@@ -804,6 +822,106 @@ int32_t init_p4_ethernet(void) {
     return esp_eth_start(eth_handle);
 }
 
+// Queues a touch event for Rust. Runs in LVGL callbacks, so it must not block: if Rust has
+// stopped draining the queue the event is dropped.
+static void post_ui_event(uint8_t kind) {
+    p4_ui_event_t event = {};
+    event.kind = kind;
+    if (kind == P4_UI_EVENT_ENROLL && s_name_input) {
+        strlcpy(event.name, lv_textarea_get_text(s_name_input), sizeof(event.name));
+    }
+    if (kind == P4_UI_EVENT_DELETE) {
+        if (s_member_count == 0 || !s_member_roller) {
+            return; // the roller shows a placeholder, nothing to delete
+        }
+        event.selected = (uint16_t)lv_roller_get_selected(s_member_roller);
+    }
+    if (s_ui_events) {
+        xQueueSend(s_ui_events, &event, 0);
+    }
+}
+
+static void ui_event_cb(lv_event_t *e) {
+    post_ui_event((uint8_t)(uintptr_t)lv_event_get_user_data(e));
+}
+
+static lv_obj_t *make_view(lv_obj_t *parent, int32_t y, int32_t height) {
+    lv_obj_t *view = lv_obj_create(parent);
+    lv_obj_remove_style_all(view);
+    lv_obj_set_size(view, VideoConfig::PANEL_WIDTH, height);
+    lv_obj_set_pos(view, 0, y);
+    lv_obj_remove_flag(view, LV_OBJ_FLAG_SCROLLABLE);
+    return view;
+}
+
+static void make_button(lv_obj_t *parent, const char *text, int32_t x, int32_t y, int32_t w,
+                        uint8_t event_kind) {
+    lv_obj_t *button = lv_button_create(parent);
+    lv_obj_set_size(button, w, 56);
+    lv_obj_set_pos(button, x, y);
+    lv_obj_add_event_cb(button, ui_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)event_kind);
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_center(label);
+}
+
+// Status line plus the idle and admin views of the right-hand panel. Called under the LVGL lock.
+static void build_control_panel(lv_obj_t *panel) {
+    constexpr int32_t MARGIN = 20;
+    constexpr int32_t VIEWS_Y = 180;
+    constexpr int32_t VIEWS_HEIGHT = VideoConfig::PANEL_HEIGHT - VIEWS_Y;
+    constexpr int32_t KEYBOARD_HEIGHT = 280;
+    constexpr int32_t BUTTON_X = 430;
+    constexpr int32_t BUTTON_WIDTH = VideoConfig::PANEL_WIDTH - BUTTON_X - MARGIN;
+    constexpr int32_t FIELD_WIDTH = BUTTON_X - 2 * MARGIN;
+
+    if (!s_ui_events) {
+        s_ui_events = xQueueCreate(UI_EVENT_QUEUE_DEPTH, sizeof(p4_ui_event_t));
+    }
+
+    s_status_label = lv_label_create(panel);
+    lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_width(s_status_label, VideoConfig::PANEL_WIDTH - 2 * MARGIN);
+    lv_obj_set_pos(s_status_label, MARGIN, 80);
+    lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+#if LV_FONT_MONTSERRAT_24
+    lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_24, LV_PART_MAIN);
+#endif
+    lv_label_set_text(s_status_label, "Starting...");
+
+    // Idle view: just the way into the admin view.
+    s_idle_view = make_view(panel, VIEWS_Y, VIEWS_HEIGHT);
+    make_button(s_idle_view, "Admin", BUTTON_X, 0, BUTTON_WIDTH, P4_UI_EVENT_ADMIN);
+
+    // Admin view: name + Enroll, member list + Delete / Done, keyboard along the bottom.
+    s_admin_view = make_view(panel, VIEWS_Y, VIEWS_HEIGHT);
+    lv_obj_add_flag(s_admin_view, LV_OBJ_FLAG_HIDDEN);
+
+    s_name_input = lv_textarea_create(s_admin_view);
+    lv_textarea_set_one_line(s_name_input, true);
+    lv_textarea_set_max_length(s_name_input, P4_UI_NAME_MAX);
+    lv_textarea_set_placeholder_text(s_name_input, "Name (optional)");
+    lv_obj_set_size(s_name_input, FIELD_WIDTH, 56);
+    lv_obj_set_pos(s_name_input, MARGIN, 0);
+    make_button(s_admin_view, "Enroll", BUTTON_X, 0, BUTTON_WIDTH, P4_UI_EVENT_ENROLL);
+
+    s_member_roller = lv_roller_create(s_admin_view);
+    lv_roller_set_options(s_member_roller, "(no members)", LV_ROLLER_MODE_NORMAL);
+    lv_roller_set_visible_row_count(s_member_roller, 3);
+    lv_obj_set_width(s_member_roller, FIELD_WIDTH);
+    lv_obj_set_pos(s_member_roller, MARGIN, 76);
+    make_button(s_admin_view, "Delete", BUTTON_X, 76, BUTTON_WIDTH, P4_UI_EVENT_DELETE);
+    make_button(s_admin_view, "Done", BUTTON_X, 152, BUTTON_WIDTH, P4_UI_EVENT_EXIT);
+
+    lv_obj_t *keyboard = lv_keyboard_create(s_admin_view);
+    lv_obj_set_size(keyboard, VideoConfig::PANEL_WIDTH, KEYBOARD_HEIGHT);
+    lv_obj_align(keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_textarea(keyboard, s_name_input);
+    // The keyboard's OK key enrolls, like the Enroll button.
+    lv_obj_add_event_cb(keyboard, ui_event_cb, LV_EVENT_READY,
+                        (void *)(uintptr_t)P4_UI_EVENT_ENROLL);
+}
+
 void setup_split_screen_ui(void) {
     if (lvgl_port_lock(100)) {
         lv_obj_t *scr = lv_screen_active();
@@ -883,6 +1001,8 @@ void setup_split_screen_ui(void) {
             lv_obj_add_style(s_touch_label, &style_label, 0);
         }
 
+        build_control_panel(panel);
+
         s_ui_ready = true;
         lvgl_port_unlock();
         ESP_LOGI("UI", "Split-screen UI setup complete. Canvas Obj: %p", (void*)s_camera_canvas_obj);
@@ -928,6 +1048,51 @@ bool p4_ui_show_faces(const p4_ui_rect_t *rects, size_t count, uint32_t lock_tim
             lv_obj_add_flag(box, LV_OBJ_FLAG_HIDDEN);
         }
     }
+    lvgl_port_unlock();
+    return true;
+}
+
+bool p4_ui_poll_event(p4_ui_event_t *event) {
+    return event && s_ui_events && xQueueReceive(s_ui_events, event, 0) == pdTRUE;
+}
+
+bool p4_ui_set_status(const char *text, uint32_t lock_timeout_ms) {
+    if (!s_ui_ready || !s_status_label || !text) {
+        return false;
+    }
+    if (!lvgl_port_lock(lock_timeout_ms)) {
+        return false;
+    }
+    lv_label_set_text(s_status_label, text);
+    lvgl_port_unlock();
+    return true;
+}
+
+bool p4_ui_set_admin_mode(bool enabled, uint32_t lock_timeout_ms) {
+    if (!s_ui_ready || !s_admin_view || !s_idle_view) {
+        return false;
+    }
+    if (!lvgl_port_lock(lock_timeout_ms)) {
+        return false;
+    }
+    lv_textarea_set_text(s_name_input, "");
+    lv_obj_set_flag(s_admin_view, LV_OBJ_FLAG_HIDDEN, !enabled);
+    lv_obj_set_flag(s_idle_view, LV_OBJ_FLAG_HIDDEN, enabled);
+    lvgl_port_unlock();
+    return true;
+}
+
+bool p4_ui_set_members(const char *names, size_t count, uint32_t lock_timeout_ms) {
+    if (!s_ui_ready || !s_member_roller) {
+        return false;
+    }
+    if (!lvgl_port_lock(lock_timeout_ms)) {
+        return false;
+    }
+    const bool empty = count == 0 || !names || names[0] == '\0';
+    s_member_count = empty ? 0 : count;
+    lv_roller_set_options(s_member_roller, empty ? "(no members)" : names, LV_ROLLER_MODE_NORMAL);
+    lv_textarea_set_text(s_name_input, "");
     lvgl_port_unlock();
     return true;
 }
