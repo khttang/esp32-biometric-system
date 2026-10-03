@@ -5,7 +5,14 @@ target = "riscv32imafc-esp-espidf"
 linker = "ldproxy"
 runner = "espflash flash --monitor --partition-table partitions.csv"
 rustflags = [
-  "-C", "link-arg=-Wl,--undefined=app_main"
+  "-C", "link-arg=-Wl,--undefined=app_main",
+  # ESP32-P4 hardware-loop erratum workarounds: wrap FreeRTOS's interrupt entry and exit with
+  # the routines in components/biometrics_wrapper/hwlp_erratum.S (--undefined pulls them out of
+  # their archive).
+  "-C", "link-arg=-Wl,--wrap=rtos_int_enter",
+  "-C", "link-arg=-Wl,--undefined=__wrap_rtos_int_enter",
+  "-C", "link-arg=-Wl,--wrap=rtos_int_exit",
+  "-C", "link-arg=-Wl,--undefined=__wrap_rtos_int_exit",
 ]
 
 [unstable]

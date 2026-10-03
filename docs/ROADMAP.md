@@ -230,11 +230,12 @@ Enroll and recognise people locally, with no server.
 - No genuinely different model was available, so the images that were swapped differed in
   version label and golden only.
 
-**Found along the way (own PR):**
-- The feature model's output is not repeatable when the inference thread is preempted: the same
-  input gives the same output at top priority, and outputs a few quantisation steps apart when
-  the camera thread interrupts the run. Every embedding computed at normal priority is affected.
-  The golden run works around it by running unpreempted; the cause still has to be found.
+**Found along the way (fixed in its own PR):**
+- The feature model's output was not repeatable when the inference thread was preempted: the
+  same input gave the same output at top priority, and outputs a few quantisation steps apart
+  when the camera thread interrupted the run. Cause: an ESP32-P4 hardware-loop erratum that
+  ESP-IDF v5.5.5's context switch does not fully cover. Worked around in
+  `hwlp_erratum.S` (see README); preempted runs are now bit-exact.
 
 ### ⬜ M4: Network Sync & Remote Model Updates
 
