@@ -20,7 +20,7 @@ jobs:
       run:
         working-directory: crates/biometric-core
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
@@ -46,9 +46,9 @@ jobs:
       run:
         working-directory: firmware
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -60,29 +60,22 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
 
-      - name: Cache ldproxy
-        id: ldproxy-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/ldproxy
-          key: ldproxy-${{ runner.os }}-v1
-
-      - name: Install ldproxy
-        if: steps.ldproxy-cache.outputs.cache-hit != 'true'
-        run: cargo install ldproxy --locked
-
       # ESP-IDF, its Python env and the RISC-V toolchain (~5 GB) are installed by esp-idf-sys
       # into firmware/.embuild on the first build.
       - name: Cache ESP-IDF (.embuild)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: firmware/.embuild
           key: embuild-${{ runner.os }}-${{ hashFiles('firmware/.cargo/config.toml', 'firmware/rust-toolchain.toml') }}
 
+      # Also caches ~/.cargo/bin, so ldproxy is only built on a cache miss.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: firmware
           cache-on-failure: true
+
+      - name: Install ldproxy
+        run: command -v ldproxy || cargo install ldproxy --locked
 
       - name: rustfmt
         run: cargo fmt --check
