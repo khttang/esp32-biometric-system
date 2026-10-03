@@ -1,4 +1,4 @@
-//! Allocation-free latency statistics for on-device performance logging.
+//! Allocation-free statistics for on-device performance logging.
 
 use core::time::Duration;
 
@@ -36,9 +36,96 @@ impl LatencyStats {
     }
 }
 
+/// Range and mean of similarity scores over a logging window, used to judge the match
+/// threshold against what the device actually sees.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct ScoreStats {
+    count: u32,
+    total: f32,
+    min: f32,
+    max: f32,
+}
+
+impl ScoreStats {
+    /// Records one score; non-finite scores are ignored.
+    pub fn record(&mut self, score: f32) {
+        if !score.is_finite() {
+            return;
+        }
+        if self.count == 0 {
+            (self.min, self.max) = (score, score);
+        } else {
+            (self.min, self.max) = (self.min.min(score), self.max.max(score));
+        }
+        self.count = self.count.saturating_add(1);
+        self.total += score;
+    }
+
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// Mean score, or `None` if nothing was recorded.
+    pub fn mean(&self) -> Option<f32> {
+        (self.count > 0).then(|| self.total / self.count as f32)
+    }
+
+    pub fn min(&self) -> Option<f32> {
+        (self.count > 0).then_some(self.min)
+    }
+
+    pub fn max(&self) -> Option<f32> {
+        (self.count > 0).then_some(self.max)
+    }
+
+    /// Returns the current statistics and starts a new window.
+    pub fn take(&mut self) -> Self {
+        core::mem::take(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_score_stats_have_no_values() {
+        let s = ScoreStats::default();
+        assert_eq!(
+            (s.count(), s.mean(), s.min(), s.max()),
+            (0, None, None, None)
+        );
+    }
+
+    #[test]
+    fn score_range_and_mean_include_negative_scores() {
+        let mut s = ScoreStats::default();
+        for score in [0.5, -0.25, 0.75] {
+            s.record(score);
+        }
+        assert_eq!(s.count(), 3);
+        assert_eq!(s.min(), Some(-0.25));
+        assert_eq!(s.max(), Some(0.75));
+        assert!((s.mean().unwrap() - 1.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn score_stats_ignore_non_finite_values() {
+        let mut s = ScoreStats::default();
+        s.record(f32::NAN);
+        s.record(f32::INFINITY);
+        assert_eq!(s.count(), 0);
+        s.record(0.4);
+        assert_eq!((s.min(), s.max()), (Some(0.4), Some(0.4)));
+    }
+
+    #[test]
+    fn score_stats_take_resets() {
+        let mut s = ScoreStats::default();
+        s.record(0.9);
+        assert_eq!(s.take().count(), 1);
+        assert_eq!(s, ScoreStats::default());
+    }
 
     #[test]
     fn empty_stats_have_no_mean_or_max() {

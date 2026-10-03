@@ -30,6 +30,10 @@ pub const MSR_PARTITION: &str = "face_msr";
 pub const MNP_PARTITION: &str = "face_mnp";
 pub const FEATURE_PARTITION: &str = "face_feat";
 
+/// NVS partition holding the enrolled templates (see [`crate::template`]); must match
+/// `firmware/partitions.csv`.
+pub const TEMPLATE_PARTITION: &str = "templates";
+
 /// Model identifiers the firmware accepts in each partition's manifest
 /// (see [`crate::manifest`]); the manifest's `version` identifies the specific release.
 /// They are the `.espdl` file stems in Espressif's model components.
