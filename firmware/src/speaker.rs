@@ -3,14 +3,18 @@ use std::f32::consts::PI;
 
 use crate::ffi;
 
+#[allow(dead_code)]
 const AUDIO_SAMPLE_RATE: u32 = 16_000;
 
-pub struct HdmiAudioPlayer {
+/// I2S speaker output (shares I2S_NUM_0 with the microphone)
+#[allow(dead_code)] // TODO: play_success_chime on ActionExecuted
+pub struct Speaker {
     i2s_port: i32,
 }
 
-impl HdmiAudioPlayer {
-pub fn new(i2s_port: i32) -> Self {
+#[allow(dead_code)]
+impl Speaker {
+    pub fn new(i2s_port: i32) -> Self {
         Self { i2s_port }
     }
 

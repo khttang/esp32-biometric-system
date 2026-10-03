@@ -27,23 +27,11 @@ typedef struct {
     uint32_t buffer_index;
 } p4_camera_frame_t;
 
-typedef struct {
-    uint16_t x;
-    uint16_t y;
-    uint16_t strength;
-    uint8_t points;
-    bool touched;
-} p4_touch_data_t;
-
 // System Initialization APIs
 int32_t p4_hardware_init_all(const p4_hardware_config_t *config);
 int32_t init_display_system(void);
 int32_t init_audio_system(void);
 int32_t init_p4_ethernet(void);
-
-// LVGL Thread Safety Wrappers
-bool lvgl_lock(uint32_t timeout_ms);
-void lvgl_unlock(void);
 
 // UI & Camera Operations
 void setup_split_screen_ui(void);
@@ -51,11 +39,9 @@ void update_camera_viewport(const p4_camera_frame_t *frame);
 bool p4_touch_is_pressed(void);
 
 // Camera V4L2 Driver FFI
-int32_t p4_camera_init_v4l2_default(void);
 int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height);
 int32_t p4_camera_capture_frame(p4_camera_frame_t *frame, uint32_t timeout_ms);
 int32_t p4_camera_release_frame(const p4_camera_frame_t *frame);
-void camera_stream_task(void *pvParameters);
 
 // Audio FFI
 int read_i2s_mic_c(int i2s_port, int16_t *out_buffer, uint32_t samples_to_read, uint32_t *bytes_read, uint32_t timeout_ms);

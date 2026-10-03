@@ -17,6 +17,7 @@ fn main() {
     let bindings = bindgen::Builder::default()
         .header("components/biometrics_wrapper/include/biometrics_wrapper.h")
         .clang_arg("-Icomponents/biometrics_wrapper/include")
+        .allowlist_file(".*biometrics_wrapper\\.h") // only our API, not stdint/stdbool internals
         .derive_default(true)
         .use_core()
         .generate()

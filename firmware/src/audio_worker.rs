@@ -10,6 +10,7 @@ pub const AUDIO_FRAME_SAMPLES: usize = 512;
 pub const AUDIO_QUEUE_DEPTH: usize = 16;
 
 /// Fixed-size PCM frame moved through the channel by value (no per-frame heap allocation)
+#[allow(dead_code)] // TODO: consumed by the voice pipeline
 pub struct AudioFrame {
     pub samples: [i16; AUDIO_FRAME_SAMPLES],
     pub len: usize,

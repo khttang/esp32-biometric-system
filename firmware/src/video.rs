@@ -1,4 +1,3 @@
-use log::{info, warn};
 use core::slice;
 use crate::system::P4CameraFrame;
 
@@ -31,7 +30,7 @@ impl VideoPipeline {
 
         // Feed the raw frame struct to the hardware PPA via C++ FFI
         unsafe {
-            crate::system::ffi::update_camera_viewport(frame as *const P4CameraFrame);
+            crate::ffi::update_camera_viewport(frame as *const P4CameraFrame);
         }
     }
 

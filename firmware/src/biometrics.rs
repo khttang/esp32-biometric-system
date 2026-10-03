@@ -1,6 +1,3 @@
-use anyhow::{Context, Result};
-use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
-use esp_idf_svc::http::Method;
 use serde::{Deserialize, Serialize};
 
 use log::{error, info, warn};
@@ -8,7 +5,6 @@ use std::time::{Duration, Instant};
 
 use crate::system::{SystemResources, crop_face_112x112};
 
-const FACE_EMBEDDING_DIM: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -27,6 +23,7 @@ pub struct GroupMember {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // TODO: UpdatingRuntimeData/Error become reachable once network triggers are wired
 pub enum SystemState {
     Initialize,
     RetrieveRuntimeData,
@@ -168,7 +165,7 @@ impl BiometricSystem {
             // -----------------------------------------------------------------
             // 5. ACTION EXECUTED: Unlock / Success UI feedback
             // -----------------------------------------------------------------
-            SystemState::ActionExecuted { member } => {
+            SystemState::ActionExecuted { .. } => {
                 if let Some(timer) = self.action_display_timer {
                     if now >= timer {
                         info!("Action feedback complete. Returning to DetectionValidation.");
@@ -219,73 +216,5 @@ impl BiometricSystem {
     /// Computes dot product of normalized L2 embeddings (Cosine Similarity)
     fn cosine_similarity(&self, a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-    }
-
-    pub fn state(&self) -> &SystemState {
-        &self.state
-    }
-
-    pub async fn fetch_templates_from_laptop(url: &str) -> Result<Vec<GroupMember>> {
-        let url_string = url.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            log::info!("[HTTP] Connecting to server: {}", url_string);
-
-            // 1. Create HTTP connection with default config
-            let config = HttpConfig {
-                use_global_ca_store: false,
-                ..Default::default()
-            };
-            let mut connection = EspHttpConnection::new(&config)
-                .context("Failed to create EspHttpConnection")?;
-
-            // 2. Send GET request
-            connection
-                .initiate_request(Method::Get, &url_string, &[])
-                .context("Failed to initiate HTTP GET request")?;
-
-            // 3. Complete request and retrieve response headers
-            connection
-                .initiate_response()
-                .context("Failed to get HTTP response")?;
-
-            let status = connection.status();
-            if status != 200 {
-                anyhow::bail!("Server returned non-200 HTTP status code: {}", status);
-            }
-
-            // 4. Read body bytes directly into buffer
-            let mut buf = vec![0u8; 64 * 1024];
-            let mut offset = 0;
-
-            loop {
-                let bytes_read = connection
-                    .read(&mut buf[offset..])
-                    .context("Error reading response stream")?;
-
-                if bytes_read == 0 {
-                    break;
-                }
-                offset += bytes_read;
-            }
-
-            // 5. Parse JSON payload into Vec<GroupMember>
-            let members: Vec<GroupMember> = serde_json::from_slice(&buf[..offset])
-                .context("Failed to parse JSON template payload into Vec<GroupMember>")?;
-
-            for member in &members {
-                if member.face_embedding.len() != FACE_EMBEDDING_DIM {
-                    anyhow::bail!(
-                        "Member '{}' has invalid face_embedding dimension: {} (expected {})",
-                        member.name,
-                        member.face_embedding.len(),
-                        FACE_EMBEDDING_DIM
-                    );
-                }
-            }
-
-            Ok(members)
-        })
-        .await?
     }
 }

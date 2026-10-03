@@ -127,7 +127,6 @@ namespace VideoConfig {
 #define C_LINE_SIZE 128               // ESP32-P4 L2 Cache Line Size (0x80)
 
 // Global Subsystem Handles
-static esp_lcd_panel_io_handle_t s_lcd_io = NULL;
 static esp_lcd_panel_handle_t s_lcd_panel = NULL;
 static i2c_master_bus_handle_t s_i2c_bus_handle = NULL;
 static i2c_master_dev_handle_t s_gt911_i2c_dev = NULL;
@@ -144,10 +143,6 @@ static dl::Model *g_mobilefacenet_model = NULL;
 static volatile bool s_camera_streaming = false;
 static int s_video_fd = -1;
 struct v4l2_frame_buffer_t s_cam_buffers[CAM_BUF_COUNT] = {};
-static size_t s_cam_buf_lengths[CAM_BUF_COUNT] = {0};
-
-static uint16_t *s_ppa_buf[2] = {NULL, NULL};
-static uint8_t s_ppa_idx = 0;
 
 static void *s_ui_canvas_buf = NULL;
 static lv_obj_t *s_camera_canvas_obj = NULL;
@@ -164,7 +159,7 @@ extern "C" {
 }
 
 // 1. High-frequency non-blocking background touch worker
-void touch_poll_task(void *pvParameters) {
+static void touch_poll_task(void *pvParameters) {
     uint8_t status_reg[2] = {0x81, 0x4E};
     uint8_t point_reg[2]  = {0x81, 0x50};
     uint8_t clear_buf[3]  = {0x81, 0x4E, 0x00};
@@ -212,20 +207,7 @@ void touch_poll_task(void *pvParameters) {
 // LVGL 9 Callbacks & Task Loop
 // -----------------------------------------------------------------------------
 
-// Helper to apply V4L2 controls
-static void set_v4l2_control(int fd, uint32_t id, int32_t value, const char *name) {
-    struct v4l2_control ctrl = {};
-    ctrl.id = id;
-    ctrl.value = value;
-    if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0) {
-        ESP_LOGW(TAG_CAM, "Failed to set V4L2 ctrl %s (0x%08" PRIx32 "): errno %d (%s)", 
-                 name, id, errno, strerror(errno));
-    } else {
-        ESP_LOGI(TAG_CAM, "V4L2 Ctrl %s set to %" PRId32, name, value);
-    }
-}
-
-esp_err_t init_ppa_hardware_engine(void) {
+static esp_err_t init_ppa_hardware_engine(void) {
     ppa_client_config_t ppa_cfg = {};
     ppa_cfg.oper_type = PPA_OPERATION_SRM; // Scaling, Rotation, Mirroring Engine
     
@@ -234,12 +216,6 @@ esp_err_t init_ppa_hardware_engine(void) {
         ESP_LOGI("PPA_SYS", "ESP32-P4 PPA Hardware Accelerator Initialized Successfully.");
     }
     return err;
-}
-
-void configure_camera_exposure_gain(int fd) {
-    set_v4l2_control(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO, "EXPOSURE_AUTO");
-    set_v4l2_control(fd, V4L2_CID_AUTOGAIN, 1, "AUTOGAIN");
-    set_v4l2_control(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1, "AUTO_WHITE_BALANCE");
 }
 
 // -----------------------------------------------------------------------------
@@ -281,7 +257,7 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
 *  - TX channel (g_i2s_tx_handle): I2S_TX, 16-bit data, left-justified, mono, no DMA, no clock divider.
 *  - RX channel (g_i2s_rx_handle): I2S_RX, 16-bit data, left-justified, mono, no DMA, no clock divider.
 */
-int init_i2s_duplex_c(uint32_t sample_rate, int bclk_gpio, int ws_gpio, int din_gpio, int dout_gpio) {
+static int init_i2s_duplex_c(uint32_t sample_rate, int bclk_gpio, int ws_gpio, int din_gpio, int dout_gpio) {
     // 1. Clean up existing channels if re-initialized
     if (g_i2s_tx_handle) {
         i2s_channel_disable(g_i2s_tx_handle);
@@ -426,7 +402,7 @@ int32_t init_display_system(void) {
         .chan_id = 3,
         .voltage_mv = 2500,
     };
-    ESP_ERROR_CHECK(esp_ldo_acquire_channel(&ldo_cfg, &ldo_mipi_phy));
+    ESP_RETURN_ON_ERROR(esp_ldo_acquire_channel(&ldo_cfg, &ldo_mipi_phy), TAG_LVGL, "esp_ldo_acquire_channel failed");
     vTaskDelay(pdMS_TO_TICKS(10));
 
     // 3. Initialize MIPI-DSI Bus
@@ -437,7 +413,7 @@ int32_t init_display_system(void) {
         .phy_clk_src = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
         .lane_bit_rate_mbps = 1000
     };
-    ESP_ERROR_CHECK(esp_lcd_new_dsi_bus(&bus_config, &dsi_bus));
+    ESP_RETURN_ON_ERROR(esp_lcd_new_dsi_bus(&bus_config, &dsi_bus), TAG_LVGL, "esp_lcd_new_dsi_bus failed");
 
     // 4. Install MIPI DBI IO
     esp_lcd_panel_io_handle_t dbi_io = NULL;
@@ -446,7 +422,7 @@ int32_t init_display_system(void) {
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
     };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_dbi(dsi_bus, &dbi_config, &dbi_io));
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_dbi(dsi_bus, &dbi_config, &dbi_io), TAG_LVGL, "esp_lcd_new_panel_io_dbi failed");
 
     // 5. Configure DPI Timing
     esp_lcd_dpi_panel_config_t dpi_config = {};
@@ -485,7 +461,7 @@ int32_t init_display_system(void) {
     io_exp_cfg.scl_speed_hz = 100000;
 
     i2c_master_dev_handle_t io_exp_dev = NULL;
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus_handle, &io_exp_cfg, &io_exp_dev));
+    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_i2c_bus_handle, &io_exp_cfg, &io_exp_dev), TAG_LVGL, "i2c_master_bus_add_device failed");
 
     uint8_t write_buf[2];
     write_buf[0] = 0x95; write_buf[1] = 0x11;
@@ -506,14 +482,14 @@ int32_t init_display_system(void) {
 
     i2c_master_bus_rm_device(io_exp_dev);
 
-    ESP_ERROR_CHECK(esp_lcd_new_panel_hx8394(dbi_io, &panel_dev_config, &s_lcd_panel));
-    ESP_ERROR_CHECK(esp_lcd_panel_reset(s_lcd_panel));
-    ESP_ERROR_CHECK(esp_lcd_panel_init(s_lcd_panel));
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_lcd_panel, true));
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_hx8394(dbi_io, &panel_dev_config, &s_lcd_panel), TAG_LVGL, "esp_lcd_new_panel_hx8394 failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_lcd_panel), TAG_LVGL, "esp_lcd_panel_reset failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_lcd_panel), TAG_LVGL, "esp_lcd_panel_init failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_lcd_panel, true), TAG_LVGL, "esp_lcd_panel_disp_on_off failed");
 
     // 6. Initialize ESP-LVGL-PORT
     const lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
-    ESP_ERROR_CHECK(lvgl_port_init(&port_cfg));
+    ESP_RETURN_ON_ERROR(lvgl_port_init(&port_cfg), TAG_LVGL, "lvgl_port_init failed");
 
     lvgl_port_display_cfg_t lvgl_disp_cfg = {};
     lvgl_disp_cfg.panel_handle = s_lcd_panel;
@@ -608,8 +584,8 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
 
     esp_err_t ret = esp_video_init(&cam_cfg);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG_CAM, "esp_video_init failed: 0x%x. Continuing in headless camera mode...", ret);
-        return 0; // Allows state machine loop to run
+        ESP_LOGE(TAG_CAM, "esp_video_init failed: 0x%x", ret);
+        return ret;
     }
 
     s_video_fd = open("/dev/video0", O_RDWR | O_NONBLOCK);
@@ -651,7 +627,6 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
 
         if (ioctl(s_video_fd, VIDIOC_QUERYBUF, &buf) < 0) return -1;
 
-        s_cam_buf_lengths[i] = buf.length;
         s_cam_buffers[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, s_video_fd, buf.m.offset);
         if (s_cam_buffers[i].start == MAP_FAILED) return -1;
         if (ioctl(s_video_fd, VIDIOC_QBUF, &buf) < 0) return -1;
@@ -839,28 +814,10 @@ int32_t init_p4_ethernet(void) {
     ret = esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle));
     if (ret != ESP_OK) return ret;
 
+    ret = esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL);
+    if (ret != ESP_OK) return ret;
+
     return esp_eth_start(eth_handle);
-}
-
-int32_t p4_display_draw_frame(const uint16_t *frame_buffer, uint16_t width, uint16_t height) {
-    if (!s_lcd_panel || !frame_buffer) return ESP_ERR_INVALID_ARG;
-
-    esp_err_t ret = esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, 0, width, height, frame_buffer);
-    return (int32_t)ret;
-}
-
-int32_t p4_display_draw_bitmap(uint16_t x_start, uint16_t y_start, uint16_t x_end, uint16_t y_end, const uint16_t *data) {
-    if (!s_lcd_panel || !data) return -1;
-
-    uintptr_t addr = (uintptr_t)data;
-    size_t len = (x_end - x_start) * (y_end - y_start) * sizeof(uint16_t);
-
-    uintptr_t aligned_addr = addr & ~(C_LINE_SIZE - 1);
-    size_t aligned_len = (addr + len - aligned_addr + C_LINE_SIZE - 1) & ~(C_LINE_SIZE - 1);
-
-    esp_cache_msync((void *)aligned_addr, aligned_len, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-
-    return (int32_t)esp_lcd_panel_draw_bitmap(s_lcd_panel, x_start, y_start, x_end, y_end, data);
 }
 
 // -----------------------------------------------------------------------------

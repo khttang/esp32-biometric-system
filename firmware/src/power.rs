@@ -57,12 +57,7 @@ impl InactivityTimer {
 }
 
 /// Spawns a background thread that monitors idle time and triggers sleep transition
-pub fn spawn_inactivity_watchdog(
-    timer: InactivityTimer,
-    timeout_secs: u64,
-    gt911_lp_pin: i32,
-    button_lp_pin: i32,
-) {
+pub fn spawn_inactivity_watchdog(timer: InactivityTimer, timeout_secs: u64) {
     thread::spawn(move || {
         info!("[Power] Inactivity watchdog active (Timeout: {}s)", timeout_secs);
 
@@ -118,7 +113,6 @@ pub fn handle_fatal_init_error(err: anyhow::Error) -> ! {
             // Give power rails 2 seconds to settle before retrying
             thread::sleep(Duration::from_secs(2));
             esp_restart();
-            loop {}
         } else {
             error!("CRITICAL: Max boot retries reached. Sleeping 1hr to preserve battery.");
             
@@ -183,7 +177,4 @@ pub fn enter_deep_sleep(timer_wakeup: Option<Duration>) -> ! {
         // 5. Trigger Deep Sleep (Does not return)
         esp_deep_sleep_start();
     }
-
-    // Unreachable loop for compiler divergence (`-> !`)
-    loop {}
 }
