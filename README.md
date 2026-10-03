@@ -48,7 +48,7 @@ Known issues:
 | Component | Part | Interface / Notes |
 |---|---|---|
 | SoC | ESP32-P4 (silicon v1.3), 2× RISC-V @ 360 MHz | 32 MB PSRAM @ 200 MHz, 16 MB flash |
-| Display | HX8394 720×1280 IPS | MIPI-DSI, 2 lanes @ 1000 Mbps, 60 MHz DPI clock, RGB565; rotated 270° in software to 1280×720 landscape |
+| Display | HX8394 720×1280 IPS | MIPI-DSI, 2 lanes @ 700 Mbps, 58 MHz DPI clock (the HX8394 driver's recommended timing, about 55 Hz), RGB565; rotated 270° in software to 1280×720 landscape |
 | Touch | GT911 | I2C `0x5D`, polled at ~66 Hz (INT pin not used) |
 | Camera | OV5647 | MIPI-CSI, RAW10 1280×960 @ 45 fps (binning) → ISP → RGB565 via `esp_video` (`/dev/video0`) |
 | Audio | I2S MEMS mic (INMP441-style) + speaker output | `I2S_NUM_0` full-duplex, 16 kHz, 16-bit mono |

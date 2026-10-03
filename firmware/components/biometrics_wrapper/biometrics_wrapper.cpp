@@ -407,12 +407,16 @@ int32_t init_display_system(void) {
     vTaskDelay(pdMS_TO_TICKS(10));
 
     // 3. Initialize MIPI-DSI Bus
+    // Lane rate, pixel clock and porches below are the HX8394 driver's own values
+    // (HX8394_PANEL_BUS_DSI_2CH_CONFIG / HX8394_720_1280_PANEL_30HZ_DPI_CONFIG in
+    // esp_lcd_hx8394.h). With other values (1000 Mbps, 60 MHz, porches 40/10/40 and 16/4/16) the
+    // panel showed the frame about 150 columns off, with a dark strip along one edge.
     esp_lcd_dsi_bus_handle_t dsi_bus = NULL;
     esp_lcd_dsi_bus_config_t bus_config = {
         .bus_id = 0,
         .num_data_lanes = 2,
         .phy_clk_src = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
-        .lane_bit_rate_mbps = 1000
+        .lane_bit_rate_mbps = 700
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_dsi_bus(&bus_config, &dsi_bus), TAG_LVGL, "esp_lcd_new_dsi_bus failed");
 
@@ -428,18 +432,18 @@ int32_t init_display_system(void) {
     // 5. Configure DPI Timing
     esp_lcd_dpi_panel_config_t dpi_config = {};
     dpi_config.dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT;
-    dpi_config.dpi_clock_freq_mhz = 60;
+    dpi_config.dpi_clock_freq_mhz = 58;
     dpi_config.virtual_channel = 0;
     dpi_config.pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB565;
     dpi_config.num_fbs = 2;
     dpi_config.flags.use_dma2d = true;
     dpi_config.video_timing.h_size = 720;
     dpi_config.video_timing.v_size = 1280;
-    dpi_config.video_timing.hsync_back_porch = 40;
+    dpi_config.video_timing.hsync_back_porch = 20;
     dpi_config.video_timing.hsync_front_porch = 40;
-    dpi_config.video_timing.hsync_pulse_width = 10;
-    dpi_config.video_timing.vsync_back_porch = 16;
-    dpi_config.video_timing.vsync_front_porch = 16;
+    dpi_config.video_timing.hsync_pulse_width = 20;
+    dpi_config.video_timing.vsync_back_porch = 10;
+    dpi_config.video_timing.vsync_front_porch = 24;
     dpi_config.video_timing.vsync_pulse_width = 4;
 
     hx8394_vendor_config_t vendor_config = {};
