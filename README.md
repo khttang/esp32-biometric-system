@@ -38,7 +38,6 @@ Known issues:
 - **Camera pipeline runs at about 9–10 fps, not 45.** Scaling the 1280×960 frame for the preview takes about 95 ms. The system is PSRAM-bandwidth-bound: the ISP, PPA, display scan-out, LVGL and code all share it (see [Measured Performance](#measured-performance-esp32-p4-rev-13-360-mhz)).
 - **Embedding takes about 187 ms**, against Espressif's published 96 ms for MFN on the P4.
 - Occasional full-screen white/cyan flashes (seen on older builds too; suspected display cable or power).
-- **Embeddings are slightly perturbed when the inference thread is preempted.** Running the feature model on the same input gives identical output at top task priority, but output that differs by a few quantisation steps when the camera thread preempts the run. The cause is not known yet (it looks like CPU state that is not preserved across a context switch). It affects every embedding computed at normal priority; its effect on match scores has not been measured.
 - Deep-sleep wake pins don't match the admin button (see [Power](#power--deep-sleep)).
 - **Templates are stored unencrypted** and the admin view is open to anyone at the device (see [Enrollment & Templates](#enrollment--templates)).
 
@@ -238,7 +237,7 @@ switch to a genuinely different model (only Espressif's one release of each was 
 the digest is compared bit for bit. It must come from a device running the same ESP-DL version;
 after an ESP-DL upgrade the goldens of the pinned models have to be re-measured. The golden run
 executes at the highest task priority, because a preempted run of the feature model is not
-repeatable (see Known issues).
+repeatable without the erratum workaround below, and a false mismatch would reject a good model for good.
 
 Updating models:
 
@@ -256,6 +255,41 @@ To publish a model of your own, get its golden from a device: pack it without `-
 
 Model files are not committed: `models/` is gitignored and the releases are pinned by SHA-256 in
 the script, together with their goldens.
+
+### ESP32-P4 Hardware-Loop Erratum Workaround
+
+ESP-DL's assembly kernels use the P4's hardware-loop registers and its PIE vector extension, with
+PIE instructions inside hardware loops. On silicon before v3 (this board is v1.3) a preempted
+inference could resume with a loop one iteration short. Nothing crashes; the result is just
+slightly wrong. Measured with the feature model on a fixed input:
+
+| Inference thread | Result |
+|---|---|
+| Highest priority (never preempted) | Identical output in every run |
+| Normal priority, camera thread preempting it | A different output in most runs, a few quantisation steps apart |
+| Normal priority, with the workaround | Identical output in 24 of 24 runs over three boots |
+
+`firmware/components/biometrics_wrapper/hwlp_erratum.S` wraps FreeRTOS's interrupt entry and
+exit routines (linker `--wrap`, set in `firmware/.cargo/config.toml`; ESP-IDF is not modified):
+
+1. **Entry:** the CPU does not always flag a running hardware loop, and ESP-IDF v5.5.5 only saves
+   the loop registers when it is flagged ([espressif/esp-idf#19025](https://github.com/espressif/esp-idf/issues/19025)).
+   The wrapper flags a loop whose counter is not zero, so the registers are saved.
+2. **Exit:** after a context switch ESP-IDF leaves PIE off and lets the task's next PIE
+   instruction trap to switch it back on. A trap taken inside a hardware loop is what costs the
+   iteration. The wrapper switches PIE back on directly when the resumed task still owns the
+   core's PIE registers, so there is no trap.
+
+What the measurements do and do not show:
+- The entry half alone did not make the output repeatable. Entry plus exit did. The exit half on
+  its own was not tested, so whether the entry half is needed for this symptom is not known; it
+  is kept because the unsaved-register case was observed (39 interrupt entries with an unflagged
+  running loop during one boot).
+- The effect on recognition has not been measured: no before/after comparison of match scores.
+- Two PIE-using tasks on the same core are not covered (the one that lost ownership still
+  traps). This firmware has at most one per core.
+
+Remove the file and the linker options once the ESP-IDF version in use fixes both paths.
 
 ### Enrollment & Templates
 
@@ -415,6 +449,7 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │   ├── components/biometrics_wrapper/      # C++ ESP-IDF component
 │   │   ├── biometrics_wrapper.cpp    # Display/LVGL, touch, camera V4L2, audio, Ethernet, OTA
 │   │   ├── face_inference.cpp        # ESP-DL face models (MSR, MNP, MobileFaceNet) from partitions
+│   │   ├── hwlp_erratum.S            # ESP32-P4 hardware-loop erratum workaround (context switch)
 │   │   ├── include/biometrics_wrapper.h    # C API used from Rust
 │   │   ├── include/bindings.h        # Headers esp-idf-sys generates Rust bindings from
 │   │   ├── idf_component.yml         # Managed component dependencies

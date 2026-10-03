@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "biometrics_wrapper.cpp" "face_inference.cpp"
+    SRCS "biometrics_wrapper.cpp" "face_inference.cpp" "hwlp_erratum.S"
     INCLUDE_DIRS "include" "."
     REQUIRES 
         cxx 
@@ -15,6 +15,8 @@ idf_component_register(
         hal
         lvgl
         mbedtls
+        riscv
+        soc
         # Managed components
         espressif__esp-dl 
         espressif__esp_video

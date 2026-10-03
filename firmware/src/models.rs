@@ -13,10 +13,10 @@
 //! before the run, so a model that crashes the chip is rejected after a bounded number of
 //! attempts instead of boot-looping the device.
 //!
-//! The golden run executes at the highest task priority. On this chip a context switch in the
-//! middle of an inference can change the feature model's output by a few quantisation steps
-//! (measured: identical digests at top priority, differing ones when the camera thread
-//! preempts the run), and the comparison is exact.
+//! The golden run executes at the highest task priority, so nothing preempts it. The comparison
+//! is exact, and a preempted inference used to come out a few quantisation steps off on this
+//! chip (see `components/biometrics_wrapper/hwlp_erratum.S`, which fixes that); a false
+//! mismatch would reject a good model for good, so the run does not depend on that fix.
 //!
 //! What the golden run proves: this firmware's ESP-DL build loads the model and computes what
 //! the publisher's did. The SHA-256 already proves the bytes are intact; the golden run catches
