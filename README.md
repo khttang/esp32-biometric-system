@@ -33,7 +33,7 @@ Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP
 | Voice recognition | Not implemented |
 
 Known issues:
-- **Camera pipeline runs at about 8 fps, not 45.** Each PPA scale of the 1280×960 frame takes 80–95 ms. Cache maintenance and LVGL's PPA use were ruled out as causes. This caps inference at about 4/s.
+- **Camera pipeline runs at about 9–10 fps, not 45.** Scaling the 1280×960 frame for the preview takes about 95 ms. The system is PSRAM-bandwidth-bound: the ISP, PPA, display scan-out, LVGL and code all share it (see [Measured Performance](#measured-performance-esp32-p4-rev-13-360-mhz)).
 - **Embedding takes about 187 ms**, against Espressif's published 96 ms for MFN on the P4.
 - Occasional full-screen white/cyan flashes (seen on older builds too; suspected display cable or power).
 - Deep-sleep wake pins don't match the admin button (see [Power](#power--deep-sleep)).
@@ -82,7 +82,7 @@ admin button is configured in Rust (`system.rs`).
 | `main` | 0 | 1 | 8 KB | ESP-IDF (Rust `main`) | Boot, then state machine loop (~20 ms period) |
 | LVGL (`taskLVGL`) | 0 | 4 | 7 KB | `esp_lvgl_port` | Render, sw-rotate 270°, flush to DPI framebuffer; 5 ms timer |
 | `gt911_poller` | 1 | 5 | 3 KB | C++ | Poll GT911 every 15 ms |
-| `cam_pipeline` | 1 | 6 | 8 KB | Rust `pipeline.rs` | Dequeue frame → PPA preview → swap canvas; feed detector |
+| `cam_pipeline` | 1 | 6 | 8 KB | Rust `pipeline.rs` | Dequeue frame → PPA preview → (on request) detector image from preview → swap canvas; logs fps/PPA stats every 10 s |
 | `inference` | 1 | 3 | 32 KB | Rust `pipeline.rs` | Detect → overlay → embed → match, ≤ 10 Hz (~27 KB of stack never used) |
 | audio capture | any | 5 | 4 KB | Rust `audio_worker.rs` | Read I2S mic into a bounded queue |
 | inactivity watchdog | any | 5 | 4 KB | Rust `power.rs` | Deep sleep after 180 s without input |
@@ -95,7 +95,7 @@ no Kconfig option for this), keeping Core 1 free for the vision pipeline.
 ┌──────────────────────── Core 0 ────────────────────────┐   ┌──────────────────────── Core 1 ────────────────────────┐
 │ main (prio 1)                                           │   │ cam_pipeline (prio 6)                                   │
 │   BiometricSystem::tick() every ~20 ms                  │   │   Camera::next_frame()  (blocking V4L2 DQBUF)           │
-│   ◀── InferenceEvent { FaceSeen | Match(member) } ──────┼───┤   PPA 1280×960 → 640×480 RGB565, letterboxed            │
+│   ◀── InferenceEvent { FaceSeen | Match(member) } ──────┼───┤   PPA 1280×960 → 640×480 RGB565 preview                 │
 │   touch / admin button → InactivityTimer::reset()       │   │   p4_ui_present_camera(back buffer)  (LVGL lock, 5 ms)  │
 │                                                         │   │   on request: PPA 1280×960 → 640×480 RGB888 ──┐         │
 │ LVGL (prio 4)                                           │   │ inference (prio 3)                             ▼         │
@@ -110,14 +110,24 @@ no Kconfig option for this), keeping Core 1 free for the vision pipeline.
 1. **Capture**: the OV5647 streams RAW10; the ISP converts to RGB565 into three MMAP'd V4L2
    buffers (2.4 MB each, PSRAM). `camera.rs` hands out a `Frame` that borrows a buffer zero-copy and
    re-queues it to the driver when dropped.
-2. **Preview**: the PPA scales the full frame to 640×480 into one of two 640×720 preview buffers
-   (black letterbox bars above and below). `p4_ui_present_camera()` swaps the LVGL canvas to that
-   buffer under the LVGL lock; the camera thread then fills the other one. If LVGL is busy for more
-   than 5 ms, that frame's preview update is skipped.
+2. **Preview**: the PPA scales the full frame to 640×480 into one of two preview buffers.
+   - The LVGL camera canvas is exactly this 640×480 image, centred in the 640×720 left column on a
+     black screen background.
+   - LVGL invalidates the whole canvas on every buffer swap, so keeping the canvas to the image area
+     limits per-frame re-rendering and rotation to image pixels.
+   - `p4_ui_present_camera()` swaps the canvas to the new buffer under the LVGL lock; the camera
+     thread then fills the other one.
+   - If LVGL is busy for more than 5 ms, that frame's preview update is skipped.
 3. **Inference hand-off**: the inference thread owns a single 640×480 RGB888 detector buffer. It
-   requests a frame by handing the buffer back; the camera fills it from the next frame. Inference
-   therefore never stalls the preview, always sees a frame at most one sensor period old, and is
-   capped at 10 Hz.
+   requests a frame by handing the buffer back.
+   - The camera fills it from the next frame's **preview**: a 640×480 → 640×480 pixel-format
+     conversion, about 19 ms. Re-scaling the 1280×960 sensor frame took about 95 ms.
+   - The conversion runs before the canvas swap, so LVGL never reads a buffer the PPA is writing.
+   - Inference therefore never stalls the preview, always sees a frame at most one sensor period
+     old, and is capped at 10 Hz.
+   - The sensor buffer is returned to the ISP only after the frame is fully processed. Returning it
+     earlier let the ISP stream the next 2.4 MB frame into PSRAM concurrently, which measurably
+     slowed every stage.
 4. **Detection**: ESP-DL `human_face_detect` (MSR proposals + MNP refinement) returns boxes and 5
    facial landmarks. Boxes are mapped into canvas coordinates and drawn as LVGL overlay objects.
 5. **Recognition**: for each face with landmarks, ESP-DL `human_face_recognition` aligns the face to
@@ -150,11 +160,22 @@ The two components must be upgraded together: `human_face_recognition` 0.3.x req
 
 | Stage | Time | Notes |
 |---|---|---|
-| Detection (MSR+MNP) | 19–23 ms | Espressif publishes about 17 ms |
-| Embedding (MFN, incl. alignment) | 181–195 ms | Espressif publishes about 96 ms; under investigation |
-| Camera pipeline | 7–9 fps | PPA preview and detector scaling, 80–95 ms each |
-| Inference rate | 3–4 /s | Limited by the camera rate |
-| Faces found | up to ~80% of frames | One person in front of the camera, indoor light |
+| Detection (MSR+MNP) | 19–40 ms | Espressif publishes about 17 ms; rises with PSRAM load and face candidates |
+| Embedding (MFN, incl. alignment) | 173–178 ms | Espressif publishes about 96 ms |
+| Camera pipeline | 9.4–9.7 fps | Preview PPA (1280×960 → 640×480) about 95 ms; detector PPA (from preview) about 19 ms |
+| Inference rate | 3.6–4.3 /s | Limited by the camera rate |
+| Faces found | up to ~70–80% of frames | One person in front of the camera, indoor light |
+
+**Bottleneck: PSRAM bandwidth.** The ISP (2.4 MB per frame), PPA, display scan-out, LVGL, and code
+running from PSRAM all share it. Measured evidence:
+- Pausing LVGL canvas updates cut PPA time by 15–30 ms.
+- The 800×640 sensor mode reached 21 fps, but it is a centre crop (zoomed in), so it is not used.
+- Returning camera buffers early slowed every stage.
+
+Remaining levers:
+- YUV420 ISP output (25% less frame data);
+- a lower display refresh rate;
+- ESP-IDF 5.5.x cache/PSRAM fixes.
 
 These numbers need the ESP-DL-oriented settings in `sdkconfig.defaults`:
 - `CONFIG_SPIRAM_XIP_FROM_PSRAM` (run code and models from PSRAM);
@@ -211,7 +232,7 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 ├── crates/
 │   └── biometric-core/               # Hardware-independent logic, host unit tests
 │       └── src/
-│           ├── geometry.rs           # PixelFormat, Rect, ImageRef, crop / letterbox math
+│           ├── geometry.rs           # PixelFormat, Rect, ImageRef, crop / fit / mapping math
 │           ├── contract.rs           # Model contract (input format, landmarks, embedding size)
 │           ├── matching.rs           # GroupMember, best_match, cosine similarity
 │           └── stats.rs              # Allocation-free latency statistics

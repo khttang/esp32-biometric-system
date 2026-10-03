@@ -171,8 +171,8 @@ mod tests {
     }
 
     #[test]
-    fn preview_crop_for_ov5647_into_left_half() {
-        // The firmware's actual configuration: 1280×960 sensor → 640×720 viewport.
+    fn crop_4_3_frame_to_taller_viewport() {
+        // A 1280×960 frame cropped (not letterboxed) to fill a 640×720 area.
         let crop = centered_aspect_crop(1280, 960, 640, 720);
         assert_eq!(
             crop,
@@ -208,8 +208,8 @@ mod tests {
     }
 
     #[test]
-    fn preview_fit_for_ov5647_into_left_half() {
-        // The firmware's actual configuration: whole 1280×960 frame letterboxed in 640×720.
+    fn fit_4_3_frame_into_taller_area_letterboxes() {
+        // A whole 1280×960 frame placed in a 640×720 area: bars above and below.
         assert_eq!(
             fit_rect(1280, 960, 640, 720),
             Rect {
@@ -219,6 +219,21 @@ mod tests {
                 h: 480
             }
         );
+    }
+
+    #[test]
+    fn firmware_canvas_is_the_full_sensor_view() {
+        // Firmware configuration: 1280×960 sensor → 640×480 canvas (the UI centres the canvas),
+        // and the 640×480 detector image maps 1:1 onto it for the face overlay.
+        let canvas = fit_rect(1280, 960, 640, 480);
+        assert_eq!(canvas, Rect::full(640, 480));
+        let face = Rect {
+            x: 100,
+            y: 50,
+            w: 80,
+            h: 90,
+        };
+        assert_eq!(map_rect(face, 640, 480, canvas), face);
     }
 
     #[test]
@@ -291,8 +306,8 @@ mod tests {
     }
 
     #[test]
-    fn map_detector_box_into_letterboxed_preview() {
-        // Firmware configuration: 640×480 detector image shown at (0,120) 640×480 in the canvas.
+    fn map_box_into_letterboxed_area() {
+        // A 640×480 image shown at (0,120) inside a 640×720 area.
         let preview = fit_rect(1280, 960, 640, 720);
         let face = Rect {
             x: 100,

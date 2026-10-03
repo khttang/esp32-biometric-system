@@ -126,7 +126,10 @@ compiled into the firmware.
 - Placeholder model, `ml/export/` and `tools/enroll_user.py` removed.
 
 **Follow-ups (own PRs):**
-- Camera pipeline throughput: about 8 fps, because each PPA scale takes 80–95 ms.
+- Camera pipeline throughput: about 8 fps, because each PPA scale takes 80–95 ms. *Partly addressed:*
+  - 9.4–9.7 fps, by building the detector image from the preview, sizing the canvas to the image,
+    and holding sensor buffers until a frame is processed.
+  - The remaining limit is PSRAM bandwidth (see README, Measured Performance).
 - Embedding latency: about 2× Espressif's figure.
 - ESP-IDF 5.5.5 plus the esp-idf-* 0.53/0.47/0.38 crates.
 
