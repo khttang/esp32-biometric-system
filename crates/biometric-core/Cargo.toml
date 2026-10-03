@@ -2,7 +2,7 @@
 name = "biometric-core"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.99"
 description = "Hardware-independent logic for the ESP32-P4 biometric firmware (host-testable)"
 
 [dependencies]
