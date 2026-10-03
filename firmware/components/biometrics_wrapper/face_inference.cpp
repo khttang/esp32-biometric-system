@@ -1,13 +1,14 @@
 // Face detection and embedding with Espressif's pretrained ESP-DL models, loaded from flash
 // partitions so they can be updated without reflashing the firmware.
 //
-//   face_msr   MSR proposal network        (human_face_detect_msr_s8_v1)
-//   face_mnp   MNP refinement + landmarks  (human_face_detect_mnp_s8_v1)
-//   face_feat  MobileFaceNet embedding     (human_face_feat_mfn_s8_v1)
+//   face_msr_a/b   MSR proposal network        (human_face_detect_msr_s8_v1)
+//   face_mnp_a/b   MNP refinement + landmarks  (human_face_detect_mnp_s8_v1)
+//   face_feat_a/b  MobileFaceNet embedding     (human_face_feat_mfn_s8_v1)
 //
-// The Rust side verifies each partition's manifest and SHA-256 before calling the init
-// functions here (firmware/src/models.rs); ESP-DL itself aborts on an unmappable partition and
-// does not check integrity. Partition images are built by crates/model-packer.
+// The Rust side chooses the slot of each model, verifies its manifest and SHA-256, and passes
+// the partition label to the init functions here (firmware/src/models.rs); ESP-DL itself
+// aborts on an unmappable partition and does not check integrity. Partition images are built
+// by crates/model-packer.
 //
 // The model setup below (pre/post-processing parameters, the two-stage MSR -> MNP flow) is
 // adapted from Espressif's human_face_detect 0.4.2 and human_face_recognition 0.3.2 components
@@ -33,17 +34,13 @@
 #include "dl_model_base.hpp"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "mbedtls/sha256.h"
 
 #include "biometrics_wrapper.h"
 
 namespace {
 
 constexpr const char *TAG = "p4_face";
-
-// Partition labels; must match crates/biometric-core/src/contract.rs and firmware/partitions.csv.
-constexpr const char *MSR_PARTITION = "face_msr";
-constexpr const char *MNP_PARTITION = "face_mnp";
-constexpr const char *FEAT_PARTITION = "face_feat";
 
 // Detection thresholds (Espressif's defaults for MSR+MNP).
 constexpr float MSR_SCORE_THR = 0.5f;
@@ -157,13 +154,58 @@ dl::image::img_t make_ppa_rgb888_image(const uint8_t *data, uint16_t width, uint
 
 extern "C" {
 
-int32_t p4_face_init_detector(void)
+int32_t p4_model_golden(const char *partition, uint8_t digest[32])
+{
+    if (!partition || !digest) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    dl::Model *model = new (std::nothrow) dl::Model(partition, fbs::MODEL_LOCATION_IN_FLASH_PARTITION);
+    if (!model) {
+        return ESP_ERR_NO_MEM;
+    }
+    // ESP-DL does not fail on data that is not a model; it just ends up with an empty graph.
+    if (model->get_inputs().empty() || model->get_outputs().empty()) {
+        ESP_LOGE(TAG, "%s does not hold a runnable model", partition);
+        delete model;
+        return ESP_ERR_INVALID_STATE;
+    }
+    // Fixed pseudo-random input (xorshift32), written as raw bytes whatever the tensor's type.
+    uint32_t state = 0x9E3779B9u;
+    for (auto &[name, tensor] : model->get_inputs()) {
+        auto *bytes = static_cast<uint8_t *>(tensor->data);
+        for (int i = 0, n = tensor->get_bytes(); i < n; ++i) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            bytes[i] = static_cast<uint8_t>(state);
+        }
+    }
+    model->run();
+
+    // Outputs are quantised integers, so the result is exact; std::map iterates in name order.
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    mbedtls_sha256_starts(&sha, 0);
+    for (auto &[name, tensor] : model->get_outputs()) {
+        mbedtls_sha256_update(&sha, reinterpret_cast<const uint8_t *>(name.data()), name.size());
+        mbedtls_sha256_update(&sha, static_cast<const uint8_t *>(tensor->data), tensor->get_bytes());
+    }
+    mbedtls_sha256_finish(&sha, digest);
+    mbedtls_sha256_free(&sha);
+    delete model;
+    return ESP_OK;
+}
+
+int32_t p4_face_init_detector(const char *msr_partition, const char *mnp_partition)
 {
     if (s_msr && s_mnp) {
         return ESP_OK;
     }
-    dl::Model *msr_model = load_model(MSR_PARTITION);
-    dl::Model *mnp_model = load_model(MNP_PARTITION);
+    if (!msr_partition || !mnp_partition) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    dl::Model *msr_model = load_model(msr_partition);
+    dl::Model *mnp_model = load_model(mnp_partition);
     Msr *msr = msr_model ? new (std::nothrow) Msr(msr_model) : nullptr;
     Mnp *mnp = mnp_model ? new (std::nothrow) Mnp(mnp_model) : nullptr;
     if (!msr || !mnp) {
@@ -183,16 +225,19 @@ int32_t p4_face_init_detector(void)
     }
     s_msr = msr;
     s_mnp = mnp;
-    ESP_LOGI(TAG, "Face detector loaded from %s + %s", MSR_PARTITION, MNP_PARTITION);
+    ESP_LOGI(TAG, "Face detector loaded from %s + %s", msr_partition, mnp_partition);
     return ESP_OK;
 }
 
-int32_t p4_face_init_embedder(void)
+int32_t p4_face_init_embedder(const char *partition)
 {
     if (s_feat) {
         return ESP_OK;
     }
-    dl::Model *model = load_model(FEAT_PARTITION);
+    if (!partition) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    dl::Model *model = load_model(partition);
     Mfn *feat = model ? new (std::nothrow) Mfn(model) : nullptr;
     if (!feat) {
         delete model;
@@ -200,7 +245,7 @@ int32_t p4_face_init_embedder(void)
         return ESP_ERR_NO_MEM;
     }
     s_feat = feat;
-    ESP_LOGI(TAG, "Face embedder loaded from %s (embedding length %d)", FEAT_PARTITION, s_feat->get_feat_len());
+    ESP_LOGI(TAG, "Face embedder loaded from %s (embedding length %d)", partition, s_feat->get_feat_len());
     return ESP_OK;
 }
 

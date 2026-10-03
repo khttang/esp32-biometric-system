@@ -18,7 +18,7 @@
 //! at most one sensor period old, the camera never waits for inference, and the PPA only does
 //! the detector downscale when someone will consume it.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
@@ -27,21 +27,21 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, ensure, Context, Result};
 use arc_swap::ArcSwap;
 use biometric_core::contract::{
-    DETECTOR_FORMAT, DETECTOR_HEIGHT, DETECTOR_WIDTH, EMBEDDING_DIM, FEATURE_MODEL_ID,
-    FEATURE_PARTITION, MNP_MODEL_ID, MNP_PARTITION, MSR_MODEL_ID, MSR_PARTITION,
+    DETECTOR_FORMAT, DETECTOR_HEIGHT, DETECTOR_WIDTH, EMBEDDING_DIM, FEATURE_MODEL, MNP_MODEL,
+    MSR_MODEL,
 };
 use biometric_core::enrollment::Enrollment;
 use biometric_core::geometry::{fit_rect, map_rect};
-use biometric_core::manifest::ModelManifest;
 use biometric_core::matching::{closest, GroupMember, MATCH_THRESHOLD};
 use biometric_core::stats::{LatencyStats, ScoreStats};
 use esp_idf_svc::hal::cpu::Core;
 use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::{error, info, warn};
 
 use crate::camera::Camera;
 use crate::ffi;
-use crate::models;
+use crate::models::ModelStore;
 use crate::ppa::{image_len, DmaBuf, ImageRef, PixelFormat, Ppa, Rect, Target};
 
 // Sensor stream; must match VideoConfig::SENSOR_* in biometrics_wrapper.cpp
@@ -107,7 +107,7 @@ pub struct Vision {
 }
 
 /// Starts the camera and inference threads.
-pub fn spawn(members: Arc<Roster>) -> Result<Vision> {
+pub fn spawn(members: Arc<Roster>, nvs: EspDefaultNvsPartition) -> Result<Vision> {
     let camera = Camera::take().context("camera handle already taken")?;
 
     // inference → camera: an empty detector buffer means "fill me from the next frame"
@@ -127,7 +127,7 @@ pub fn spawn(members: Arc<Roster>) -> Result<Vision> {
         camera_loop(camera, request_rx, frame_tx)
     })?;
     spawn_on_core1(c"inference", INFERENCE_STACK_SIZE, 3, move || {
-        inference_loop(frame_rx, request_tx, event_tx, command_rx, members)
+        inference_loop(frame_rx, request_tx, event_tx, command_rx, members, nvs)
     })?;
     Ok(Vision {
         events: event_rx,
@@ -303,27 +303,42 @@ fn inference_loop(
     events: SyncSender<InferenceEvent>,
     commands: Receiver<Command>,
     members: Arc<Roster>,
+    nvs: EspDefaultNvsPartition,
 ) {
-    // Each model loads only if its partition verifies, so a missing or corrupt model disables
-    // just its stage. This thread is the only user of the p4_face_* API.
-    // Safety: plain init calls; see biometrics_wrapper.h.
-    let detector_models = [(MSR_PARTITION, MSR_MODEL_ID), (MNP_PARTITION, MNP_MODEL_ID)];
-    if load_stage("detector", &detector_models, || unsafe {
-        ffi::p4_face_init_detector()
-    })
-    .is_none()
-    {
+    // Each model loads from the slot the store selects, and only if that slot verifies, so a
+    // missing or corrupt model disables just its stage. This thread is the only user of the
+    // p4_face_* API.
+    let store = match ModelStore::open(nvs) {
+        Ok(store) => store,
+        Err(e) => return error!("[Pipeline] face models unavailable: {e:#}"),
+    };
+    let detector = store
+        .select(&MSR_MODEL)
+        .zip(store.select(&MNP_MODEL))
+        .filter(|(msr, mnp)| {
+            // Safety: both partitions were verified; the labels are valid C strings.
+            let ret = unsafe {
+                ffi::p4_face_init_detector(msr.partition.as_ptr(), mnp.partition.as_ptr())
+            };
+            if ret != 0 {
+                error!("[Pipeline] detector init failed: {ret}");
+            }
+            ret == 0
+        });
+    if detector.is_none() {
         return error!("[Pipeline] face detection unavailable; preview continues without it");
     }
-    let embedder = load_stage(
-        "embedder",
-        &[(FEATURE_PARTITION, FEATURE_MODEL_ID)],
-        || unsafe { ffi::p4_face_init_embedder() },
-    )
-    .and_then(|mut manifests| manifests.pop());
+    let embedder = store.select(&FEATURE_MODEL).filter(|feature| {
+        // Safety: the partition was verified; the label is a valid C string.
+        let ret = unsafe { ffi::p4_face_init_embedder(feature.partition.as_ptr()) };
+        if ret != 0 {
+            error!("[Pipeline] embedder init failed: {ret}");
+        }
+        ret == 0
+    });
     // Model contract check: never compare embeddings of an unexpected length. `Some` holds
     // the feature model's release, which templates are bound to.
-    let model_version: Option<Arc<str>> = match &embedder {
+    let model_version: Option<Arc<str>> = match embedder.as_ref().map(|e| &e.manifest) {
         Some(manifest) => {
             // Safety: plain query, embedder is loaded.
             let len = unsafe { ffi::p4_face_embedding_len() };
@@ -500,32 +515,6 @@ fn log_stale_templates(members: &[Arc<GroupMember>], model_version: &str) {
             members.len()
         );
     }
-}
-
-/// Verifies every `(partition, model id)` a stage needs and, only if all are intact, loads the
-/// stage with `init`. Returns the verified manifests in the order given.
-fn load_stage(
-    stage: &str,
-    models: &[(&str, &str)],
-    init: impl FnOnce() -> i32,
-) -> Option<Vec<ModelManifest>> {
-    let mut manifests = Vec::with_capacity(models.len());
-    for &(partition, model_id) in models {
-        let label = CString::new(partition).expect("partition labels contain no NUL");
-        match models::verify(&label, model_id) {
-            Ok(manifest) => manifests.push(manifest),
-            Err(e) => {
-                error!("[Pipeline] {stage} not loaded: {e:#}");
-                return None;
-            }
-        }
-    }
-    let ret = init();
-    if ret != 0 {
-        error!("[Pipeline] {stage} init failed: {ret}");
-        return None;
-    }
-    Some(manifests)
 }
 
 /// Runs the face detector on the RGB888 detector image; returns the number of faces written.

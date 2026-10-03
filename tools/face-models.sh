@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Fetch, package and flash the face models into their flash partitions.
 #
-#   tools/face-models.sh fetch   # download Espressif's pinned model releases, verify, extract
-#   tools/face-models.sh pack    # build partition images (model + manifest) with model-packer
-#   tools/face-models.sh flash   # write the images with espflash (set ESPFLASH_PORT to choose a port)
-#   tools/face-models.sh all     # fetch + pack + flash
+#   tools/face-models.sh fetch          # download Espressif's pinned model releases, verify, extract
+#   tools/face-models.sh pack  [a|b]    # build partition images (model + manifest) with model-packer
+#   tools/face-models.sh flash [a|b]    # write the images with espflash (set ESPFLASH_PORT to choose a port)
+#   tools/face-models.sh all   [a|b]    # fetch + pack + flash
 #
-# Models are not part of the firmware build. Each lives in its own partition with a manifest
-# (model id, version, size, SHA-256) that the firmware verifies before loading it.
+# Models are not part of the firmware build. Each has two flash slots (a, the default, and b)
+# and a manifest (model id, version, size, SHA-256, golden) that the firmware verifies before
+# loading it. To update a model on a running device, write the new image to the slot that is
+# not in use: the firmware gives it a golden run at the next boot and switches only if it passes.
+#
+# Set NO_GOLDEN=1 to pack without goldens, e.g. to have the device compute and log them.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,12 +26,21 @@ RELEASES=(
   "human_face_recognition 0.3.2 fdab7b1c65a04aee41ffac103f73ec9074c393b31314c689acaf92e3505df8e9"
 )
 
-# Partition, model id (= .espdl file stem), release it comes from.
+# Partition (without the slot suffix), model id (= .espdl file stem), release it comes from, and
+# the golden: the SHA-256 of the model's outputs in the firmware's golden run, as logged by an
+# ESP32-P4 running this firmware's ESP-DL version (see README, Model Partitions).
 IMAGES=(
-  "face_msr human_face_detect_msr_s8_v1 human_face_detect 0.4.2"
-  "face_mnp human_face_detect_mnp_s8_v1 human_face_detect 0.4.2"
-  "face_feat human_face_feat_mfn_s8_v1 human_face_recognition 0.3.2"
+  "face_msr human_face_detect_msr_s8_v1 human_face_detect 0.4.2 f5cc3e078da10f69787d705548d8ff28d66034f5f8b36353715f113809ec9593"
+  "face_mnp human_face_detect_mnp_s8_v1 human_face_detect 0.4.2 9127698ed41b7b45e8aadab4b6049fcc5acccce2a4e89c310d33484b5d22aa56"
+  "face_feat human_face_feat_mfn_s8_v1 human_face_recognition 0.3.2 48fa61984e4bf6654ff9af55ba441d41addbaacfa6fe0d741dfb05afd9e1beeb"
 )
+
+slot_arg() {
+  case "${1:-a}" in
+    a|b) echo "${1:-a}" ;;
+    *) echo "slot must be a or b, not '$1'" >&2; exit 2 ;;
+  esac
+}
 
 sha256() {
   if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
@@ -51,7 +64,7 @@ fetch() {
     fi
     # Only the ESP32-P4 models that the firmware uses.
     for image in "${IMAGES[@]}"; do
-      read -r _ model image_component _ <<<"$image"
+      read -r _ model image_component _ _ <<<"$image"
       if [[ "$image_component" == "$component" ]]; then
         unzip -o -q -j "$archive" "models/p4/$model.espdl" -d "$MODELS/p4"
       fi
@@ -61,18 +74,25 @@ fetch() {
 }
 
 pack() {
+  local slot; slot="$(slot_arg "${1:-}")"
   for image in "${IMAGES[@]}"; do
-    read -r partition model component version <<<"$image"
+    read -r base model component version golden <<<"$image"
+    partition="${base}_${slot}"
+    golden_args=(--golden "$golden")
+    if [[ -n "${NO_GOLDEN:-}" ]]; then golden_args=(); fi
     # Run from the crate directory so rustup selects its pinned toolchain (rust-toolchain.toml).
     (cd "$PACKER_DIR" && cargo run --quiet --release -- \
       --input "$MODELS/p4/$model.espdl" --model "$model" --version "$component $version" \
-      --label "$partition" --partitions "$PARTITIONS" --out "$MODELS/$partition.bin")
+      --label "$partition" --partitions "$PARTITIONS" --out "$MODELS/$partition.bin" \
+      ${golden_args[@]+"${golden_args[@]}"})
   done
 }
 
 flash() {
+  local slot; slot="$(slot_arg "${1:-}")"
   for image in "${IMAGES[@]}"; do
-    read -r partition _ <<<"$image"
+    read -r base _ <<<"$image"
+    partition="${base}_${slot}"
     offset="$(awk -F, -v p="$partition" '$1 ~ "^"p"[[:space:]]*$" { gsub(/[[:space:]]/, "", $4); print $4 }' "$PARTITIONS")"
     if [[ -z "$offset" ]]; then
       echo "Partition $partition not found in $PARTITIONS" >&2
@@ -85,8 +105,8 @@ flash() {
 
 case "${1:-}" in
   fetch) fetch ;;
-  pack) pack ;;
-  flash) flash ;;
-  all) fetch && pack && flash ;;
-  *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  pack) pack "${2:-}" ;;
+  flash) flash "${2:-}" ;;
+  all) fetch && pack "${2:-}" && flash "${2:-}" ;;
+  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

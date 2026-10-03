@@ -24,19 +24,35 @@ pub const LANDMARK_COUNT: usize = 5;
 /// Length of the face embedding produced by the feature model.
 pub const EMBEDDING_DIM: usize = 512;
 
-/// Model partitions (one model each); must match `firmware/partitions.csv` and
-/// `face_inference.cpp`.
-pub const MSR_PARTITION: &str = "face_msr";
-pub const MNP_PARTITION: &str = "face_mnp";
-pub const FEATURE_PARTITION: &str = "face_feat";
+/// One face model: where its two flash slots are and which model they must hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelSpec {
+    /// NVS key of the model's activation record (see [`crate::activation`]).
+    pub key: &'static str,
+    /// Model identifier required in the slot's manifest (see [`crate::manifest`]); the
+    /// manifest's `version` identifies the specific release. It is the `.espdl` file stem in
+    /// Espressif's model components.
+    pub id: &'static str,
+    /// Partition labels of slots A and B; must match `firmware/partitions.csv`.
+    pub partitions: [&'static str; 2],
+}
+
+pub const MSR_MODEL: ModelSpec = ModelSpec {
+    key: "msr",
+    id: "human_face_detect_msr_s8_v1",
+    partitions: ["face_msr_a", "face_msr_b"],
+};
+pub const MNP_MODEL: ModelSpec = ModelSpec {
+    key: "mnp",
+    id: "human_face_detect_mnp_s8_v1",
+    partitions: ["face_mnp_a", "face_mnp_b"],
+};
+pub const FEATURE_MODEL: ModelSpec = ModelSpec {
+    key: "feat",
+    id: "human_face_feat_mfn_s8_v1",
+    partitions: ["face_feat_a", "face_feat_b"],
+};
 
 /// NVS partition holding the enrolled templates (see [`crate::template`]); must match
 /// `firmware/partitions.csv`.
 pub const TEMPLATE_PARTITION: &str = "templates";
-
-/// Model identifiers the firmware accepts in each partition's manifest
-/// (see [`crate::manifest`]); the manifest's `version` identifies the specific release.
-/// They are the `.espdl` file stems in Espressif's model components.
-pub const MSR_MODEL_ID: &str = "human_face_detect_msr_s8_v1";
-pub const MNP_MODEL_ID: &str = "human_face_detect_mnp_s8_v1";
-pub const FEATURE_MODEL_ID: &str = "human_face_feat_mfn_s8_v1";

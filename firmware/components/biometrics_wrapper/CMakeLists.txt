@@ -14,6 +14,7 @@ idf_component_register(
         esp_pm 
         hal
         lvgl
+        mbedtls
         # Managed components
         espressif__esp-dl 
         espressif__esp_video

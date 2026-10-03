@@ -1,17 +1,21 @@
 # ESP32-P4-NANO, 16 MB flash. Partition table at 0x8000 (default), written by espflash.
-# App slots hold the firmware only (~3.6 MB). Face models live in their own partitions (one model
-# each, plus a manifest in the last 4 KiB) so they can be updated without reflashing the app; see
-# crates/model-packer. ESP-DL memory-maps model partitions, so they must be 64 KiB aligned.
+# App slots hold the firmware only (~3.7 MB). Each face model has two slots (A/B) of its own, so
+# a new model can be written next to the one in use and activated without reflashing the app;
+# every slot holds one model plus a manifest in its last 4 KiB (see crates/model-packer).
+# ESP-DL memory-maps model partitions, so they must be 64 KiB aligned.
 # Enrolled face templates are NVS blobs in `templates` (its own NVS partition, so erasing or
 # resizing the system `nvs` never touches them).
-# Name,    Type, SubType, Offset,   Size
+# Name,     Type, SubType, Offset,   Size
 nvs,       data, nvs,     0x9000,   0x10000
 otadata,   data, ota,     0x19000,  0x2000
 phy_init,  data, phy,     0x1B000,  0x1000
 ota_0,     app,  ota_0,   0x20000,  0x500000
 ota_1,     app,  ota_1,   0x520000, 0x500000
-face_msr,  data, spiffs,  0xA20000, 0x20000
-face_mnp,  data, spiffs,  0xA40000, 0x30000
-face_feat, data, spiffs,  0xA70000, 0x200000
-templates, data, nvs,     0xC70000, 0x40000
-storage,   data, spiffs,  0xCB0000, 0x350000
+face_msr_a,  data, spiffs,  0xA20000, 0x20000
+face_mnp_a,  data, spiffs,  0xA40000, 0x30000
+face_feat_a, data, spiffs,  0xA70000, 0x200000
+templates,   data, nvs,     0xC70000, 0x40000
+face_msr_b,  data, spiffs,  0xCB0000, 0x20000
+face_mnp_b,  data, spiffs,  0xCD0000, 0x30000
+face_feat_b, data, spiffs,  0xD00000, 0x200000
+storage,     data, spiffs,  0xF00000, 0x100000
