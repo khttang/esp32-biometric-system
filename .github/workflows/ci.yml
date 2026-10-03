@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    name: biometric-core (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/biometric-core
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/biometric-core
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test
+
+  firmware:
+    name: firmware (fmt, clippy, ESP32-P4 release build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: firmware
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # .cargo/config.toml sets a macOS Python path under [env]; Cargo's [env] does not
+      # override variables already present in the environment, so this takes precedence.
+      - name: Point ESP-IDF tooling at the runner's Python
+        run: echo "PYTHON=$(command -v python3)" >> "$GITHUB_ENV"
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+
+      - name: Cache ldproxy
+        id: ldproxy-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/ldproxy
+          key: ldproxy-${{ runner.os }}-v1
+
+      - name: Install ldproxy
+        if: steps.ldproxy-cache.outputs.cache-hit != 'true'
+        run: cargo install ldproxy --locked
+
+      # ESP-IDF, its Python env and the RISC-V toolchain (~5 GB) are installed by esp-idf-sys
+      # into firmware/.embuild on the first build.
+      - name: Cache ESP-IDF (.embuild)
+        uses: actions/cache@v4
+        with:
+          path: firmware/.embuild
+          key: embuild-${{ runner.os }}-${{ hashFiles('firmware/.cargo/config.toml', 'firmware/rust-toolchain.toml') }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firmware
+          cache-on-failure: true
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --release -- -D warnings
+
+      - name: Release build
+        run: cargo build --release
