@@ -28,7 +28,7 @@ Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP
 | Vision pipeline (camera → PPA → preview / inference threads) | Working |
 | Face detection | Working: ESP-DL MSR+MNP models, green boxes drawn over the preview |
 | Face embedding | Working: ESP-DL MobileFaceNet, 512-d, aligned from 5 landmarks |
-| Model updates | Models live in their own flash partitions with a verified manifest; update them without reflashing the firmware ([Model Partitions](#model-partitions)) |
+| Model updates | Each model has two flash slots (A/B) with a verified manifest. A new image written to the standby slot is activated only after a golden run passes, and the previous image is kept for rollback; no firmware reflash ([Model Partitions](#model-partitions)) |
 | Enrollment | On-device: the admin view on the touch panel enrolls the face in view and deletes members; templates persist in flash ([Enrollment & Templates](#enrollment--templates)) |
 | Matching | Cosine similarity against enrolled templates of the same model release. Enroll → reboot → recognise → delete works on the board. The threshold (0.5) is Espressif's default and has **not** been measured on a test set yet |
 | Template download | Not yet (M4): the HTTP fetch code is not triggered by the state machine |
@@ -38,6 +38,7 @@ Known issues:
 - **Camera pipeline runs at about 9–10 fps, not 45.** Scaling the 1280×960 frame for the preview takes about 95 ms. The system is PSRAM-bandwidth-bound: the ISP, PPA, display scan-out, LVGL and code all share it (see [Measured Performance](#measured-performance-esp32-p4-rev-13-360-mhz)).
 - **Embedding takes about 187 ms**, against Espressif's published 96 ms for MFN on the P4.
 - Occasional full-screen white/cyan flashes (seen on older builds too; suspected display cable or power).
+- **Embeddings are slightly perturbed when the inference thread is preempted.** Running the feature model on the same input gives identical output at top task priority, but output that differs by a few quantisation steps when the camera thread preempts the run. The cause is not known yet (it looks like CPU state that is not preserved across a context switch). It affects every embedding computed at normal priority; its effect on match scores has not been measured.
 - Deep-sleep wake pins don't match the admin button (see [Power](#power--deep-sleep)).
 - **Templates are stored unencrypted** and the admin view is open to anyone at the device (see [Enrollment & Templates](#enrollment--templates)).
 
@@ -165,7 +166,7 @@ partitions with our own labels.
 
 ### Model Partitions
 
-Each model lives in its own flash partition, so a model update needs no firmware rebuild:
+Each model lives in flash partitions of its own, so a model update needs no firmware rebuild:
 
 ```text
 offset 0                                    size - 4096           size
@@ -173,37 +174,88 @@ offset 0                                    size - 4096           size
 ```
 
 - **Manifest:** in the partition's last 4 KiB sector:
-  `{"format":1,"model":"human_face_feat_mfn_s8_v1","version":"human_face_recognition 0.3.2","size":1295200,"sha256":"…"}`.
-  The `version` will be recorded with enrolled templates (M2), so templates are only compared with
-  embeddings from the same model.
+  `{"format":2,"model":"human_face_feat_mfn_s8_v1","version":"human_face_recognition 0.3.2","size":1295200,"sha256":"…","golden_sha256":"…"}`.
+  The `version` is recorded with enrolled templates, so templates are only compared with
+  embeddings from the same model. Format 1 manifests (no `golden_sha256`) are still accepted.
 - **Verify before load:** at startup the inference thread memory-maps each partition and checks
   that the manifest names the expected model, the size fits, and the data's SHA-256 matches. Only
   then does ESP-DL load it.
   - ESP-DL itself aborts the chip on an unmappable partition and has no integrity check.
-  - Verification takes 22 ms (MSR), 32 ms (MNP) and 376 ms (MobileFaceNet, 1.3 MB).
-- **Failure handling, tested on the device:**
-
-  | Partition state | Result |
-  |---|---|
-  | Embedder data corrupted (one flipped bit) | `model data does not match the manifest's SHA-256`; recognition disabled, detection keeps running |
-  | Detector partition erased | `no manifest`; detection disabled, the camera preview keeps running |
-
-  The board never crashes or boot-loops because of a model partition.
+  - Verification takes 22 ms (MSR), 32 ms (MNP) and 380 ms (MobileFaceNet, 1.3 MB) per slot.
+    Both slots of every model are verified at each boot, about 0.9 s in total when all are filled.
+- **A model can never take the device down:** if neither slot of a model holds a usable image,
+  only the stage that needs it is disabled. Tested on the device with the single-slot layout: a
+  corrupted embedder left detection running, and an erased detector left the preview running.
 - **Single source of truth:** the format lives in `biometric-core::manifest`. It is shared by the
   firmware (`firmware/src/models.rs`) and the host packer (`crates/model-packer`), with host tests
   for every failure mode.
 
+#### A/B Slots, Golden Run and Rollback
+
+Every model has two slots (`face_msr_a`/`_b`, `face_mnp_a`/`_b`, `face_feat_a`/`_b`). One is
+active; an update is written to the other, the standby slot. Nothing else has to be told: at boot
+the firmware sees an image in the standby slot that it has not evaluated and gives it a trial.
+
+1. **Golden run.** The candidate is loaded, run once on a fixed pseudo-random input, and the
+   SHA-256 of its output tensors is compared with the manifest's `golden_sha256`. The SHA-256 of
+   the file proves the bytes are intact; the golden run shows that *this firmware's* ESP-DL build
+   can load the model and computes what the publisher's did (it would catch a model that needs
+   operators or memory the firmware lacks).
+2. **Pass:** the candidate becomes the active slot. The old image stays in the other slot as the
+   *previous* image.
+3. **Fail** (digest differs, no golden, or the data is not a runnable model): the candidate is
+   marked *rejected* and never tried again; the active slot stays in use.
+4. **Rollback:** if the active slot later fails verification, the firmware switches back to the
+   previous image. It never falls back to a rejected one.
+5. **Crash protection:** the state is written to NVS *before* the golden run. If the device
+   resets during a trial, the next boot sees the marker; after two unfinished trials of the same
+   image it is rejected. Two attempts are allowed so that a power cut does not condemn a good
+   model.
+
+The state per model (active slot, the verdict on the standby image, the trial marker) is a 69-byte
+record in the `models` NVS namespace. The decision logic is `biometric_core::activation`, a pure
+state machine with host tests; `firmware/src/models.rs` feeds it and runs the trial. An image is
+identified by a hash over its manifest fields, so the same model repackaged with another version
+or golden counts as a new image, and re-writing an identical image does nothing.
+
+Tested on the device (feature model unless noted):
+
+| Situation | Result |
+|---|---|
+| Upgrade from the single-slot layout, standby slots empty | Slot A in use, no reflash of the models needed |
+| New images with goldens written to slot B (all three models) | Golden runs pass (59 / 54 / 355 ms); slot B active; no trial on later boots |
+| Image without a golden in the standby slot | Not activated; the log gives the digest this device computes |
+| Image with a wrong golden | `golden mismatch`; rejected; not retried on the next boot |
+| Random data with a valid manifest and SHA-256 | `does not hold a runnable model`; rejected (ESP-DL did not crash) |
+| Active slot corrupted (4 KiB overwritten) | `model data does not match the manifest's SHA-256`; rolled back to the previous image in slot A |
+| Identical image written to the standby slot | Nothing happens |
+
+Not tested on the device: a reset in the middle of a trial (covered by host tests only), and a
+switch to a genuinely different model (only Espressif's one release of each was available, so the
+"new" images differed in version label and golden only).
+
+**The golden is exact and belongs to a firmware generation.** Outputs are quantised integers, so
+the digest is compared bit for bit. It must come from a device running the same ESP-DL version;
+after an ESP-DL upgrade the goldens of the pinned models have to be re-measured. The golden run
+executes at the highest task priority, because a preempted run of the feature model is not
+repeatable (see Known issues).
+
 Updating models:
 
 ```sh
-tools/face-models.sh fetch   # download Espressif's pinned releases, check their SHA-256, extract
-tools/face-models.sh pack    # build models/face_*.bin partition images (model-packer)
-tools/face-models.sh flash   # espflash write-bin each image at its partition offset
-tools/face-models.sh all     # all three steps
+tools/face-models.sh fetch      # download Espressif's pinned releases, check their SHA-256, extract
+tools/face-models.sh pack  b    # build models/face_*_b.bin partition images (model-packer)
+tools/face-models.sh flash b    # espflash write-bin each image at its partition offset
+tools/face-models.sh all        # all three steps; the slot defaults to a
 ```
 
+To publish a model of your own, get its golden from a device: pack it without `--golden`
+(`NO_GOLDEN=1` with the script), write it to the standby slot, and boot. The log shows
+`image has no golden and is not activated; this device computes <digest>`. Pack it again with
+`--golden <digest>`.
+
 Model files are not committed: `models/` is gitignored and the releases are pinned by SHA-256 in
-the script.
+the script, together with their goldens.
 
 ### Enrollment & Templates
 
@@ -344,8 +396,9 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │   ├── biometric-core/               # Hardware-independent logic, host unit tests
 │   │   └── src/
 │   │       ├── geometry.rs           # PixelFormat, Rect, ImageRef, crop / fit / mapping math
-│   │       ├── contract.rs           # Model contract (input, partitions, model ids, embedding size)
+│   │       ├── contract.rs           # Model contract (input, model ids and slots, embedding size)
 │   │       ├── manifest.rs           # Model partition image format: build + verify
+│   │       ├── activation.rs         # A/B slot activation and rollback state machine
 │   │       ├── matching.rs           # GroupMember, model-version-aware matching, cosine similarity
 │   │       ├── template.rs           # Template format v1: encode / decode one stored member
 │   │       ├── enrollment.rs         # Sample accumulator, member ids / names / slots
@@ -374,7 +427,7 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │       ├── ui.rs                     # Control panel: status line, admin view events
 │       ├── pipeline.rs               # Camera + inference threads (Core 1)
 │       ├── camera.rs                 # V4L2 frame lifetime (RAII)
-│       ├── models.rs                 # Verify model partitions before loading
+│       ├── models.rs                 # Verify model slots, golden run, choose the active slot
 │       ├── ppa.rs                    # PPA client, DMA buffers
 │       ├── audio_worker.rs           # I2S mic capture thread
 │       ├── speaker.rs                # I2S speaker output (chime)
@@ -393,16 +446,20 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 | phy_init | data/phy | `0x1B000` | 4 KB |
 | ota_0 | app | `0x20000` | 5 MB |
 | ota_1 | app | `0x520000` | 5 MB |
-| face_msr | data | `0xA20000` | 128 KB (MSR model, 61 KB) |
-| face_mnp | data | `0xA40000` | 192 KB (MNP model, 130 KB) |
-| face_feat | data | `0xA70000` | 2 MB (MobileFaceNet, 1.3 MB) |
+| face_msr_a | data | `0xA20000` | 128 KB (MSR model, 61 KB) |
+| face_mnp_a | data | `0xA40000` | 192 KB (MNP model, 130 KB) |
+| face_feat_a | data | `0xA70000` | 2 MB (MobileFaceNet, 1.3 MB) |
 | templates | data/nvs | `0xC70000` | 256 KB (enrolled templates, up to 32 × 2.1 KB) |
-| storage | data/spiffs | `0xCB0000` | 3.31 MB |
+| face_msr_b | data | `0xCB0000` | 128 KB |
+| face_mnp_b | data | `0xCD0000` | 192 KB |
+| face_feat_b | data | `0xD00000` | 2 MB |
+| storage | data/spiffs | `0xF00000` | 1 MB (unused) |
 
 The partition table lives at the default `0x8000`, where `espflash` writes it and the app reads it.
 - The app image is about 3.6 MB, 69% of a slot.
 - Model partitions are 64 KiB aligned, because ESP-DL memory-maps them.
-- `storage` leaves room to carve out M3b's A/B model slots without moving the app.
+- The A slots and `templates` kept their offsets when the B slots were added, so a device with
+  the earlier single-slot layout keeps its models and enrollments.
 
 ---
 

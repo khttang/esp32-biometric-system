@@ -198,7 +198,7 @@ Enroll and recognise people locally, with no server.
 - The display showed every frame about 150 px off, which made the first version of the touch
   panel unusable. Fixed separately by using the HX8394 driver's DSI timing.
 
-### ⬜ M3b: A/B Model Slots, Validation Run, Rollback
+### ✅ M3b: A/B Model Slots, Validation Run, Rollback
 
 - Two slots per model (carved from `storage`), with an NVS pointer to the active slot.
 - Before switching to a new model, run it on a golden input and compare the output with the
@@ -209,12 +209,39 @@ Enroll and recognise people locally, with no server.
 - Host tests for the activation and rollback state machine.
 - On-board: swap models without reflashing the app, and fall back when a new model fails validation.
 
+**Outcome:**
+- `biometric-core::activation`: a pure state machine (active slot, verdict on the standby image,
+  trial marker) with host tests for activation, rejection, rollback, interrupted trials and the
+  NVS record.
+- Manifest format 2 adds `golden_sha256`; format 1 is still read. `model-packer --golden`.
+- The golden run feeds the model a fixed pseudo-random input and hashes its output tensors, so
+  it works for any model without model-specific test data. The expected digest ships in the
+  manifest and is obtained from a device (the firmware logs it for an image without one).
+- The state is saved to NVS before a trial, so a model that resets the chip is rejected after
+  two unfinished trials.
+- The boot log names the slot and version in use for each model.
+- On the board: all three models switched to slot B after passing their golden runs; a wrong
+  golden, a missing golden and random data were rejected; a corrupted active slot rolled back to
+  the previous image. See the README for the full table.
+
+**Not done:**
+- A reset in the middle of a trial was not provoked on the board (host tests only): the random
+  "model" that was expected to crash ESP-DL was rejected cleanly instead.
+- No genuinely different model was available, so the images that were swapped differed in
+  version label and golden only.
+
+**Found along the way (own PR):**
+- The feature model's output is not repeatable when the inference thread is preempted: the same
+  input gives the same output at top priority, and outputs a few quantisation steps apart when
+  the camera thread interrupts the run. Every embedding computed at normal priority is affected.
+  The golden run works around it by running unpreempted; the cause still has to be found.
+
 ### ⬜ M4: Network Sync & Remote Model Updates
 
 Operate a fleet.
 
 - Template sync from a server (versioned, incremental) over Ethernet; the server is the source of truth.
-- Remote model updates driven by device-management shared attributes (ThingsBoard client from git history, revisited): download, hash/signature verification, then the M3 activation flow.
+- Remote model updates driven by device-management shared attributes (ThingsBoard client from git history, revisited): download, hash/signature verification, then the M3b activation flow.
 - Flash/NVS encryption for templates and secrets.
 - Documented trust model: who signs models, and how devices get keys.
 
