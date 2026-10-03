@@ -3,6 +3,7 @@
 //! Nothing in here touches ESP-IDF, so it builds and tests on the host:
 //! `cd crates/biometric-core && cargo test`
 
+pub mod activation;
 pub mod contract;
 pub mod enrollment;
 pub mod geometry;

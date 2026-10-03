@@ -136,17 +136,42 @@ storage,  data, spiffs,  0xC60000, 3712K
     #[test]
     fn reads_the_firmware_partition_table() {
         let csv = include_str!("../../../firmware/partitions.csv");
-        use biometric_core::contract::{FEATURE_PARTITION, MNP_PARTITION, MSR_PARTITION};
+        use biometric_core::contract::{FEATURE_MODEL, MNP_MODEL, MSR_MODEL};
         // Model partitions are memory-mapped by ESP-DL, which needs 64 KiB alignment.
-        for label in [MSR_PARTITION, MNP_PARTITION, FEATURE_PARTITION] {
-            let p = find(csv, label).unwrap();
-            assert_eq!(
-                p.offset % 0x10000,
-                0,
-                "{} offset not 64 KiB aligned",
-                p.name
-            );
-            assert_eq!(p.size % 0x10000, 0, "{} size not 64 KiB aligned", p.name);
+        for model in [MSR_MODEL, MNP_MODEL, FEATURE_MODEL] {
+            let [a, b] = model.partitions.map(|label| find(csv, label).unwrap());
+            assert_eq!(a.size, b.size, "{} slots differ in size", model.key);
+            for p in [a, b] {
+                assert_eq!(
+                    p.offset % 0x10000,
+                    0,
+                    "{} offset not 64 KiB aligned",
+                    p.name
+                );
+                assert_eq!(p.size % 0x10000, 0, "{} size not 64 KiB aligned", p.name);
+            }
         }
+    }
+
+    #[test]
+    fn firmware_partitions_do_not_overlap_and_fit_the_flash() {
+        let csv = include_str!("../../../firmware/partitions.csv");
+        let mut all: Vec<Partition> = csv
+            .lines()
+            .filter_map(|line| line.split('#').next()?.split(',').next().map(str::trim))
+            .filter(|name| !name.is_empty())
+            .map(|name| find(csv, name).unwrap())
+            .collect();
+        all.sort_by_key(|p| p.offset);
+        for pair in all.windows(2) {
+            assert!(
+                pair[0].offset + pair[0].size <= pair[1].offset,
+                "{} overlaps {}",
+                pair[0].name,
+                pair[1].name
+            );
+        }
+        let last = all.last().unwrap();
+        assert!(last.offset + last.size <= 16 * 1024 * 1024, "past 16 MB");
     }
 }

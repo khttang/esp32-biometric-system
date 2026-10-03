@@ -21,8 +21,10 @@ use sha2::{Digest, Sha256};
 /// Size of the trailing sector that holds the manifest (one flash erase sector).
 pub const MANIFEST_SECTOR_SIZE: usize = 4096;
 
-/// Manifest layout version understood by this firmware.
-pub const MANIFEST_FORMAT: u32 = 1;
+/// Manifest layout version written by [`build_image`]. Format 2 added `golden_sha256`.
+pub const MANIFEST_FORMAT: u32 = 2;
+/// Oldest layout version still accepted (a format 1 manifest is a format 2 one without a golden).
+pub const MIN_MANIFEST_FORMAT: u32 = 1;
 
 /// Value of erased NOR flash.
 const ERASED: u8 = 0xFF;
@@ -41,6 +43,37 @@ pub struct ModelManifest {
     pub size: u32,
     /// Lower-case hex SHA-256 of the model data.
     pub sha256: String,
+    /// Lower-case hex SHA-256 the model's outputs must have in the firmware's golden run
+    /// (`firmware/src/models.rs`). A new image without one is never activated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golden_sha256: Option<String>,
+}
+
+impl ModelManifest {
+    /// Identifies this exact image: a SHA-256 over the manifest, which in turn covers the
+    /// model data's hash, the version and the golden. Repackaging the same model data with a
+    /// different version or golden therefore counts as a new image.
+    pub fn image_id(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        for field in [
+            self.model.as_bytes(),
+            self.version.as_bytes(),
+            self.sha256.as_bytes(),
+            self.golden_sha256.as_deref().unwrap_or("").as_bytes(),
+        ] {
+            // Length-prefixed, so moving bytes between fields changes the id.
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field);
+        }
+        hasher.finalize().into()
+    }
+
+    /// The golden digest, if the manifest has one. [`verify`] has already checked its syntax.
+    pub fn golden(&self) -> Option<[u8; 32]> {
+        self.golden_sha256
+            .as_deref()
+            .and_then(|hex| decode_hex_digest(hex).ok())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,7 +96,7 @@ pub enum ManifestError {
         size: u64,
         capacity: usize,
     },
-    /// The `sha256` field is not 64 hex characters.
+    /// `sha256` or `golden_sha256` is not 64 hex characters.
     InvalidDigest,
     /// The model data does not match the manifest's SHA-256.
     HashMismatch,
@@ -87,7 +120,8 @@ impl fmt::Display for ManifestError {
             Self::UnsupportedFormat(v) => {
                 write!(
                     f,
-                    "unsupported manifest format {v} (expected {MANIFEST_FORMAT})"
+                    "unsupported manifest format {v} \
+                     (expected {MIN_MANIFEST_FORMAT}..={MANIFEST_FORMAT})"
                 )
             }
             Self::WrongModel { expected, found } => {
@@ -96,7 +130,7 @@ impl fmt::Display for ManifestError {
             Self::SizeOutOfRange { size, capacity } => {
                 write!(f, "model size {size} is outside 1..={capacity} bytes")
             }
-            Self::InvalidDigest => write!(f, "sha256 must be 64 hex characters"),
+            Self::InvalidDigest => write!(f, "digests must be 64 hex characters"),
             Self::HashMismatch => write!(f, "model data does not match the manifest's SHA-256"),
             Self::ManifestTooLarge { len } => {
                 write!(
@@ -132,7 +166,7 @@ pub fn read_manifest(partition: &[u8]) -> Result<ModelManifest, ManifestError> {
     }
     let manifest: ModelManifest = serde_json::from_slice(&sector[..end])
         .map_err(|e| ManifestError::Malformed(e.to_string()))?;
-    if manifest.format != MANIFEST_FORMAT {
+    if !(MIN_MANIFEST_FORMAT..=MANIFEST_FORMAT).contains(&manifest.format) {
         return Err(ManifestError::UnsupportedFormat(manifest.format));
     }
     Ok(manifest)
@@ -156,6 +190,9 @@ pub fn verify(partition: &[u8], expected_model: &str) -> Result<ModelManifest, M
         });
     }
     let expected_digest = decode_hex_digest(&manifest.sha256)?;
+    if let Some(golden) = &manifest.golden_sha256 {
+        decode_hex_digest(golden)?;
+    }
     if Sha256::digest(&partition[..size]).as_slice() != expected_digest {
         return Err(ManifestError::HashMismatch);
     }
@@ -167,6 +204,7 @@ pub fn build_image(
     model_data: &[u8],
     model: &str,
     version: &str,
+    golden: Option<&[u8; 32]>,
     partition_len: usize,
 ) -> Result<Vec<u8>, ManifestError> {
     let capacity = data_capacity(partition_len)?;
@@ -185,6 +223,7 @@ pub fn build_image(
             capacity,
         })?,
         sha256: encode_hex(&Sha256::digest(model_data)),
+        golden_sha256: golden.map(|digest| encode_hex(digest)),
     };
     let json =
         serde_json::to_vec(&manifest).map_err(|e| ManifestError::Malformed(e.to_string()))?;
@@ -198,7 +237,8 @@ pub fn build_image(
     Ok(image)
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
+/// Lower-case hex of `bytes`.
+pub fn encode_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
@@ -208,7 +248,8 @@ fn encode_hex(bytes: &[u8]) -> String {
     s
 }
 
-fn decode_hex_digest(hex: &str) -> Result<[u8; 32], ManifestError> {
+/// Parses a 64-character hex SHA-256.
+pub fn decode_hex_digest(hex: &str) -> Result<[u8; 32], ManifestError> {
     let bytes = hex.as_bytes();
     if bytes.len() != 64 {
         return Err(ManifestError::InvalidDigest);
@@ -239,7 +280,69 @@ mod tests {
     }
 
     fn image() -> Vec<u8> {
-        build_image(&model_data(), MODEL, VERSION, PARTITION).unwrap()
+        build_image(&model_data(), MODEL, VERSION, None, PARTITION).unwrap()
+    }
+
+    const GOLDEN: [u8; 32] = [0xAB; 32];
+
+    #[test]
+    fn golden_round_trips_and_is_optional() {
+        assert_eq!(verify(&image(), MODEL).unwrap().golden(), None);
+        let img = build_image(&model_data(), MODEL, VERSION, Some(&GOLDEN), PARTITION).unwrap();
+        let m = verify(&img, MODEL).unwrap();
+        assert_eq!(m.format, MANIFEST_FORMAT);
+        assert_eq!(m.golden_sha256.as_deref(), Some("ab".repeat(32).as_str()));
+        assert_eq!(m.golden(), Some(GOLDEN));
+    }
+
+    #[test]
+    fn format_1_manifest_without_golden_is_still_accepted() {
+        let data = model_data();
+        let mut img = vec![0xFF; PARTITION];
+        img[..data.len()].copy_from_slice(&data);
+        let json = format!(
+            r#"{{"format":1,"model":"{MODEL}","version":"v","size":{},"sha256":"{}"}}"#,
+            data.len(),
+            encode_hex(&Sha256::digest(&data))
+        );
+        let at = PARTITION - MANIFEST_SECTOR_SIZE;
+        img[at..at + json.len()].copy_from_slice(json.as_bytes());
+        assert_eq!(verify(&img, MODEL).unwrap().golden(), None);
+    }
+
+    #[test]
+    fn malformed_golden_is_rejected() {
+        let mut m = verify(&image(), MODEL).unwrap();
+        m.golden_sha256 = Some("abc".into());
+        let mut img = image();
+        let at = PARTITION - MANIFEST_SECTOR_SIZE;
+        let json = serde_json::to_vec(&m).unwrap();
+        img[at..].fill(0xFF);
+        img[at..at + json.len()].copy_from_slice(&json);
+        assert_eq!(verify(&img, MODEL), Err(ManifestError::InvalidDigest));
+    }
+
+    #[test]
+    fn image_id_changes_with_data_version_and_golden() {
+        let base = verify(&image(), MODEL).unwrap();
+        assert_eq!(base.image_id(), verify(&image(), MODEL).unwrap().image_id());
+
+        let other_version =
+            build_image(&model_data(), MODEL, "another release", None, PARTITION).unwrap();
+        let with_golden =
+            build_image(&model_data(), MODEL, VERSION, Some(&GOLDEN), PARTITION).unwrap();
+        let mut data = model_data();
+        data[0] ^= 1;
+        let other_data = build_image(&data, MODEL, VERSION, None, PARTITION).unwrap();
+
+        let ids: Vec<_> = [other_version, with_golden, other_data]
+            .iter()
+            .map(|img| verify(img, MODEL).unwrap().image_id())
+            .collect();
+        for (i, id) in ids.iter().enumerate() {
+            assert_ne!(*id, base.image_id());
+            assert!(ids[..i].iter().all(|earlier| earlier != id));
+        }
     }
 
     #[test]
@@ -313,12 +416,20 @@ mod tests {
     #[test]
     fn unsupported_format_is_rejected() {
         let img = with_manifest(&format!(
-            r#"{{"format":2,"model":"{MODEL}","version":"v","size":1,"sha256":"{}"}}"#,
+            r#"{{"format":3,"model":"{MODEL}","version":"v","size":1,"sha256":"{}"}}"#,
             "0".repeat(64)
         ));
         assert_eq!(
             read_manifest(&img),
-            Err(ManifestError::UnsupportedFormat(2))
+            Err(ManifestError::UnsupportedFormat(3))
+        );
+        let img = with_manifest(&format!(
+            r#"{{"format":0,"model":"{MODEL}","version":"v","size":1,"sha256":"{}"}}"#,
+            "0".repeat(64)
+        ));
+        assert_eq!(
+            read_manifest(&img),
+            Err(ManifestError::UnsupportedFormat(0))
         );
     }
 
@@ -368,15 +479,15 @@ mod tests {
     fn build_rejects_models_that_do_not_fit() {
         let too_big = vec![0u8; PARTITION - MANIFEST_SECTOR_SIZE + 1];
         assert!(matches!(
-            build_image(&too_big, MODEL, VERSION, PARTITION),
+            build_image(&too_big, MODEL, VERSION, None, PARTITION),
             Err(ManifestError::SizeOutOfRange { .. })
         ));
         assert!(matches!(
-            build_image(&[], MODEL, VERSION, PARTITION),
+            build_image(&[], MODEL, VERSION, None, PARTITION),
             Err(ManifestError::SizeOutOfRange { .. })
         ));
         assert_eq!(
-            build_image(&[1], MODEL, VERSION, MANIFEST_SECTOR_SIZE),
+            build_image(&[1], MODEL, VERSION, None, MANIFEST_SECTOR_SIZE),
             Err(ManifestError::PartitionTooSmall {
                 partition_len: MANIFEST_SECTOR_SIZE
             })
@@ -386,7 +497,7 @@ mod tests {
     #[test]
     fn exactly_full_partition_is_accepted() {
         let data = vec![7u8; PARTITION - MANIFEST_SECTOR_SIZE];
-        let img = build_image(&data, MODEL, VERSION, PARTITION).unwrap();
+        let img = build_image(&data, MODEL, VERSION, None, PARTITION).unwrap();
         assert!(verify(&img, MODEL).is_ok());
     }
 }
