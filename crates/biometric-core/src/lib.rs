@@ -5,5 +5,6 @@
 
 pub mod contract;
 pub mod geometry;
+pub mod manifest;
 pub mod matching;
 pub mod stats;
