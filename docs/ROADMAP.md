@@ -135,6 +135,31 @@ compiled into the firmware.
   - Builds needed `CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y` for the board's v1.3 silicon.
   - Performance-neutral for the pipeline (measured).
 
+### ✅ M3a: Models in Their Own Partitions (Manifest + Verification)
+
+Update model weights without rebuilding the firmware. Done before M2, so enrolled templates can
+record the model version from the manifest (the runtime source of truth) from the start.
+
+- Each model (MSR, MNP, MobileFaceNet) lives in its own partition. The `.espdl` data sits at
+  offset 0, with a JSON manifest (model id, version, size, SHA-256) in the last 4 KiB sector.
+- `biometric-core::manifest` defines the format and is used by both the firmware and the host
+  packer. Host tests cover every failure mode.
+- The firmware verifies each partition before ESP-DL loads it. A missing or corrupt model
+  disables only its stage; the board never crashes because of a model.
+- Espressif's face components can only load from partitions declared in an ESP-IDF partition
+  table, which esp-idf-sys builds don't use. So the firmware builds the models itself (adapted
+  from the components, MIT) with its own partition labels; the components are no longer built.
+- Tooling:
+  - `crates/model-packer` builds partition images;
+  - `tools/face-models.sh` fetches Espressif's pinned releases (SHA-256 checked), packs and
+    flashes them.
+- The app image shrinks from 5.1 to 3.6 MB.
+
+**Validation:**
+- Host tests for the format and the packer.
+- On-board: normal load; a single flipped bit in the embedder is rejected (detection continues);
+  an erased detector partition is rejected (preview continues).
+
 ### ⬜ M2: On-Device Enrollment
 
 Enroll and recognise people locally, with no server.
@@ -150,18 +175,16 @@ Enroll and recognise people locally, with no server.
 - Host tests for serialisation, versioning and matching edge cases.
 - On-board enroll → reboot → recognise → delete cycle.
 
-### ⬜ M3: Models from Flash Partitions (A/B + Manifest)
+### ⬜ M3b: A/B Model Slots, Validation Run, Rollback
 
-Update model weights without rebuilding firmware, locally first.
-
-- Repartition for two model slots plus a manifest. The partition-table overlap with `nvs` was already fixed in M1.
-- Load models from a partition via ESP-DL's partition loading; manifest parsing and contract checks.
-- Validation run on a golden input before activating a model; NVS pointer switch; rollback.
-- Host tooling and documentation to package a model plus manifest and flash it with `espflash write-bin`.
+- Two slots per model (carved from `storage`), with an NVS pointer to the active slot.
+- Before switching to a new model, run it on a golden input and compare the output with the
+  expected result.
+- Roll back to the previous slot on failure; report the active model version.
 
 **Validation:**
-- Host tests for manifest parsing and the activation and rollback state machine.
-- On-board: swap models without reflashing the app, and reject a corrupted or incompatible model.
+- Host tests for the activation and rollback state machine.
+- On-board: swap models without reflashing the app, and fall back when a new model fails validation.
 
 ### ⬜ M4: Network Sync & Remote Model Updates
 

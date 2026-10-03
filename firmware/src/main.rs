@@ -5,6 +5,7 @@ use esp_idf_svc::sys as ffi;
 mod audio_worker;
 mod biometrics;
 mod camera;
+mod models;
 mod pipeline;
 mod power;
 mod ppa;

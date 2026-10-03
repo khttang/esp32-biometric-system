@@ -26,8 +26,9 @@ Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP
 |---|---|
 | Display, touch, camera preview, Ethernet, I2S audio | Working |
 | Vision pipeline (camera → PPA → preview / inference threads) | Working |
-| Face detection | Working: ESP-DL `human_face_detect` (MSR+MNP), green boxes drawn over the preview |
-| Face embedding | Working: ESP-DL `human_face_recognition` (MFN), 512-d, aligned from 5 landmarks |
+| Face detection | Working: ESP-DL MSR+MNP models, green boxes drawn over the preview |
+| Face embedding | Working: ESP-DL MobileFaceNet, 512-d, aligned from 5 landmarks |
+| Model updates | Models live in their own flash partitions with a verified manifest; update them without reflashing the firmware ([Model Partitions](#model-partitions)) |
 | Enrollment | Not yet (M2): no templates exist, so matching never fires |
 | Template download / matching | Matching implemented and unit-tested; template download is not yet triggered by the state machine |
 | Voice recognition | Not implemented |
@@ -147,14 +148,59 @@ Defined in `crates/biometric-core/src/contract.rs` and checked at startup:
 
 | Item | Value |
 |---|---|
-| Detector | `human_face_detect` 0.4.2, `human_face_detect_msr_s8_v1` + `mnp_s8_v1` |
-| Embedder | `human_face_recognition` 0.3.2, `human_face_feat_mfn_s8_v1` (`FEATURE_MODEL_VERSION`) |
+| Detector | `human_face_detect_msr_s8_v1` + `human_face_detect_mnp_s8_v1` (from `human_face_detect` 0.4.2) |
+| Embedder | `human_face_feat_mfn_s8_v1` (from `human_face_recognition` 0.3.2) |
+| Model ids | `MSR_MODEL_ID`, `MNP_MODEL_ID`, `FEATURE_MODEL_ID`; each partition's manifest must name the expected id |
 | Detector input | 640×480 PPA RGB888 (BGR888 to ESP-DL), full field of view |
 | Landmarks | 5 per face; required for alignment |
 | Embedding | 512 × `f32`, L2-normalised. A model reporting another length disables recognition (detection keeps running). |
 
-The two components must be upgraded together: `human_face_recognition` 0.3.x requires
-`human_face_detect ~0.4.1` (detect 0.5.x is incompatible).
+The models come from Espressif's `human_face_detect` / `human_face_recognition` releases, but
+those components are not part of the firmware build. `face_inference.cpp` builds the models with
+the same pre/post-processing parameters, adapted under the MIT licence, so it can load them from
+partitions with our own labels.
+
+### Model Partitions
+
+Each model lives in its own flash partition, so a model update needs no firmware rebuild:
+
+```text
+offset 0                                    size - 4096           size
+├─ .espdl model (`size` bytes) ─ 0xFF padding ─┼─ manifest JSON ─────┤
+```
+
+- **Manifest:** in the partition's last 4 KiB sector:
+  `{"format":1,"model":"human_face_feat_mfn_s8_v1","version":"human_face_recognition 0.3.2","size":1295200,"sha256":"…"}`.
+  The `version` will be recorded with enrolled templates (M2), so templates are only compared with
+  embeddings from the same model.
+- **Verify before load:** at startup the inference thread memory-maps each partition and checks
+  that the manifest names the expected model, the size fits, and the data's SHA-256 matches. Only
+  then does ESP-DL load it.
+  - ESP-DL itself aborts the chip on an unmappable partition and has no integrity check.
+  - Verification takes 22 ms (MSR), 32 ms (MNP) and 376 ms (MobileFaceNet, 1.3 MB).
+- **Failure handling, tested on the device:**
+
+  | Partition state | Result |
+  |---|---|
+  | Embedder data corrupted (one flipped bit) | `model data does not match the manifest's SHA-256`; recognition disabled, detection keeps running |
+  | Detector partition erased | `no manifest`; detection disabled, the camera preview keeps running |
+
+  The board never crashes or boot-loops because of a model partition.
+- **Single source of truth:** the format lives in `biometric-core::manifest`. It is shared by the
+  firmware (`firmware/src/models.rs`) and the host packer (`crates/model-packer`), with host tests
+  for every failure mode.
+
+Updating models:
+
+```sh
+tools/face-models.sh fetch   # download Espressif's pinned releases, check their SHA-256, extract
+tools/face-models.sh pack    # build models/face_*.bin partition images (model-packer)
+tools/face-models.sh flash   # espflash write-bin each image at its partition offset
+tools/face-models.sh all     # all three steps
+```
+
+Model files are not committed: `models/` is gitignored and the releases are pinned by SHA-256 in
+the script.
 
 ### Measured Performance (ESP32-P4 rev 1.3, 360 MHz)
 
@@ -207,8 +253,9 @@ output windows itself.
       8. Ethernet.
    3. Start the audio capture thread; configure the admin button.
    4. Start the inactivity watchdog.
-   5. Spawn the vision pipeline (camera + inference threads). The inference thread loads both face
-      models (`p4_face_init`) before taking its first frame.
+   5. Spawn the vision pipeline (camera + inference threads). Before taking its first frame, the
+      inference thread verifies each model partition and loads the detector and embedder
+      independently (`p4_face_init_detector` / `p4_face_init_embedder`).
 3. State machine loop (`biometrics.rs`):
    `Initialize → DetectionValidation ⇄ ActionExecuted`, plus `RetrieveRuntimeData` /
    `UpdatingRuntimeData` for template sync.
@@ -232,12 +279,14 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 ├── README.md
 ├── CLAUDE.md                         # Engineering guidelines for Claude Code
 ├── crates/
-│   └── biometric-core/               # Hardware-independent logic, host unit tests
-│       └── src/
-│           ├── geometry.rs           # PixelFormat, Rect, ImageRef, crop / fit / mapping math
-│           ├── contract.rs           # Model contract (input format, landmarks, embedding size)
-│           ├── matching.rs           # GroupMember, best_match, cosine similarity
-│           └── stats.rs              # Allocation-free latency statistics
+│   ├── biometric-core/               # Hardware-independent logic, host unit tests
+│   │   └── src/
+│   │       ├── geometry.rs           # PixelFormat, Rect, ImageRef, crop / fit / mapping math
+│   │       ├── contract.rs           # Model contract (input, partitions, model ids, embedding size)
+│   │       ├── manifest.rs           # Model partition image format: build + verify
+│   │       ├── matching.rs           # GroupMember, best_match, cosine similarity
+│   │       └── stats.rs              # Allocation-free latency statistics
+│   └── model-packer/                 # Host tool: .espdl + manifest -> partition image
 ├── firmware/                         # ESP32-P4 application (Rust + ESP-IDF)
 │   ├── .cargo/config.toml            # Target, build-std, espflash runner, ESP-IDF version
 │   ├── rust-toolchain.toml           # Pinned nightly + rust-src
@@ -248,7 +297,7 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │   ├── components_esp32p4.lock       # Locked ESP-IDF managed component versions
 │   ├── components/biometrics_wrapper/      # C++ ESP-IDF component
 │   │   ├── biometrics_wrapper.cpp    # Display/LVGL, touch, camera V4L2, audio, Ethernet, OTA
-│   │   ├── face_inference.cpp        # ESP-DL face detection + embedding adapter
+│   │   ├── face_inference.cpp        # ESP-DL face models (MSR, MNP, MobileFaceNet) from partitions
 │   │   ├── include/biometrics_wrapper.h    # C API used from Rust
 │   │   ├── include/bindings.h        # Headers esp-idf-sys generates Rust bindings from
 │   │   ├── idf_component.yml         # Managed component dependencies
@@ -259,10 +308,13 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │       ├── biometrics.rs             # State machine
 │       ├── pipeline.rs               # Camera + inference threads (Core 1)
 │       ├── camera.rs                 # V4L2 frame lifetime (RAII)
+│       ├── models.rs                 # Verify model partitions before loading
 │       ├── ppa.rs                    # PPA client, DMA buffers
 │       ├── audio_worker.rs           # I2S mic capture thread
 │       ├── speaker.rs                # I2S speaker output (chime)
 │       └── power.rs                  # Inactivity watchdog, deep sleep, boot crash counter
+├── tools/face-models.sh              # Fetch, package and flash the face models
+├── models/                           # (gitignored) downloaded models + partition images
 └── docs/ROADMAP.md                    # Milestones
 ```
 
@@ -273,13 +325,17 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 | nvs | data/nvs | `0x9000` | 64 KB |
 | otadata | data/ota | `0x19000` | 8 KB |
 | phy_init | data/phy | `0x1B000` | 4 KB |
-| ota_0 | app | `0x20000` | 6 MB |
-| ota_1 | app | `0x620000` | 6 MB |
-| model | data/spiffs | `0xC20000` | 2 MB (reserved for M3) |
-| storage | data/spiffs | `0xE20000` | 1.875 MB |
+| ota_0 | app | `0x20000` | 5 MB |
+| ota_1 | app | `0x520000` | 5 MB |
+| face_msr | data | `0xA20000` | 128 KB (MSR model, 61 KB) |
+| face_mnp | data | `0xA40000` | 192 KB (MNP model, 130 KB) |
+| face_feat | data | `0xA70000` | 2 MB (MobileFaceNet, 1.3 MB) |
+| storage | data/spiffs | `0xC70000` | 3.56 MB |
 
 The partition table lives at the default `0x8000`, where `espflash` writes it and the app reads it.
-The app slots hold the firmware plus the embedded face models: about 5.1 MB, 81% of a slot.
+- The app image is about 3.6 MB, 69% of a slot.
+- Model partitions are 64 KiB aligned, because ESP-DL memory-maps them.
+- `storage` leaves room to carve out M3b's A/B model slots without moving the app.
 
 ---
 
@@ -296,6 +352,7 @@ automatically on the first build. Run `rustup toolchain install` once in `firmwa
 | Rust (host tests) | `1.99.0` + `rustfmt`, `clippy` | Pinned in `crates/biometric-core/rust-toolchain.toml` |
 | `ldproxy` | latest | `cargo install ldproxy` (linker wrapper used by `.cargo/config.toml`) |
 | `espflash` | 4.x | `cargo install espflash` |
+| `curl`, `unzip`, `shasum`/`sha256sum` | any | Used by `tools/face-models.sh`; preinstalled on macOS and most Linux distributions |
 | Python | 3.12 | `brew install python@3.12`. **Path is hardcoded** as `PYTHON=/opt/homebrew/bin/python3.12` in `firmware/.cargo/config.toml`; adjust for your machine. |
 | ESP-IDF | v5.5.5 | Downloaded by `esp-idf-sys` into `firmware/.embuild/` on the first build. The NANO's P4 is silicon v1.x, so `CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y` is required: ESP-IDF 5.5 otherwise targets v3.01+ and the image crashes at boot. |
 | CMake, Ninja, RISC-V GCC 14.2, esp-clang, ROM ELFs | n/a | Installed by `esp-idf-sys` into `firmware/.embuild/espressif/tools/` |
@@ -311,18 +368,19 @@ and used as `crate::ffi`.
 
 ```sh
 # Host unit tests (no board needed)
-cd crates/biometric-core
+cd crates/biometric-core   # and crates/model-packer
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 
 # Firmware: always use the release profile
 cd firmware
 cargo build --release          # first build downloads ESP-IDF + tools (needs network, takes a while)
 cargo run --release            # build, flash (espflash, partitions.csv) and open the serial monitor
+../tools/face-models.sh all     # first time, or after a model change: write the face models
 cargo fmt --check && cargo clippy --release -- -D warnings   # same checks as CI
 ```
 
 - **CI** (`.github/workflows/ci.yml`) runs on every pull request and push to `main`:
-  - rustfmt, clippy (`-D warnings`) and unit tests for `biometric-core` on Rust 1.99.0;
+  - rustfmt, clippy (`-D warnings`) and unit tests for `biometric-core` and `model-packer` on Rust 1.99.0;
   - rustfmt, clippy and a release build of the firmware.
 
   ESP-IDF (`firmware/.embuild`, about 5 GB) is cached between runs. The first run is slow.
@@ -339,10 +397,11 @@ cargo fmt --check && cargo clippy --release -- -D warnings   # same checks as CI
 - **After editing C++ or headers**, run `touch sdkconfig.defaults` before `cargo build --release`.
   `esp-idf-sys` only re-runs its CMake build (and regenerates bindings) when that file changes;
   otherwise the old C++ object is silently relinked.
-- **Models** come from the `human_face_detect` / `human_face_recognition` components and are embedded
-  at build time; the variants are chosen in `sdkconfig.defaults`.
+- **Models** are written separately from the firmware (see [Model Partitions](#model-partitions)).
+  A board without models boots normally: the preview runs and the log says which models are missing.
 - **After changing `partitions.csv`**, erase the chip once: `espflash erase-flash`, then
-  `cargo run --release`. Stale data from the old layout can otherwise be misread.
+  `cargo run --release` and `tools/face-models.sh all`. Stale data from the old layout can
+  otherwise be misread.
 
 ---
 

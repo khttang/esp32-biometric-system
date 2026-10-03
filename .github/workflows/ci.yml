@@ -13,12 +13,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  core:
-    name: biometric-core (fmt, clippy, tests)
+  host:
+    name: host crates (fmt, clippy, tests)
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate: [biometric-core, model-packer]
     defaults:
       run:
-        working-directory: crates/biometric-core
+        working-directory: crates/${{ matrix.crate }}
     steps:
       - uses: actions/checkout@v7
 
@@ -27,7 +30,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/biometric-core
+          workspaces: crates/${{ matrix.crate }}
 
       - name: rustfmt
         run: cargo fmt --check

@@ -1,8 +1,5 @@
 dependencies:
   espressif/esp-dl: "^3.3.0"
-  # Pretrained face models. recognition 0.3.x requires detect ~0.4.1, so the pair is pinned together.
-  espressif/human_face_detect: "~0.4.2"
-  espressif/human_face_recognition: "~0.3.2"
   espressif/esp_video: "==2.2.0"
   espressif/es8311: "^1.0.0"
   waveshare/esp_lcd_hx8394: "^2.1.0"

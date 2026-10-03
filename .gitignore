@@ -2,3 +2,6 @@
 
 # Claude Code per-user local settings
 .claude/settings.local.json
+
+# Downloaded and packaged face models (tools/face-models.sh)
+/models/

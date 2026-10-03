@@ -14,7 +14,7 @@
 //! at most one sensor period old, the camera never waits for inference, and the PPA only does
 //! the detector downscale when someone will consume it.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
@@ -23,9 +23,11 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, ensure, Context, Result};
 use arc_swap::ArcSwap;
 use biometric_core::contract::{
-    DETECTOR_FORMAT, DETECTOR_HEIGHT, DETECTOR_WIDTH, EMBEDDING_DIM, FEATURE_MODEL_VERSION,
+    DETECTOR_FORMAT, DETECTOR_HEIGHT, DETECTOR_WIDTH, EMBEDDING_DIM, FEATURE_MODEL_ID,
+    FEATURE_PARTITION, MNP_MODEL_ID, MNP_PARTITION, MSR_MODEL_ID, MSR_PARTITION,
 };
 use biometric_core::geometry::{fit_rect, map_rect};
+use biometric_core::manifest::ModelManifest;
 use biometric_core::stats::LatencyStats;
 use esp_idf_svc::hal::cpu::Core;
 use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
@@ -34,6 +36,7 @@ use log::{error, info, warn};
 use crate::biometrics::{best_match, GroupMember};
 use crate::camera::Camera;
 use crate::ffi;
+use crate::models;
 use crate::ppa::{image_len, DmaBuf, ImageRef, PixelFormat, Ppa, Rect, Target};
 
 // Sensor stream; must match VideoConfig::SENSOR_* in biometrics_wrapper.cpp
@@ -258,22 +261,47 @@ fn inference_loop(
     events: SyncSender<InferenceEvent>,
     members: Arc<ArcSwap<Vec<GroupMember>>>,
 ) {
-    // Safety: this thread is the only user of the p4_face_* API.
-    let ret = unsafe { ffi::p4_face_init() };
-    if ret != 0 {
-        return error!("[Pipeline] face model init failed: {ret}");
+    // Each model loads only if its partition verifies, so a missing or corrupt model disables
+    // just its stage. This thread is the only user of the p4_face_* API.
+    // Safety: plain init calls; see biometrics_wrapper.h.
+    let detector_models = [(MSR_PARTITION, MSR_MODEL_ID), (MNP_PARTITION, MNP_MODEL_ID)];
+    if load_stage("detector", &detector_models, || unsafe {
+        ffi::p4_face_init_detector()
+    })
+    .is_none()
+    {
+        return error!("[Pipeline] face detection unavailable; preview continues without it");
     }
+    let embedder = load_stage(
+        "embedder",
+        &[(FEATURE_PARTITION, FEATURE_MODEL_ID)],
+        || unsafe { ffi::p4_face_init_embedder() },
+    )
+    .and_then(|mut manifests| manifests.pop());
     // Model contract check: never compare embeddings of an unexpected length.
-    let embedding_len = unsafe { ffi::p4_face_embedding_len() };
-    let recognition_enabled = embedding_len == EMBEDDING_DIM;
-    if recognition_enabled {
-        info!("[Pipeline] face models ready ({FEATURE_MODEL_VERSION}, {embedding_len}-d)");
-    } else {
-        error!(
-            "[Pipeline] embedding length {embedding_len} != contract {EMBEDDING_DIM}; \
-             recognition disabled, detection only"
-        );
-    }
+    let recognition_enabled = match &embedder {
+        Some(manifest) => {
+            // Safety: plain query, embedder is loaded.
+            let len = unsafe { ffi::p4_face_embedding_len() };
+            if len == EMBEDDING_DIM {
+                info!(
+                    "[Pipeline] recognition ready: {} ({}), {len}-d",
+                    manifest.model, manifest.version
+                );
+                true
+            } else {
+                error!(
+                    "[Pipeline] embedding length {len} != contract {EMBEDDING_DIM}; \
+                     recognition disabled, detection only"
+                );
+                false
+            }
+        }
+        None => {
+            error!("[Pipeline] recognition disabled, detection only");
+            false
+        }
+    };
 
     let view_rect = fit_rect(SENSOR_W, SENSOR_H, VIEW_W, VIEW_H);
     let mut faces = [ffi::p4_face_t::default(); MAX_FACES];
@@ -346,6 +374,32 @@ fn inference_loop(
         }
     }
     warn!("[Pipeline] camera thread gone; inference thread exiting");
+}
+
+/// Verifies every `(partition, model id)` a stage needs and, only if all are intact, loads the
+/// stage with `init`. Returns the verified manifests in the order given.
+fn load_stage(
+    stage: &str,
+    models: &[(&str, &str)],
+    init: impl FnOnce() -> i32,
+) -> Option<Vec<ModelManifest>> {
+    let mut manifests = Vec::with_capacity(models.len());
+    for &(partition, model_id) in models {
+        let label = CString::new(partition).expect("partition labels contain no NUL");
+        match models::verify(&label, model_id) {
+            Ok(manifest) => manifests.push(manifest),
+            Err(e) => {
+                error!("[Pipeline] {stage} not loaded: {e:#}");
+                return None;
+            }
+        }
+    }
+    let ret = init();
+    if ret != 0 {
+        error!("[Pipeline] {stage} init failed: {ret}");
+        return None;
+    }
+    Some(manifests)
 }
 
 /// Runs the face detector on the RGB888 detector image; returns the number of faces written.
