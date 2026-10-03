@@ -18,6 +18,8 @@ LVGL, the V4L2 camera ioctls, panel bring-up and ESP-DL inference.
 
 ## Project Status
 
+Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP.md).
+
 | Area | State |
 |---|---|
 | Display, touch, camera preview, Ethernet, I2S audio | Working |
