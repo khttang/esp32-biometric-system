@@ -108,10 +108,14 @@ typedef struct {
     int32_t landmarks[2 * P4_FACE_LANDMARKS]; // (x, y) pairs as reported by the detector
 } p4_face_t;
 
-// Load the detection / feature model from its flash partition (human_face_det / human_face_feat).
-// Idempotent. ESP-DL aborts on an unreadable partition, so verify it (Rust models.rs) first.
-int32_t p4_face_init_detector(void);
-int32_t p4_face_init_embedder(void);
+// Golden run: loads the model in `partition`, runs it once on a fixed pseudo-random input and
+// writes the SHA-256 of its outputs to `digest`, then frees the model. The result depends only
+// on the model and the ESP-DL build, so a known-good value can ship with the model.
+int32_t p4_model_golden(const char *partition, uint8_t digest[32]);
+// Load the detection / feature models from the given flash partitions. Idempotent.
+// ESP-DL aborts on an unreadable partition, so verify each one (Rust models.rs) first.
+int32_t p4_face_init_detector(const char *msr_partition, const char *mnp_partition);
+int32_t p4_face_init_embedder(const char *partition);
 // Embedding length of the loaded feature model (0 before p4_face_init_embedder).
 size_t p4_face_embedding_len(void);
 // Images are packed PPA RGB888 (ESP-IDF layout: B, G, R bytes per pixel).

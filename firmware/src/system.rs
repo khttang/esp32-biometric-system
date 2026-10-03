@@ -125,7 +125,7 @@ impl SystemResourcesBuilder {
         let group_members = Arc::new(Roster::from_pointee(members.unwrap_or_default()));
 
         // 7. Vision pipeline (camera + inference threads on Core 1; loads the face models)
-        let vision = crate::pipeline::spawn(group_members.clone())
+        let vision = crate::pipeline::spawn(group_members.clone(), nvs.clone())
             .context("[SystemResources] Failed to start vision pipeline")?;
 
         info!("[SystemResources] All hardware subsystems and LVGL 9 split-screen ready!");
