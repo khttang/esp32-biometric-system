@@ -95,7 +95,7 @@ Make every later PR verifiable by anyone.
 - CI green on the PR.
 - The firmware built with the new toolchain boots on the board.
 
-### ⬜ M1: Real Inference with Embedded Models
+### ✅ M1: Real Inference with Embedded Models
 
 Replace the stub detector and the untrained embedding model with Espressif's pretrained models,
 compiled into the firmware.
@@ -109,6 +109,26 @@ compiled into the firmware.
 **Validation:**
 - Host tests for any new pure logic (box scaling between detector and display coordinates, contract checks).
 - On-board: faces detected at the documented rate; latency numbers recorded in the PR.
+
+**Outcome:**
+- `human_face_detect` 0.4.2 (MSR+MNP) and `human_face_recognition` 0.3.2 (MFN, 512-d), with a
+  C++ adapter (`face_inference.cpp`). Matching stays in Rust.
+- Model contract in `biometric-core::contract`; the embedding length is checked at startup.
+- Overlay boxes drawn on the preview.
+- Measured on the board, as documented in the README:
+  - detection 19–23 ms;
+  - embedding about 187 ms;
+  - faces found in up to about 80% of frames.
+- Found and fixed a red/blue swap: PPA RGB888 is B,G,R in memory, so the buffer is passed to ESP-DL as BGR888.
+- Pulled forward from M3: the partition table moved to the default `0x8000` (the old `0xc000` copy sat
+  inside `nvs`), and app slots grew to 6 MB for the embedded models.
+- Performance settings: XIP from PSRAM, 256 KB L2, `-O2`, and only the ESP-DL pixel conversion in use.
+- Placeholder model, `ml/export/` and `tools/enroll_user.py` removed.
+
+**Follow-ups (own PRs):**
+- Camera pipeline throughput: about 8 fps, because each PPA scale takes 80–95 ms.
+- Embedding latency: about 2× Espressif's figure.
+- ESP-IDF 5.5.5 plus the esp-idf-* 0.53/0.47/0.38 crates.
 
 ### ⬜ M2: On-Device Enrollment
 
@@ -129,7 +149,7 @@ Enroll and recognise people locally, with no server.
 
 Update model weights without rebuilding firmware, locally first.
 
-- Repartition for two model slots plus a manifest, and fix the current `partitions.csv` offset overlap with `nvs`.
+- Repartition for two model slots plus a manifest. The partition-table overlap with `nvs` was already fixed in M1.
 - Load models from a partition via ESP-DL's partition loading; manifest parsing and contract checks.
 - Validation run on a golden input before activating a model; NVS pointer switch; rollback.
 - Host tooling and documentation to package a model plus manifest and flash it with `espflash write-bin`.

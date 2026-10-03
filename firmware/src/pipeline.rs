@@ -1,12 +1,12 @@
 //! Real-time vision pipeline, both threads pinned to Core 1 (Core 0 runs LVGL + the state machine).
 //!
 //! ```text
-//! camera thread (prio 6)                         inference thread (prio 3)
-//!   next_frame() ── PPA crop/scale ─▶ preview back buffer ─▶ p4_ui_present_camera (swap)
-//!               └─ if a request is pending:                  ┌──────────────────────────┐
-//!                  PPA scale ─▶ detector image ── frame ───▶ │ detect → PPA crop 112×112 │
-//!                                                ◀─ request ─│ → embed → match → event   │
-//!   Frame dropped → buffer back to the ISP                   └──────────────────────────┘
+//! camera thread (prio 6)                        inference thread (prio 3)
+//!   next_frame() ── PPA scale ─▶ preview back buffer ─▶ p4_ui_present_camera (swap)
+//!               └─ if a request is pending:              ┌───────────────────────────────┐
+//!                  PPA scale ─▶ detector image ─ frame ─▶ │ detect (boxes + landmarks)    │
+//!                                               ◀ request │ → overlay → embed → match     │
+//!   Frame dropped → buffer back to the ISP                └───────────────────────────────┘
 //! ```
 //!
 //! The inference thread asks for a frame by handing its (single) detector buffer back, and
@@ -15,13 +15,19 @@
 //! the detector downscale when someone will consume it.
 
 use std::ffi::CStr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, ensure, Context, Result};
 use arc_swap::ArcSwap;
+use biometric_core::contract::{
+    DETECTOR_FORMAT, DETECTOR_HEIGHT, DETECTOR_WIDTH, EMBEDDING_DIM, FEATURE_MODEL_VERSION,
+};
+use biometric_core::geometry::{fit_rect, map_rect};
+use biometric_core::stats::LatencyStats;
 use esp_idf_svc::hal::cpu::Core;
 use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
 use log::{error, info, warn};
@@ -29,9 +35,7 @@ use log::{error, info, warn};
 use crate::biometrics::{best_match, GroupMember};
 use crate::camera::Camera;
 use crate::ffi;
-use biometric_core::geometry::fit_rect;
-
-use crate::ppa::{image_len, DmaBuf, ImageRef, PixelFormat, Ppa, Rect, Target};
+use crate::ppa::{image_len, DmaBuf, PixelFormat, Ppa, Rect, Target};
 
 // Sensor stream; must match VideoConfig::SENSOR_* in biometrics_wrapper.cpp
 const SENSOR_W: u32 = 1280;
@@ -39,27 +43,23 @@ const SENSOR_H: u32 = 960;
 // Preview canvas on the left half of the screen; must match VideoConfig::VIEWPORT_*
 const VIEW_W: u32 = 640;
 const VIEW_H: u32 = 720;
-// Detector input: full field of view at half resolution
-const DET_W: u32 = 640;
-const DET_H: u32 = 480;
-// MobileFaceNet input
-const FACE_SIZE: u32 = 112;
-pub const EMBEDDING_DIM: usize = 512;
 
 /// Max time the camera thread waits for LVGL before skipping one preview update.
 const PRESENT_LOCK_TIMEOUT_MS: u32 = 5;
+/// Max time the inference thread waits for LVGL before skipping one overlay update.
+const OVERLAY_LOCK_TIMEOUT_MS: u32 = 10;
 const EVENT_QUEUE_DEPTH: usize = 8;
 /// Upper bound on inference rate. Face ID doesn't need camera rate, and each request costs a
 /// full-frame PPA downscale on the camera thread.
 const MIN_INFERENCE_INTERVAL: Duration = Duration::from_millis(100);
+/// Faces handled per frame; matches the number of overlay boxes the UI provides.
+const MAX_FACES: usize = ffi::P4_UI_MAX_FACE_BOXES as usize;
+/// Interval between inference performance log lines.
+const STATS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+const INFERENCE_STACK_SIZE: usize = 32 * 1024;
 
-/// Face location in detector-image coordinates.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // TODO: filled by human_face_detect
-pub struct FaceBox {
-    pub rect: Rect,
-    pub confidence: f32,
-}
+/// Frames dequeued by the camera thread; read and reset by the inference thread's stats log.
+static CAMERA_FRAMES: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug)]
 pub enum InferenceEvent {
@@ -79,7 +79,7 @@ pub fn spawn(members: Arc<ArcSwap<Vec<GroupMember>>>) -> Result<Receiver<Inferen
     let (frame_tx, frame_rx) = mpsc::sync_channel::<DmaBuf>(1);
     let (event_tx, event_rx) = mpsc::sync_channel::<InferenceEvent>(EVENT_QUEUE_DEPTH);
 
-    let detector_buf = DmaBuf::new(image_len(DET_W, DET_H, PixelFormat::Rgb888))
+    let detector_buf = DmaBuf::new(image_len(DETECTOR_WIDTH, DETECTOR_HEIGHT, DETECTOR_FORMAT))
         .context("failed to allocate detector buffer")?;
     request_tx
         .send(detector_buf)
@@ -88,7 +88,7 @@ pub fn spawn(members: Arc<ArcSwap<Vec<GroupMember>>>) -> Result<Receiver<Inferen
     spawn_on_core1(c"cam_pipeline", 8 * 1024, 6, move || {
         camera_loop(camera, request_rx, frame_tx)
     })?;
-    spawn_on_core1(c"inference", 32 * 1024, 3, move || {
+    spawn_on_core1(c"inference", INFERENCE_STACK_SIZE, 3, move || {
         inference_loop(frame_rx, request_tx, event_tx, members)
     })?;
     Ok(event_rx)
@@ -144,6 +144,7 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
     let full_frame = Rect::full(SENSOR_W, SENSOR_H);
     let view_rect = fit_rect(SENSOR_W, SENSOR_H, VIEW_W, VIEW_H);
     let mut pending_request: Option<DmaBuf> = None;
+    let mut inference_running = true;
 
     info!("[Pipeline] camera thread running on core 1");
     loop {
@@ -155,6 +156,7 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
                 continue;
             }
         };
+        CAMERA_FRAMES.fetch_add(1, Ordering::Relaxed);
         let image = frame.image();
 
         let preview = Target {
@@ -180,15 +182,22 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
             Err(e) => warn!("[Pipeline] preview PPA failed: {e}"),
         }
 
-        if pending_request.is_none() {
+        if inference_running && pending_request.is_none() {
             pending_request = requests.try_recv().ok();
         }
         if let Some(mut detector_buf) = pending_request.take() {
-            let detector = Target::full(&mut detector_buf, DET_W, DET_H, PixelFormat::Rgb888);
+            let detector = Target::full(
+                &mut detector_buf,
+                DETECTOR_WIDTH,
+                DETECTOR_HEIGHT,
+                DETECTOR_FORMAT,
+            );
             match ppa.scale_crop(image, full_frame, detector) {
                 Ok(()) => {
                     if frames.send(detector_buf).is_err() {
-                        return warn!("[Pipeline] inference thread gone; camera thread exiting");
+                        // Keep the preview running even if inference is unavailable.
+                        warn!("[Pipeline] inference thread gone; preview continues without it");
+                        inference_running = false;
                     }
                 }
                 Err(e) => {
@@ -207,48 +216,83 @@ fn inference_loop(
     events: SyncSender<InferenceEvent>,
     members: Arc<ArcSwap<Vec<GroupMember>>>,
 ) {
-    let mut ppa = match Ppa::new() {
-        Ok(ppa) => ppa,
-        Err(e) => return error!("[Pipeline] PPA client registration failed: {e}"),
-    };
-    let Some(mut face_buf) = DmaBuf::new(image_len(FACE_SIZE, FACE_SIZE, PixelFormat::Rgb888))
-    else {
-        return error!("[Pipeline] failed to allocate face buffer");
-    };
+    // Safety: this thread is the only user of the p4_face_* API.
+    let ret = unsafe { ffi::p4_face_init() };
+    if ret != 0 {
+        return error!("[Pipeline] face model init failed: {ret}");
+    }
+    // Model contract check: never compare embeddings of an unexpected length.
+    let embedding_len = unsafe { ffi::p4_face_embedding_len() };
+    let recognition_enabled = embedding_len == EMBEDDING_DIM;
+    if recognition_enabled {
+        info!("[Pipeline] face models ready ({FEATURE_MODEL_VERSION}, {embedding_len}-d)");
+    } else {
+        error!(
+            "[Pipeline] embedding length {embedding_len} != contract {EMBEDDING_DIM}; \
+             recognition disabled, detection only"
+        );
+    }
+
+    let view_rect = fit_rect(SENSOR_W, SENSOR_H, VIEW_W, VIEW_H);
+    let mut faces = [ffi::p4_face_t::default(); MAX_FACES];
+    let mut boxes = [ffi::p4_ui_rect_t::default(); MAX_FACES];
     let mut embedding = [0.0f32; EMBEDDING_DIM];
+    let mut detect_stats = LatencyStats::default();
+    let mut embed_stats = LatencyStats::default();
+    let mut frames_with_faces = 0u32;
+    let mut last_stats_log = Instant::now();
+    let mut stack_reported = false;
 
     info!("[Pipeline] inference thread running on core 1");
     while let Ok(detector_buf) = frames.recv() {
-        let started = std::time::Instant::now();
-        let image = ImageRef {
-            data: detector_buf.as_slice(),
-            width: DET_W,
-            height: DET_H,
-            format: PixelFormat::Rgb888,
-        };
+        let started = Instant::now();
+        let image = detector_buf.as_slice();
 
-        let faces = detect_faces(image);
-        if !faces.is_empty() {
+        let face_count = match detect(image, &mut faces) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("[Pipeline] {e}");
+                0
+            }
+        };
+        detect_stats.record(started.elapsed());
+
+        let detected = &faces[..face_count];
+        show_overlay(detected, view_rect, &mut boxes);
+        if !detected.is_empty() {
+            frames_with_faces += 1;
             let _ = events.try_send(InferenceEvent::FaceSeen);
         }
-        for face in &faces {
-            let Some(rect) = face.rect.clamp_to(DET_W, DET_H) else {
-                continue;
-            };
-            let face_target =
-                Target::full(&mut face_buf, FACE_SIZE, FACE_SIZE, PixelFormat::Rgb888);
-            if let Err(e) = ppa.scale_crop(image, rect, face_target) {
-                warn!("[Pipeline] face crop failed: {e}");
-                continue;
+
+        if recognition_enabled {
+            for face in detected.iter().filter(|f| f.has_landmarks) {
+                let embed_started = Instant::now();
+                let result = embed(image, face, &mut embedding);
+                embed_stats.record(embed_started.elapsed());
+                if let Err(e) = result {
+                    warn!("[Pipeline] {e}");
+                    continue;
+                }
+                if !stack_reported {
+                    log_stack_headroom();
+                    stack_reported = true;
+                }
+                if let Some(member) = best_match(&embedding, &members.load()) {
+                    let _ = events.try_send(InferenceEvent::Match(member));
+                    break;
+                }
             }
-            if let Err(e) = embed(&face_buf, &mut embedding) {
-                warn!("[Pipeline] {e}");
-                continue;
-            }
-            if let Some(member) = best_match(&embedding, &members.load()) {
-                let _ = events.try_send(InferenceEvent::Match(member));
-                break;
-            }
+        }
+
+        if last_stats_log.elapsed() >= STATS_LOG_INTERVAL {
+            log_stats(
+                detect_stats.take(),
+                embed_stats.take(),
+                frames_with_faces,
+                last_stats_log.elapsed(),
+            );
+            frames_with_faces = 0;
+            last_stats_log = Instant::now();
         }
 
         // Hand the buffer back: this is the request for the next (fresh) frame.
@@ -262,15 +306,101 @@ fn inference_loop(
     warn!("[Pipeline] camera thread gone; inference thread exiting");
 }
 
-/// TODO: replace with espressif/human_face_detect.
-fn detect_faces(_image: ImageRef<'_>) -> Vec<FaceBox> {
-    Vec::new()
+/// Runs the face detector on the RGB888 detector image; returns the number of faces written.
+fn detect(image: &[u8], faces: &mut [ffi::p4_face_t; MAX_FACES]) -> Result<usize> {
+    debug_assert!(image.len() >= image_len(DETECTOR_WIDTH, DETECTOR_HEIGHT, DETECTOR_FORMAT));
+    let mut count = 0usize;
+    // Safety: `image` holds a full detector frame; `faces` has MAX_FACES slots.
+    let ret = unsafe {
+        ffi::p4_face_detect(
+            image.as_ptr(),
+            DETECTOR_WIDTH as u16,
+            DETECTOR_HEIGHT as u16,
+            faces.as_mut_ptr(),
+            faces.len(),
+            &mut count,
+        )
+    };
+    ensure!(ret == 0, "p4_face_detect failed: {ret}");
+    Ok(count.min(faces.len()))
 }
 
-/// Runs MobileFaceNet on a 112×112 RGB888 crop; writes an L2-normalised embedding.
-fn embed(face: &DmaBuf, out: &mut [f32; EMBEDDING_DIM]) -> Result<()> {
-    // Safety: `face` holds at least 112*112*3 bytes and `out` has EMBEDDING_DIM floats.
-    let ret = unsafe { ffi::dl_mobilefacenet_run(face.as_ptr(), out.as_mut_ptr(), out.len()) };
-    ensure!(ret == 0, "dl_mobilefacenet_run failed: {ret}");
+/// Aligns `face` and writes its L2-normalised embedding.
+fn embed(image: &[u8], face: &ffi::p4_face_t, out: &mut [f32; EMBEDDING_DIM]) -> Result<()> {
+    // Safety: `image` holds a full detector frame; `out` has EMBEDDING_DIM floats, which was
+    // checked against the loaded model at startup.
+    let ret = unsafe {
+        ffi::p4_face_embed(
+            image.as_ptr(),
+            DETECTOR_WIDTH as u16,
+            DETECTOR_HEIGHT as u16,
+            face,
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    };
+    ensure!(ret == 0, "p4_face_embed failed: {ret}");
     Ok(())
+}
+
+/// Draws the detected boxes over the preview (or hides them when there are none).
+fn show_overlay(
+    faces: &[ffi::p4_face_t],
+    view_rect: Rect,
+    boxes: &mut [ffi::p4_ui_rect_t; MAX_FACES],
+) {
+    let mut n = 0;
+    for face in faces {
+        let Some(rect) = Rect::from_corners(
+            face.x0,
+            face.y0,
+            face.x1,
+            face.y1,
+            DETECTOR_WIDTH,
+            DETECTOR_HEIGHT,
+        ) else {
+            continue;
+        };
+        let r = map_rect(rect, DETECTOR_WIDTH, DETECTOR_HEIGHT, view_rect);
+        // Canvas coordinates are at most VIEW_W × VIEW_H, so they fit in i16.
+        boxes[n] = ffi::p4_ui_rect_t {
+            x: r.x as i16,
+            y: r.y as i16,
+            w: r.w as i16,
+            h: r.h as i16,
+        };
+        n += 1;
+    }
+    // Safety: `boxes[..n]` is initialised; the C side copies the values under the LVGL lock.
+    // A skipped update (lock busy) is harmless: the next frame redraws the overlay.
+    unsafe { ffi::p4_ui_show_faces(boxes.as_ptr(), n, OVERLAY_LOCK_TIMEOUT_MS) };
+}
+
+fn log_stats(detect: LatencyStats, embed: LatencyStats, frames_with_faces: u32, window: Duration) {
+    let ms = |d: Option<Duration>| d.map_or(0.0, |d| d.as_secs_f32() * 1000.0);
+    info!(
+        "[Pipeline] camera {:.1} fps | {:.1} inferences/s over {:.0}s | \
+         detect avg {:.1} ms max {:.1} ms | embed n={} avg {:.1} ms max {:.1} ms | \
+         frames with faces {}",
+        CAMERA_FRAMES.swap(0, Ordering::Relaxed) as f32 / window.as_secs_f32(),
+        detect.count() as f32 / window.as_secs_f32(),
+        window.as_secs_f32(),
+        ms(detect.mean()),
+        ms(detect.max()),
+        embed.count(),
+        ms(embed.mean()),
+        ms(embed.max()),
+        frames_with_faces,
+    );
+}
+
+/// Logs the inference thread's minimum free stack after the deepest call path (embedding) ran.
+fn log_stack_headroom() {
+    // Safety: NULL queries the calling task.
+    let free_words = unsafe { ffi::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) };
+    info!(
+        "[Pipeline] inference stack: {} of {} bytes never used",
+        free_words as usize * core::mem::size_of::<ffi::StackType_t>(),
+        INFERENCE_STACK_SIZE
+    );
 }

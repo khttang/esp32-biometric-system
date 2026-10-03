@@ -39,6 +39,20 @@ void setup_split_screen_ui(void);
 // next call) in the camera canvas. NULL restores the internal buffer. lock_timeout_ms 0 = wait forever.
 // Returns false (nothing changed) if the LVGL lock could not be taken in time.
 bool p4_ui_present_camera(const void *buf, uint32_t lock_timeout_ms);
+
+// Face overlay boxes drawn on top of the camera canvas.
+#define P4_UI_MAX_FACE_BOXES 4
+
+typedef struct {
+    int16_t x;
+    int16_t y;
+    int16_t w;
+    int16_t h;
+} p4_ui_rect_t;
+
+// Shows `count` boxes (canvas coordinates; at most P4_UI_MAX_FACE_BOXES are drawn) and hides the
+// rest. count = 0 hides all. Returns false (nothing changed) if the LVGL lock was not taken in time.
+bool p4_ui_show_faces(const p4_ui_rect_t *rects, size_t count, uint32_t lock_timeout_ms);
 bool p4_touch_is_pressed(void);
 
 // Camera V4L2 Driver FFI
@@ -54,9 +68,33 @@ int write_i2s_tx_c(int i2s_port, const int16_t *buffer, uint32_t sample_count, u
 int32_t p4_perform_ota_update(const char *url);
 void p4_mark_app_valid(void);
 
-// ESP-DL MobileFaceNet FFI
-int32_t dl_mobilefacenet_init(const uint8_t *model_buf, size_t model_size);
-int32_t dl_mobilefacenet_run(const uint8_t *crop_rgb888, float *out_embedding, size_t embedding_len);
+// Face inference (face_inference.cpp): ESP-DL human_face_detect + human_face_recognition.
+// Not thread-safe: call all p4_face_* functions from a single thread.
+#define P4_FACE_LANDMARKS 5
+
+typedef struct {
+    int32_t x0; // box corners in image pixels, inclusive
+    int32_t y0;
+    int32_t x1;
+    int32_t y1;
+    float score;
+    bool has_landmarks;
+    int32_t landmarks[2 * P4_FACE_LANDMARKS]; // (x, y) pairs as reported by the detector
+} p4_face_t;
+
+// Loads the detection and feature models. Idempotent.
+int32_t p4_face_init(void);
+// Embedding length of the loaded feature model (0 before p4_face_init).
+size_t p4_face_embedding_len(void);
+// Images are packed PPA RGB888 (ESP-IDF layout: B, G, R bytes per pixel).
+// Detects faces in a packed RGB888 image. Writes up to `capacity` faces (highest score first) and
+// stores the number written in `*count`.
+int32_t p4_face_detect(const uint8_t *rgb888, uint16_t width, uint16_t height, p4_face_t *faces,
+                       size_t capacity, size_t *count);
+// Aligns `face` (requires landmarks) and writes its L2-normalised embedding; `len` must equal
+// p4_face_embedding_len().
+int32_t p4_face_embed(const uint8_t *rgb888, uint16_t width, uint16_t height, const p4_face_t *face,
+                      float *embedding, size_t len);
 
 #ifdef __cplusplus
 }

@@ -3,6 +3,8 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
     Rgb565,
+    /// ESP-IDF RGB888 as produced by the PPA: 3 bytes per pixel stored **B, G, R**
+    /// (`color_pixel_rgb888_data_t`). ESP-DL calls this layout BGR888.
     Rgb888,
 }
 
@@ -29,6 +31,28 @@ pub struct Rect {
 }
 
 impl Rect {
+    /// Rectangle from inclusive corner coordinates as reported by detectors, clipped to a
+    /// `width`×`height` image. `None` if nothing of it lies inside the image.
+    pub fn from_corners(
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        let clip = |v: i32, max: u32| i64::from(v).clamp(0, i64::from(max));
+        // Inclusive corners -> half-open [x0, x1 + 1), then clip both ends to the image.
+        let (left, right) = (clip(x0, width), clip(x1.saturating_add(1), width));
+        let (top, bottom) = (clip(y0, height), clip(y1.saturating_add(1), height));
+        (right > left && bottom > top).then(|| Self {
+            x: left as u32,
+            y: top as u32,
+            w: (right - left) as u32,
+            h: (bottom - top) as u32,
+        })
+    }
+
     pub const fn full(w: u32, h: u32) -> Self {
         Self { x: 0, y: 0, w, h }
     }
@@ -93,6 +117,21 @@ pub fn fit_rect(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Rect {
             w,
             h: dst_h,
         }
+    }
+}
+
+/// Maps `r`, given in a `from_w`×`from_h` image, into the `to` rectangle of another picture
+/// (e.g. detector-image coordinates → the letterboxed preview area of the canvas).
+pub fn map_rect(r: Rect, from_w: u32, from_h: u32, to: Rect) -> Rect {
+    let sx = |v: u32| (u64::from(v) * u64::from(to.w) / u64::from(from_w)) as u32;
+    let sy = |v: u32| (u64::from(v) * u64::from(to.h) / u64::from(from_h)) as u32;
+    let (x0, y0) = (sx(r.x), sy(r.y));
+    let (x1, y1) = (sx(r.x + r.w), sy(r.y + r.h));
+    Rect {
+        x: to.x + x0,
+        y: to.y + y0,
+        w: x1 - x0,
+        h: y1 - y0,
     }
 }
 
@@ -198,6 +237,104 @@ mod tests {
     #[test]
     fn fit_same_aspect_fills_area() {
         assert_eq!(fit_rect(1280, 960, 640, 480), Rect::full(640, 480));
+    }
+
+    #[test]
+    fn from_corners_converts_inclusive_corners() {
+        assert_eq!(
+            Rect::from_corners(10, 20, 109, 219, 640, 480),
+            Some(Rect {
+                x: 10,
+                y: 20,
+                w: 100,
+                h: 200
+            })
+        );
+    }
+
+    #[test]
+    fn from_corners_clips_to_image_and_handles_negatives() {
+        assert_eq!(
+            Rect::from_corners(-5, -5, 9, 9, 640, 480),
+            Some(Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 10
+            })
+        );
+        assert_eq!(
+            Rect::from_corners(630, 470, 700, 500, 640, 480),
+            Some(Rect {
+                x: 630,
+                y: 470,
+                w: 10,
+                h: 10
+            })
+        );
+        assert_eq!(
+            Rect::from_corners(i32::MIN, 0, i32::MAX, 0, 640, 480),
+            Some(Rect {
+                x: 0,
+                y: 0,
+                w: 640,
+                h: 1
+            })
+        );
+    }
+
+    #[test]
+    fn from_corners_rejects_empty_or_outside_boxes() {
+        assert_eq!(Rect::from_corners(50, 50, 40, 60, 640, 480), None); // x1 < x0
+        assert_eq!(Rect::from_corners(700, 10, 720, 20, 640, 480), None); // right of image
+        assert_eq!(Rect::from_corners(-30, 10, -10, 20, 640, 480), None); // left of image
+    }
+
+    #[test]
+    fn map_detector_box_into_letterboxed_preview() {
+        // Firmware configuration: 640×480 detector image shown at (0,120) 640×480 in the canvas.
+        let preview = fit_rect(1280, 960, 640, 720);
+        let face = Rect {
+            x: 100,
+            y: 50,
+            w: 80,
+            h: 90,
+        };
+        assert_eq!(
+            map_rect(face, 640, 480, preview),
+            Rect {
+                x: 100,
+                y: 170,
+                w: 80,
+                h: 90
+            }
+        );
+    }
+
+    #[test]
+    fn map_rect_scales_both_axes() {
+        let to = Rect {
+            x: 10,
+            y: 20,
+            w: 320,
+            h: 120,
+        };
+        let r = Rect {
+            x: 64,
+            y: 48,
+            w: 128,
+            h: 96,
+        };
+        assert_eq!(
+            map_rect(r, 640, 480, to),
+            Rect {
+                x: 42,
+                y: 32,
+                w: 64,
+                h: 24
+            }
+        );
+        assert_eq!(map_rect(Rect::full(640, 480), 640, 480, to), to);
     }
 
     #[test]

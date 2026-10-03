@@ -26,14 +26,17 @@ Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP
 |---|---|
 | Display, touch, camera preview, Ethernet, I2S audio | Working |
 | Vision pipeline (camera → PPA → preview / inference threads) | Working |
-| Face detection | **Stub** (`pipeline::detect_faces` returns no faces; planned: `espressif/human_face_detect`) |
-| Face embedding model | **Placeholder**: `assets/mobilefacenet_quantized.espdl` is exported from an untrained network (`ml/export/`) |
+| Face detection | Working: ESP-DL `human_face_detect` (MSR+MNP), green boxes drawn over the preview |
+| Face embedding | Working: ESP-DL `human_face_recognition` (MFN), 512-d, aligned from 5 landmarks |
+| Enrollment | Not yet (M2): no templates exist, so matching never fires |
 | Template download / matching | Matching implemented and unit-tested; template download is not yet triggered by the state machine |
-| Voice recognition | Not implemented on device (`tools/enroll_user.py` computes speaker embeddings on the host) |
+| Voice recognition | Not implemented |
 
-Known issues: occasional full-screen white/cyan flashes (seen on older builds too; suspected display
-cable or power), partition table offset overlaps `nvs`, deep-sleep wake pins don't match the admin
-button (see [Power](#power--deep-sleep)).
+Known issues:
+- **Camera pipeline runs at about 8 fps, not 45.** Each PPA scale of the 1280×960 frame takes 80–95 ms. Cache maintenance and LVGL's PPA use were ruled out as causes. This caps inference at about 4/s.
+- **Embedding takes about 187 ms**, against Espressif's published 96 ms for MFN on the P4.
+- Occasional full-screen white/cyan flashes (seen on older builds too; suspected display cable or power).
+- Deep-sleep wake pins don't match the admin button (see [Power](#power--deep-sleep)).
 
 ---
 
@@ -80,7 +83,7 @@ admin button is configured in Rust (`system.rs`).
 | LVGL (`taskLVGL`) | 0 | 4 | 7 KB | `esp_lvgl_port` | Render, sw-rotate 270°, flush to DPI framebuffer; 5 ms timer |
 | `gt911_poller` | 1 | 5 | 3 KB | C++ | Poll GT911 every 15 ms |
 | `cam_pipeline` | 1 | 6 | 8 KB | Rust `pipeline.rs` | Dequeue frame → PPA preview → swap canvas; feed detector |
-| `inference` | 1 | 3 | 32 KB | Rust `pipeline.rs` | Detect → crop → embed → match, ≤ 10 Hz |
+| `inference` | 1 | 3 | 32 KB | Rust `pipeline.rs` | Detect → overlay → embed → match, ≤ 10 Hz (~27 KB of stack never used) |
 | audio capture | any | 5 | 4 KB | Rust `audio_worker.rs` | Read I2S mic into a bounded queue |
 | inactivity watchdog | any | 5 | 4 KB | Rust `power.rs` | Deep sleep after 180 s without input |
 | IDF system tasks | n/a | n/a | n/a | ESP-IDF | Event loop, lwIP, EMAC RX, ISP/CSI drivers |
@@ -96,7 +99,7 @@ no Kconfig option for this), keeping Core 1 free for the vision pipeline.
 │   touch / admin button → InactivityTimer::reset()       │   │   p4_ui_present_camera(back buffer)  (LVGL lock, 5 ms)  │
 │                                                         │   │   on request: PPA 1280×960 → 640×480 RGB888 ──┐         │
 │ LVGL (prio 4)                                           │   │ inference (prio 3)                             ▼         │
-│   render canvas + right panel, rotate 270°, DSI flush   │   │   detect → PPA crop 112×112 → embed → match ──┐         │
+│   render canvas + right panel, rotate 270°, DSI flush   │   │   detect → overlay → align+embed → match ─────┐         │
 │                                                         │   │ gt911_poller (prio 5)                          │         │
 └─────────────────────────────────────────────────────────┘   └──────────────────────────────────────────────┼─────────┘
                                                                                                              └─▶ events
@@ -115,9 +118,51 @@ no Kconfig option for this), keeping Core 1 free for the vision pipeline.
    requests a frame by handing the buffer back; the camera fills it from the next frame. Inference
    therefore never stalls the preview, always sees a frame at most one sensor period old, and is
    capped at 10 Hz.
-4. **Recognition**: detected faces are cropped to 112×112 RGB888 by the PPA, embedded by ESP-DL
-   (`dl_mobilefacenet_run`, 512-d, L2-normalised) and matched by cosine similarity (threshold 0.75)
-   against enrolled `GroupMember` templates.
+4. **Detection**: ESP-DL `human_face_detect` (MSR proposals + MNP refinement) returns boxes and 5
+   facial landmarks. Boxes are mapped into canvas coordinates and drawn as LVGL overlay objects.
+5. **Recognition**: for each face with landmarks, ESP-DL `human_face_recognition` aligns the face to
+   112×112 and computes a 512-d, L2-normalised MFN embedding. It is matched by cosine similarity
+   (threshold 0.75) against enrolled `GroupMember` templates.
+
+The C++ side is a thin adapter (`face_inference.cpp`). Detection results come back to Rust, and
+matching and enrollment stay in Rust (`HumanFaceRecognizer`'s own database is not used).
+
+**Colour order.** The PPA's "RGB888" is ESP-IDF's `color_pixel_rgb888_data_t`, stored **B, G, R** in
+memory. That is what ESP-DL calls BGR888. The detector buffer is therefore passed as `BGR888`. Passing
+it as RGB888 swaps red and blue; on the device this cut detection to a few percent of frames.
+
+### Model Contract
+
+Defined in `crates/biometric-core/src/contract.rs` and checked at startup:
+
+| Item | Value |
+|---|---|
+| Detector | `human_face_detect` 0.4.2, `human_face_detect_msr_s8_v1` + `mnp_s8_v1` |
+| Embedder | `human_face_recognition` 0.3.2, `human_face_feat_mfn_s8_v1` (`FEATURE_MODEL_VERSION`) |
+| Detector input | 640×480 PPA RGB888 (BGR888 to ESP-DL), full field of view |
+| Landmarks | 5 per face; required for alignment |
+| Embedding | 512 × `f32`, L2-normalised. A model reporting another length disables recognition (detection keeps running). |
+
+The two components must be upgraded together: `human_face_recognition` 0.3.x requires
+`human_face_detect ~0.4.1` (detect 0.5.x is incompatible).
+
+### Measured Performance (ESP32-P4 rev 1.3, 360 MHz)
+
+| Stage | Time | Notes |
+|---|---|---|
+| Detection (MSR+MNP) | 19–23 ms | Espressif publishes about 17 ms |
+| Embedding (MFN, incl. alignment) | 181–195 ms | Espressif publishes about 96 ms; under investigation |
+| Camera pipeline | 7–9 fps | PPA preview and detector scaling, 80–95 ms each |
+| Inference rate | 3–4 /s | Limited by the camera rate |
+| Faces found | up to ~80% of frames | One person in front of the camera, indoor light |
+
+These numbers need the ESP-DL-oriented settings in `sdkconfig.defaults`:
+- `CONFIG_SPIRAM_XIP_FROM_PSRAM` (run code and models from PSRAM);
+- 256 KB L2 cache;
+- `-O2`.
+
+Without them, detection measured 28–120 ms and embedding 466–706 ms. Only the RGB888 → RGB888 ESP-DL
+pixel conversion is compiled in, which saves about 1.1 MB of code.
 
 All PPA work, DMA-buffer allocation (128-byte aligned PSRAM) and frame lifetimes are owned by Rust
 (`ppa.rs`, `camera.rs`, `pipeline.rs`). The PPA driver performs cache maintenance on its input and
@@ -139,8 +184,8 @@ output windows itself.
       8. Ethernet.
    3. Start the audio capture thread; configure the admin button.
    4. Start the inactivity watchdog.
-   5. Load the ESP-DL model from flash (embedded with `include_bytes!`, 16-byte aligned).
-   6. Spawn the vision pipeline (camera + inference threads).
+   5. Spawn the vision pipeline (camera + inference threads). The inference thread loads both face
+      models (`p4_face_init`) before taking its first frame.
 3. State machine loop (`biometrics.rs`):
    `Initialize → DetectionValidation ⇄ ActionExecuted`, plus `RetrieveRuntimeData` /
    `UpdatingRuntimeData` for template sync.
@@ -167,7 +212,9 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │   └── biometric-core/               # Hardware-independent logic, host unit tests
 │       └── src/
 │           ├── geometry.rs           # PixelFormat, Rect, ImageRef, crop / letterbox math
-│           └── matching.rs           # GroupMember, best_match, cosine similarity
+│           ├── contract.rs           # Model contract (input format, landmarks, embedding size)
+│           ├── matching.rs           # GroupMember, best_match, cosine similarity
+│           └── stats.rs              # Allocation-free latency statistics
 ├── firmware/                         # ESP32-P4 application (Rust + ESP-IDF)
 │   ├── .cargo/config.toml            # Target, build-std, espflash runner, ESP-IDF version
 │   ├── rust-toolchain.toml           # Pinned nightly + rust-src
@@ -176,15 +223,13 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │   ├── sdkconfig.defaults            # ESP-IDF Kconfig (PSRAM, cache, camera, LVGL, Ethernet …)
 │   ├── partitions.csv                # Flash layout (see below)
 │   ├── components_esp32p4.lock       # Locked ESP-IDF managed component versions
-│   ├── assets/
-│   │   └── mobilefacenet_quantized.espdl   # ESP-DL model embedded into the firmware
 │   ├── components/biometrics_wrapper/      # C++ ESP-IDF component
-│   │   ├── biometrics_wrapper.cpp    # Display/LVGL, touch, camera V4L2, audio, Ethernet, ESP-DL, OTA
+│   │   ├── biometrics_wrapper.cpp    # Display/LVGL, touch, camera V4L2, audio, Ethernet, OTA
+│   │   ├── face_inference.cpp        # ESP-DL face detection + embedding adapter
 │   │   ├── include/biometrics_wrapper.h    # C API used from Rust
 │   │   ├── include/bindings.h        # Headers esp-idf-sys generates Rust bindings from
 │   │   ├── idf_component.yml         # Managed component dependencies
-│   │   ├── CMakeLists.txt
-│   │   └── Kconfig.projbuild
+│   │   └── CMakeLists.txt
 │   └── src/
 │       ├── main.rs                   # Entry point, main loop
 │       ├── system.rs                 # SystemResources builder, template fetch/cache
@@ -195,8 +240,7 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │       ├── audio_worker.rs           # I2S mic capture thread
 │       ├── speaker.rs                # I2S speaker output (chime)
 │       └── power.rs                  # Inactivity watchdog, deep sleep, boot crash counter
-├── ml/export/                        # PyTorch → ONNX → ESP-DL export / quantisation scripts
-└── tools/enroll_user.py              # Host-side face + voice enrollment (ONNX, SpeechBrain)
+└── docs/ROADMAP.md                    # Milestones
 ```
 
 ### Flash Layout (`firmware/partitions.csv`, 16 MB)
@@ -206,10 +250,13 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 | nvs | data/nvs | `0x9000` | 64 KB |
 | otadata | data/ota | `0x19000` | 8 KB |
 | phy_init | data/phy | `0x1B000` | 4 KB |
-| ota_0 | app | `0x20000` | 3.5 MB |
-| ota_1 | app | `0x3A0000` | 3.5 MB |
-| model | data/spiffs | `0x720000` | 3 MB |
-| storage | data/spiffs | `0xA20000` | 5.875 MB |
+| ota_0 | app | `0x20000` | 6 MB |
+| ota_1 | app | `0x620000` | 6 MB |
+| model | data/spiffs | `0xC20000` | 2 MB (reserved for M3) |
+| storage | data/spiffs | `0xE20000` | 1.875 MB |
+
+The partition table lives at the default `0x8000`, where `espflash` writes it and the app reads it.
+The app slots hold the firmware plus the embedded face models: about 5.1 MB, 81% of a slot.
 
 ---
 
@@ -269,8 +316,10 @@ cargo fmt --check && cargo clippy --release -- -D warnings   # same checks as CI
 - **After editing C++ or headers**, run `touch sdkconfig.defaults` before `cargo build --release`.
   `esp-idf-sys` only re-runs its CMake build (and regenerates bindings) when that file changes;
   otherwise the old C++ object is silently relinked.
-- **Model:** the `.espdl` file is embedded at compile time; replacing
-  `assets/mobilefacenet_quantized.espdl` and rebuilding is enough.
+- **Models** come from the `human_face_detect` / `human_face_recognition` components and are embedded
+  at build time; the variants are chosen in `sdkconfig.defaults`.
+- **After changing `partitions.csv`**, erase the chip once: `espflash erase-flash`, then
+  `cargo run --release`. Stale data from the old layout can otherwise be misread.
 
 ---
 
