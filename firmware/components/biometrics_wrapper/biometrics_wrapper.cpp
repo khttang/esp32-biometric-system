@@ -471,7 +471,8 @@ int32_t init_display_system(void) {
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_lcd_panel, true), TAG_LVGL, "esp_lcd_panel_disp_on_off failed");
 
     // 6. Initialize ESP-LVGL-PORT
-    const lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    port_cfg.task_affinity = 0; // keep LVGL on Core 0; Core 1 runs the camera/inference pipeline
     ESP_RETURN_ON_ERROR(lvgl_port_init(&port_cfg), TAG_LVGL, "lvgl_port_init failed");
 
     lvgl_port_display_cfg_t lvgl_disp_cfg = {};

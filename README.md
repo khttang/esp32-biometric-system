@@ -73,7 +73,7 @@ admin button is configured in Rust (`system.rs`).
 | Task | Core | Priority | Stack | Created by | Role |
 |---|---|---|---|---|---|
 | `main` | 0 | 1 | 8 KB | ESP-IDF (Rust `main`) | Boot, then state machine loop (~20 ms period) |
-| LVGL (`taskLVGL`) | any¹ | 4 | 7 KB | `esp_lvgl_port` | Render, sw-rotate 270°, flush to DPI framebuffer; 5 ms timer |
+| LVGL (`taskLVGL`) | 0 | 4 | 7 KB | `esp_lvgl_port` | Render, sw-rotate 270°, flush to DPI framebuffer; 5 ms timer |
 | `gt911_poller` | 1 | 5 | 3 KB | C++ | Poll GT911 every 15 ms |
 | `cam_pipeline` | 1 | 6 | 8 KB | Rust `pipeline.rs` | Dequeue frame → PPA preview → swap canvas; feed detector |
 | `inference` | 1 | 3 | 32 KB | Rust `pipeline.rs` | Detect → crop → embed → match, ≤ 10 Hz |
@@ -81,7 +81,8 @@ admin button is configured in Rust (`system.rs`).
 | inactivity watchdog | any | 5 | 4 KB | Rust `power.rs` | Deep sleep after 180 s without input |
 | IDF system tasks | n/a | n/a | n/a | ESP-IDF | Event loop, lwIP, EMAC RX, ISP/CSI drivers |
 
-¹ `ESP_LVGL_PORT_INIT_CONFIG()` uses `task_affinity = -1`, so LVGL may run on either core.
+LVGL is pinned to Core 0 via `port_cfg.task_affinity` in `init_display_system()` (esp_lvgl_port has
+no Kconfig option for this), keeping Core 1 free for the vision pipeline.
 
 ```text
 ┌──────────────────────── Core 0 ────────────────────────┐   ┌──────────────────────── Core 1 ────────────────────────┐
@@ -90,7 +91,7 @@ admin button is configured in Rust (`system.rs`).
 │   ◀── InferenceEvent { FaceSeen | Match(member) } ──────┼───┤   PPA 1280×960 → 640×480 RGB565, letterboxed            │
 │   touch / admin button → InactivityTimer::reset()       │   │   p4_ui_present_camera(back buffer)  (LVGL lock, 5 ms)  │
 │                                                         │   │   on request: PPA 1280×960 → 640×480 RGB888 ──┐         │
-│ LVGL (prio 4, unpinned — usually here)                  │   │ inference (prio 3)                             ▼         │
+│ LVGL (prio 4)                                           │   │ inference (prio 3)                             ▼         │
 │   render canvas + right panel, rotate 270°, DSI flush   │   │   detect → PPA crop 112×112 → embed → match ──┐         │
 │                                                         │   │ gt911_poller (prio 5)                          │         │
 └─────────────────────────────────────────────────────────┘   └──────────────────────────────────────────────┼─────────┘
