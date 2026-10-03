@@ -14,6 +14,7 @@ use std::sync::atomic::AtomicBool;
 use std::thread::sleep;
 use std::time::Duration;
 
+use crate::audio_worker::{AudioFrame, AUDIO_QUEUE_DEPTH};
 use crate::hdmi_audio::HdmiAudioPlayer;
 use crate::power::InactivityTimer;
 use crate::video::{FaceBox, VideoPipeline};
@@ -111,6 +112,7 @@ pub mod ffi {
         pub fn dl_mobilefacenet_run(crop_rgb888: *const u8, out_embedding: *mut f32, embedding_len: usize) -> i32;
         pub fn init_i2s_duplex_c(sample_rate: u32, bclk_gpio: i32, ws_gpio: i32, din_gpio: i32, dout_gpio: i32) -> i32;
         pub fn update_camera_viewport(frame: *const P4CameraFrame);
+        pub fn p4_touch_is_pressed() -> bool;
     }
 }
 
@@ -132,6 +134,9 @@ pub struct SystemResources {
 
     // Inactivity watchdog timer handle
     pub inactivity_timer: InactivityTimer,
+
+    // Bounded mic frame queue; frames are dropped when nobody drains it
+    pub audio_rx: std::sync::mpsc::Receiver<AudioFrame>,
 
     // Shared between Core 0 (Network) and Core 1 (Matcher)
     pub group_members: Arc<ArcSwap<Vec<GroupMember>>>,
@@ -184,7 +189,7 @@ impl SystemResourcesBuilder {
         // 3. Audio Subsystem & Worker
         //init_audio_subsystem()
         //    .context("[SystemResources] initializes audio system")?;
-        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<Vec<i16>>();
+        let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<AudioFrame>(AUDIO_QUEUE_DEPTH);
         crate::audio_worker::spawn_audio_capture_thread(0, audio_tx);
         let hdmi_player = HdmiAudioPlayer::new(0);
 
@@ -218,7 +223,8 @@ impl SystemResourcesBuilder {
             event_loop,
             timer_service,
             hdmi_player,
-            inactivity_timer: InactivityTimer::new(),
+            inactivity_timer,
+            audio_rx,
             admin_button,
             video_pipeline: VideoPipeline::new(),
             model_ptr: model_ptr as *mut u8,
@@ -286,6 +292,10 @@ impl SystemResources {
 
     pub fn is_admin_pressed(&self) -> bool {
         self.admin_button.is_low()
+    }
+
+    pub fn is_touch_pressed(&self) -> bool {
+        unsafe { ffi::p4_touch_is_pressed() }
     }
 
     /// Fetch group members over network with local Flash fallback

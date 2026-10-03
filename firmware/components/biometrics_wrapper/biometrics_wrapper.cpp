@@ -151,7 +151,6 @@ static uint8_t s_ppa_idx = 0;
 
 static void *s_ui_canvas_buf = NULL;
 static lv_obj_t *s_camera_canvas_obj = NULL;
-static TaskHandle_t s_camera_task_handle = NULL;
 static volatile bool s_ui_ready = false;
 
 static volatile uint16_t s_touch_x = 0;
@@ -241,68 +240,6 @@ void configure_camera_exposure_gain(int fd) {
     set_v4l2_control(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO, "EXPOSURE_AUTO");
     set_v4l2_control(fd, V4L2_CID_AUTOGAIN, 1, "AUTOGAIN");
     set_v4l2_control(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1, "AUTO_WHITE_BALANCE");
-}
-
-void process_camera_frame_task(void *pvParameters) {
-    struct v4l2_buffer buf = {};
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-
-    ESP_LOGI("CAM_TASK", "Camera capture task running on Core 1");
-
-    while (s_camera_streaming) {
-        if (ioctl(s_video_fd, VIDIOC_DQBUF, &buf) == 0) {
-            void *cam_buf = s_cam_buffers[buf.index].start;
-
-            if (s_ui_ready && s_camera_canvas_obj != NULL && s_ui_canvas_buf != NULL) {
-                if (lvgl_port_lock(0)) {
-                    ppa_srm_oper_config_t srm_cfg = {};
-
-                    // 1. Input Image Configuration (OV5647 1280x720)
-                    srm_cfg.in.buffer = cam_buf;
-                    srm_cfg.in.pic_w = VideoConfig::SENSOR_WIDTH;
-                    srm_cfg.in.pic_h = VideoConfig::SENSOR_HEIGHT;
-                    srm_cfg.in.block_w = VideoConfig::SENSOR_WIDTH;
-                    srm_cfg.in.block_h = VideoConfig::SENSOR_HEIGHT;
-                    srm_cfg.in.block_offset_x = 0;
-                    srm_cfg.in.block_offset_y = 0;
-                    srm_cfg.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
-
-                    // 2. Output Canvas Configuration (640x360 RGB565)
-                    srm_cfg.out.buffer = s_ui_canvas_buf;
-                    srm_cfg.out.buffer_size = VideoConfig::VIEWPORT_WIDTH * VideoConfig::VIEWPORT_HEIGHT * sizeof(uint16_t);
-                    srm_cfg.out.pic_w = VideoConfig::VIEWPORT_WIDTH;
-                    srm_cfg.out.pic_h = VideoConfig::VIEWPORT_HEIGHT;
-                    srm_cfg.out.block_offset_x = 0;
-                    srm_cfg.out.block_offset_y = 0;
-                    srm_cfg.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
-
-                    // 3. Precise 2:1 Scaling Ratios
-                    srm_cfg.scale_x = (float)VideoConfig::VIEWPORT_WIDTH / (float)VideoConfig::SENSOR_WIDTH;   // 0.5f
-                    srm_cfg.scale_y = (float)VideoConfig::VIEWPORT_HEIGHT / (float)VideoConfig::SENSOR_HEIGHT; // 0.5f
-                    srm_cfg.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
-                    srm_cfg.mirror_x = false;
-                    srm_cfg.mirror_y = false;
-
-                    // 4. Execute Hardware Scaling via ESP32-P4 PPA
-                    esp_err_t ppa_err = ppa_do_scale_rotate_mirror(s_ppa_client, &srm_cfg);
-                    if (ppa_err != ESP_OK) {
-                        ESP_LOGE("CAM_TASK", "PPA scaling failed: 0x%x", ppa_err);
-                    } else {
-                        lv_obj_invalidate(s_camera_canvas_obj);
-                    }
-
-                    lvgl_port_unlock();
-                }
-            }
-            // Re-queue buffer back to V4L2
-            ioctl(s_video_fd, VIDIOC_QBUF, &buf);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-
-    vTaskDelete(NULL);
 }
 
 // -----------------------------------------------------------------------------
@@ -433,6 +370,10 @@ int write_i2s_tx_c(int i2s_port, const int16_t *buffer, uint32_t sample_count, u
 extern "C" {
 
 esp_cam_sensor_device_t *ov5647_detect(void *config);
+
+bool p4_touch_is_pressed(void) {
+    return s_touch_pressed;
+}
 
 int32_t init_audio_system(void) {
     const uint32_t SAMPLE_RATE = 16000U;
@@ -722,19 +663,6 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
         return -1;
     }
 
-    // Register task on CPU 1 (Core 1) to leave CPU 0 free for LVGL/OS tasks
-    BaseType_t res = xTaskCreatePinnedToCore(
-        process_camera_frame_task, // Task function pointer
-        "cam_frame_task",          // Task name
-        8192,                      // Stack size in bytes
-        NULL,                      // Task parameters
-        5,                         // Priority (Higher priority for low-latency video)
-        &s_camera_task_handle,     // Task handle pointer
-        1                          // Core ID (CPU 1)
-    );
-    if (res != pdPASS) {
-        ESP_LOGE("CAM_TASK", "Failed to spawn camera frame task!");
-    }
     s_camera_streaming = true;
 
     ESP_LOGI(TAG_CAM, "OV5647 Camera streaming successfully on /dev/video0 (%dx%d RGB565)!", 

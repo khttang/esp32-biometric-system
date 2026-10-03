@@ -48,6 +48,7 @@ void lvgl_unlock(void);
 // UI & Camera Operations
 void setup_split_screen_ui(void);
 void update_camera_viewport(const p4_camera_frame_t *frame);
+bool p4_touch_is_pressed(void);
 
 // Camera V4L2 Driver FFI
 int32_t p4_camera_init_v4l2_default(void);

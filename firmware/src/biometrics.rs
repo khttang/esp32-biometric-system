@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use crate::system::{SystemResources, crop_face_112x112};
 
-const INACTIVITY_TIMEOUT_SECS: u64 = 180; // 3 minutes idle -> Deep Sleep
 const FACE_EMBEDDING_DIM: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +38,6 @@ pub enum SystemState {
 
 pub struct BiometricSystem {
     state: SystemState,
-    last_activity_time: Instant,
     action_display_timer: Option<Instant>,
 }
 
@@ -47,7 +45,6 @@ impl BiometricSystem {
     pub fn new() -> Self {
         Self {
             state: SystemState::Initialize,
-            last_activity_time: Instant::now(),
             action_display_timer: None,
         }
     }
@@ -61,13 +58,18 @@ impl BiometricSystem {
     ) {
         let now = Instant::now();
 
+        // Any user input keeps the device awake (deep sleep is owned by power::spawn_inactivity_watchdog)
+        if admin_button_pressed || resources.is_touch_pressed() {
+            resources.inactivity_timer.reset();
+        }
+
         match &self.state {
             // -----------------------------------------------------------------
             // 1. INITIALIZE: System setup verification
             // -----------------------------------------------------------------
             SystemState::Initialize => {
                 info!("Hardware & pipeline ready. Transitioning to DetectionValidation...");
-                self.last_activity_time = now;
+                resources.inactivity_timer.reset();
                 self.state = SystemState::DetectionValidation;
             }
 
@@ -93,7 +95,7 @@ impl BiometricSystem {
                         resources.video_pipeline.render_camera_half(&resources.raw_frame, &detected_faces);
 
                         if !detected_faces.is_empty() {
-                            self.last_activity_time = now;
+                            resources.inactivity_timer.reset();
 
                             // 1. Crop face box to 112x112 RGB888 buffer
                             if let Some(crop_112x112) = crop_face_112x112(
@@ -123,12 +125,6 @@ impl BiometricSystem {
                     if resources.fail_count % 120 == 0 {
                         info!("[CAM_DEBUG] capture_camera_frame() returned false {} times!", resources.fail_count);
                     }
-                }
-
-                // C. 180s Inactivity Timeout -> Deep Sleep
-                if now.duration_since(self.last_activity_time) >= Duration::from_secs(INACTIVITY_TIMEOUT_SECS) {
-                    info!("No activity detected for {}s. Entering Deep Sleep...", INACTIVITY_TIMEOUT_SECS);
-                    crate::power::enter_deep_sleep(None); // Shuts off backlight, arms wake pins, calls esp_deep_sleep_start
                 }
             }
 
@@ -176,7 +172,7 @@ impl BiometricSystem {
                 if let Some(timer) = self.action_display_timer {
                     if now >= timer {
                         info!("Action feedback complete. Returning to DetectionValidation.");
-                        self.last_activity_time = now;
+                        resources.inactivity_timer.reset();
                         self.action_display_timer = None;
                         self.state = SystemState::DetectionValidation;
                     }
