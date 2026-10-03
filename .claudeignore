@@ -1,0 +1,11 @@
+# Ignore heavy build artifacts and caches
+target/
+.git/
+.cargo/
+**/*.pdb
+
+# Ignore system keys, secrets, or temporary logs
+.env
+*.log
+secure_vault/
+
