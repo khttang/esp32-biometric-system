@@ -47,7 +47,12 @@ mod tests {
     use super::*;
 
     fn member(id: &str, embedding: &[f32]) -> GroupMember {
-        GroupMember { id: id.into(), name: id.into(), role: Role::User, face_embedding: embedding.to_vec() }
+        GroupMember {
+            id: id.into(),
+            name: id.into(),
+            role: Role::User,
+            face_embedding: embedding.to_vec(),
+        }
     }
 
     fn normalized(v: &[f32]) -> Vec<f32> {
@@ -94,7 +99,8 @@ mod tests {
 
     #[test]
     fn parses_server_template_json() {
-        let json = r#"[{"id":"Ada_Lovelace","name":"Ada","role":"ADMIN","face_embedding":[0.6,0.8]}]"#;
+        let json =
+            r#"[{"id":"Ada_Lovelace","name":"Ada","role":"ADMIN","face_embedding":[0.6,0.8]}]"#;
         let members: Vec<GroupMember> = serde_json::from_str(json).unwrap();
         assert_eq!(members[0].role, Role::Admin);
         assert_eq!(members[0].face_embedding, vec![0.6, 0.8]);

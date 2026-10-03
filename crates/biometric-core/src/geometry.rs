@@ -52,11 +52,21 @@ pub fn centered_aspect_crop(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> R
     if u64::from(src_w) * u64::from(dst_h) >= u64::from(dst_w) * u64::from(src_h) {
         // Source is wider: keep full height, crop width.
         let w = (u64::from(src_h) * u64::from(dst_w) / u64::from(dst_h)) as u32;
-        Rect { x: (src_w - w) / 2, y: 0, w, h: src_h }
+        Rect {
+            x: (src_w - w) / 2,
+            y: 0,
+            w,
+            h: src_h,
+        }
     } else {
         // Source is taller: keep full width, crop height.
         let h = (u64::from(src_w) * u64::from(dst_h) / u64::from(dst_w)) as u32;
-        Rect { x: 0, y: (src_h - h) / 2, w: src_w, h }
+        Rect {
+            x: 0,
+            y: (src_h - h) / 2,
+            w: src_w,
+            h,
+        }
     }
 }
 
@@ -68,11 +78,21 @@ pub fn fit_rect(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Rect {
     if u64::from(src_w) * u64::from(dst_h) >= u64::from(dst_w) * u64::from(src_h) {
         // Source is wider: full width, bars above and below.
         let h = (u64::from(dst_w) * u64::from(src_h) / u64::from(src_w)) as u32;
-        Rect { x: 0, y: (dst_h - h) / 2, w: dst_w, h }
+        Rect {
+            x: 0,
+            y: (dst_h - h) / 2,
+            w: dst_w,
+            h,
+        }
     } else {
         // Source is taller: full height, bars left and right.
         let w = (u64::from(dst_h) * u64::from(src_w) / u64::from(src_h)) as u32;
-        Rect { x: (dst_w - w) / 2, y: 0, w, h: dst_h }
+        Rect {
+            x: (dst_w - w) / 2,
+            y: 0,
+            w,
+            h: dst_h,
+        }
     }
 }
 
@@ -115,29 +135,64 @@ mod tests {
     fn preview_crop_for_ov5647_into_left_half() {
         // The firmware's actual configuration: 1280×960 sensor → 640×720 viewport.
         let crop = centered_aspect_crop(1280, 960, 640, 720);
-        assert_eq!(crop, Rect { x: 213, y: 0, w: 853, h: 960 });
+        assert_eq!(
+            crop,
+            Rect {
+                x: 213,
+                y: 0,
+                w: 853,
+                h: 960
+            }
+        );
     }
 
     #[test]
     fn centered_crop_on_taller_source_crops_height() {
         let crop = centered_aspect_crop(720, 1280, 640, 480);
-        assert_eq!(crop, Rect { x: 0, y: 370, w: 720, h: 540 });
+        assert_eq!(
+            crop,
+            Rect {
+                x: 0,
+                y: 370,
+                w: 720,
+                h: 540
+            }
+        );
     }
 
     #[test]
     fn centered_crop_with_same_aspect_is_identity() {
-        assert_eq!(centered_aspect_crop(1280, 960, 640, 480), Rect::full(1280, 960));
+        assert_eq!(
+            centered_aspect_crop(1280, 960, 640, 480),
+            Rect::full(1280, 960)
+        );
     }
 
     #[test]
     fn preview_fit_for_ov5647_into_left_half() {
         // The firmware's actual configuration: whole 1280×960 frame letterboxed in 640×720.
-        assert_eq!(fit_rect(1280, 960, 640, 720), Rect { x: 0, y: 120, w: 640, h: 480 });
+        assert_eq!(
+            fit_rect(1280, 960, 640, 720),
+            Rect {
+                x: 0,
+                y: 120,
+                w: 640,
+                h: 480
+            }
+        );
     }
 
     #[test]
     fn fit_taller_source_pillarboxes() {
-        assert_eq!(fit_rect(480, 640, 640, 480), Rect { x: 140, y: 0, w: 360, h: 480 });
+        assert_eq!(
+            fit_rect(480, 640, 640, 480),
+            Rect {
+                x: 140,
+                y: 0,
+                w: 360,
+                h: 480
+            }
+        );
     }
 
     #[test]
@@ -147,33 +202,99 @@ mod tests {
 
     #[test]
     fn clamp_trims_box_hanging_off_the_edge() {
-        let r = Rect { x: 600, y: 450, w: 100, h: 100 };
-        assert_eq!(r.clamp_to(640, 480), Some(Rect { x: 600, y: 450, w: 40, h: 30 }));
+        let r = Rect {
+            x: 600,
+            y: 450,
+            w: 100,
+            h: 100,
+        };
+        assert_eq!(
+            r.clamp_to(640, 480),
+            Some(Rect {
+                x: 600,
+                y: 450,
+                w: 40,
+                h: 30
+            })
+        );
     }
 
     #[test]
     fn clamp_rejects_box_fully_outside() {
-        assert_eq!(Rect { x: 700, y: 10, w: 20, h: 20 }.clamp_to(640, 480), None);
-        assert_eq!(Rect { x: 10, y: 10, w: 0, h: 20 }.clamp_to(640, 480), None);
+        assert_eq!(
+            Rect {
+                x: 700,
+                y: 10,
+                w: 20,
+                h: 20
+            }
+            .clamp_to(640, 480),
+            None
+        );
+        assert_eq!(
+            Rect {
+                x: 10,
+                y: 10,
+                w: 0,
+                h: 20
+            }
+            .clamp_to(640, 480),
+            None
+        );
     }
 
     #[test]
     fn contains_checks_bounds_without_overflow() {
         let data = [0u8; 16];
-        let img = ImageRef { data: &data, width: 4, height: 2, format: PixelFormat::Rgb565 };
+        let img = ImageRef {
+            data: &data,
+            width: 4,
+            height: 2,
+            format: PixelFormat::Rgb565,
+        };
         assert!(img.contains(Rect::full(4, 2)));
-        assert!(img.contains(Rect { x: 3, y: 1, w: 1, h: 1 }));
-        assert!(!img.contains(Rect { x: 3, y: 0, w: 2, h: 1 }));
-        assert!(!img.contains(Rect { x: 0, y: 0, w: 0, h: 1 }));
-        assert!(!img.contains(Rect { x: u32::MAX, y: 0, w: 2, h: 1 }));
+        assert!(img.contains(Rect {
+            x: 3,
+            y: 1,
+            w: 1,
+            h: 1
+        }));
+        assert!(!img.contains(Rect {
+            x: 3,
+            y: 0,
+            w: 2,
+            h: 1
+        }));
+        assert!(!img.contains(Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 1
+        }));
+        assert!(!img.contains(Rect {
+            x: u32::MAX,
+            y: 0,
+            w: 2,
+            h: 1
+        }));
     }
 
     #[test]
     fn well_formed_requires_enough_bytes() {
         let data = [0u8; 15];
-        let img = ImageRef { data: &data, width: 4, height: 2, format: PixelFormat::Rgb565 };
+        let img = ImageRef {
+            data: &data,
+            width: 4,
+            height: 2,
+            format: PixelFormat::Rgb565,
+        };
         assert!(!img.is_well_formed());
-        let img = ImageRef { data: &data[..12], width: 2, height: 2, format: PixelFormat::Rgb888 };
+        let img = ImageRef {
+            data: &data[..12],
+            width: 2,
+            height: 2,
+            format: PixelFormat::Rgb888,
+        };
         assert!(img.is_well_formed());
     }
 }

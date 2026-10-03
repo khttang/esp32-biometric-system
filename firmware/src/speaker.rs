@@ -20,7 +20,7 @@ impl Speaker {
 
     pub fn play_success_chime(&mut self) -> Result<()> {
         let mut chime_pcm = Vec::new();
-        Self::generate_sine_wave(880.0, 0.15, &mut chime_pcm);  // A5
+        Self::generate_sine_wave(880.0, 0.15, &mut chime_pcm); // A5
         Self::generate_sine_wave(1760.0, 0.25, &mut chime_pcm); // A6
 
         let ret = unsafe {

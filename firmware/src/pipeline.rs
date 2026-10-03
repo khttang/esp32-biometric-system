@@ -31,7 +31,7 @@ use crate::camera::Camera;
 use crate::ffi;
 use biometric_core::geometry::fit_rect;
 
-use crate::ppa::{image_len, DmaBuf, ImageRef, PixelFormat, Ppa, Rect};
+use crate::ppa::{image_len, DmaBuf, ImageRef, PixelFormat, Ppa, Rect, Target};
 
 // Sensor stream; must match VideoConfig::SENSOR_* in biometrics_wrapper.cpp
 const SENSOR_W: u32 = 1280;
@@ -81,9 +81,13 @@ pub fn spawn(members: Arc<ArcSwap<Vec<GroupMember>>>) -> Result<Receiver<Inferen
 
     let detector_buf = DmaBuf::new(image_len(DET_W, DET_H, PixelFormat::Rgb888))
         .context("failed to allocate detector buffer")?;
-    request_tx.send(detector_buf).map_err(|_| anyhow!("request channel closed"))?; // first request
+    request_tx
+        .send(detector_buf)
+        .map_err(|_| anyhow!("request channel closed"))?; // first request
 
-    spawn_on_core1(c"cam_pipeline", 8 * 1024, 6, move || camera_loop(camera, request_rx, frame_tx))?;
+    spawn_on_core1(c"cam_pipeline", 8 * 1024, 6, move || {
+        camera_loop(camera, request_rx, frame_tx)
+    })?;
     spawn_on_core1(c"inference", 32 * 1024, 3, move || {
         inference_loop(frame_rx, request_tx, event_tx, members)
     })?;
@@ -139,7 +143,6 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
     // The bars stay black because preview buffers start zeroed and the PPA never writes there.
     let full_frame = Rect::full(SENSOR_W, SENSOR_H);
     let view_rect = fit_rect(SENSOR_W, SENSOR_H, VIEW_W, VIEW_H);
-    let det_rect = Rect::full(DET_W, DET_H);
     let mut pending_request: Option<DmaBuf> = None;
 
     info!("[Pipeline] camera thread running on core 1");
@@ -154,11 +157,21 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
         };
         let image = frame.image();
 
-        match ppa.scale_crop(image, full_frame, &mut previews[back], VIEW_W, VIEW_H, view_rect, PixelFormat::Rgb565) {
+        let preview = Target {
+            buf: &mut previews[back],
+            width: VIEW_W,
+            height: VIEW_H,
+            rect: view_rect,
+            format: PixelFormat::Rgb565,
+        };
+        match ppa.scale_crop(image, full_frame, preview) {
             Ok(()) => {
                 // Safety: the buffer stays alive (and unwritten) until the next swap.
                 let presented = unsafe {
-                    ffi::p4_ui_present_camera(previews[back].as_ptr().cast(), PRESENT_LOCK_TIMEOUT_MS)
+                    ffi::p4_ui_present_camera(
+                        previews[back].as_ptr().cast(),
+                        PRESENT_LOCK_TIMEOUT_MS,
+                    )
                 };
                 if presented {
                     back ^= 1;
@@ -171,7 +184,8 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
             pending_request = requests.try_recv().ok();
         }
         if let Some(mut detector_buf) = pending_request.take() {
-            match ppa.scale_crop(image, full_frame, &mut detector_buf, DET_W, DET_H, det_rect, PixelFormat::Rgb888) {
+            let detector = Target::full(&mut detector_buf, DET_W, DET_H, PixelFormat::Rgb888);
+            match ppa.scale_crop(image, full_frame, detector) {
                 Ok(()) => {
                     if frames.send(detector_buf).is_err() {
                         return warn!("[Pipeline] inference thread gone; camera thread exiting");
@@ -197,7 +211,8 @@ fn inference_loop(
         Ok(ppa) => ppa,
         Err(e) => return error!("[Pipeline] PPA client registration failed: {e}"),
     };
-    let Some(mut face_buf) = DmaBuf::new(image_len(FACE_SIZE, FACE_SIZE, PixelFormat::Rgb888)) else {
+    let Some(mut face_buf) = DmaBuf::new(image_len(FACE_SIZE, FACE_SIZE, PixelFormat::Rgb888))
+    else {
         return error!("[Pipeline] failed to allocate face buffer");
     };
     let mut embedding = [0.0f32; EMBEDDING_DIM];
@@ -217,8 +232,12 @@ fn inference_loop(
             let _ = events.try_send(InferenceEvent::FaceSeen);
         }
         for face in &faces {
-            let Some(rect) = face.rect.clamp_to(DET_W, DET_H) else { continue };
-            if let Err(e) = ppa.scale_crop(image, rect, &mut face_buf, FACE_SIZE, FACE_SIZE, Rect::full(FACE_SIZE, FACE_SIZE), PixelFormat::Rgb888) {
+            let Some(rect) = face.rect.clamp_to(DET_W, DET_H) else {
+                continue;
+            };
+            let face_target =
+                Target::full(&mut face_buf, FACE_SIZE, FACE_SIZE, PixelFormat::Rgb888);
+            if let Err(e) = ppa.scale_crop(image, rect, face_target) {
                 warn!("[Pipeline] face crop failed: {e}");
                 continue;
             }

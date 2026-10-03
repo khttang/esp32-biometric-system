@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::{Input, PinDriver, Pull};
@@ -12,14 +12,14 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use crate::audio_worker::{AudioFrame, AUDIO_QUEUE_DEPTH};
-use crate::ffi;
-use crate::speaker::Speaker;
-use crate::power::InactivityTimer;
-use crate::pipeline::InferenceEvent;
 use crate::biometrics::GroupMember;
+use crate::ffi;
+use crate::pipeline::InferenceEvent;
+use crate::power::InactivityTimer;
+use crate::speaker::Speaker;
 
 // Sleep Parameters (wake pins live in power.rs)
-const INACTIVITY_TIMEOUT_SECS: u64 = 180;  // 3 mins
+const INACTIVITY_TIMEOUT_SECS: u64 = 180; // 3 mins
 const TEMPLATE_ENDPOINT: &str = "http://192.168.1.100:8080/api/v1/members";
 
 // Force 16-byte alignment required by ESP32-P4 ESP-DL hardware acceleration
@@ -73,8 +73,8 @@ pub struct SystemResourcesBuilder {
 
 impl SystemResourcesBuilder {
     pub fn new() -> Result<Self> {
-        let peripherals = Peripherals::take()
-            .context("SystemResources Failed to take ESP32-P4 peripherals")?;
+        let peripherals =
+            Peripherals::take().context("SystemResources Failed to take ESP32-P4 peripherals")?;
         Ok(Self { peripherals })
     }
 
@@ -96,7 +96,10 @@ impl SystemResourcesBuilder {
         };
         let init_ret = unsafe { ffi::p4_hardware_init_all(&config) };
         if init_ret != 0 {
-            bail!("[SystemResources] p4_hardware_init_all failed: {}", init_ret);
+            bail!(
+                "[SystemResources] p4_hardware_init_all failed: {}",
+                init_ret
+            );
         }
 
         // 3. Audio Subsystem & Worker
@@ -113,15 +116,25 @@ impl SystemResourcesBuilder {
         // 5. Inactivity Watchdog
         let inactivity_timer = InactivityTimer::new();
         crate::power::spawn_inactivity_watchdog(inactivity_timer.clone(), INACTIVITY_TIMEOUT_SECS);
-        info!("[SystemResources] Power Inactivity watchdog active (Timeout: {}s)", INACTIVITY_TIMEOUT_SECS);
+        info!(
+            "[SystemResources] Power Inactivity watchdog active (Timeout: {}s)",
+            INACTIVITY_TIMEOUT_SECS
+        );
 
         // 6. Neural Model Setup
         let model: &'static [u8] = &MODEL_WEIGHTS.0;
-        info!("[ESP-DL] MobileFaceNet model mapped at flash addr {:p} (Size: {} bytes)", model.as_ptr(), model.len());
+        info!(
+            "[ESP-DL] MobileFaceNet model mapped at flash addr {:p} (Size: {} bytes)",
+            model.as_ptr(),
+            model.len()
+        );
 
         let dl_err = unsafe { ffi::dl_mobilefacenet_init(model.as_ptr(), model.len()) };
         if dl_err != 0 {
-            bail!("[SystemResources] MobileFaceNet Init Failed with code: {}", dl_err);
+            bail!(
+                "[SystemResources] MobileFaceNet Init Failed with code: {}",
+                dl_err
+            );
         }
 
         // 7. Vision pipeline (camera + inference threads on Core 1)
@@ -167,13 +180,19 @@ impl SystemResources {
 
         match self.download_members_http() {
             Ok(members) => {
-                info!("Successfully fetched {} members over network.", members.len());
+                info!(
+                    "Successfully fetched {} members over network.",
+                    members.len()
+                );
                 let _ = Self::save_members_to_flash("/spiffs/members.json", &members);
                 self.group_members.store(Arc::new(members));
                 Ok(())
             }
             Err(err) => {
-                warn!("HTTP fetch failed ({:?}). Loading local Flash backup...", err);
+                warn!(
+                    "HTTP fetch failed ({:?}). Loading local Flash backup...",
+                    err
+                );
                 let cached_members = Self::load_members_from_flash("/spiffs/members.json")?;
                 self.group_members.store(Arc::new(cached_members));
                 Ok(())
@@ -244,4 +263,3 @@ impl SystemResources {
 pub fn validate_running_app() {
     unsafe { ffi::p4_mark_app_valid() };
 }
-

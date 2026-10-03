@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 use crate::pipeline::InferenceEvent;
 use crate::system::SystemResources;
 
-
 pub use biometric_core::matching::{best_match, GroupMember};
 
 #[derive(Debug)]
@@ -102,7 +101,10 @@ impl BiometricSystem {
             // -----------------------------------------------------------------
             SystemState::UpdatingRuntimeData { force_full_resync } => {
                 resources.inactivity_timer.reset();
-                info!("State: UpdatingRuntimeData (Force Full Resync: {})", force_full_resync);
+                info!(
+                    "State: UpdatingRuntimeData (Force Full Resync: {})",
+                    force_full_resync
+                );
 
                 if !resources.check_ethernet_link_status() {
                     error!("Cannot sync: Ethernet cable is disconnected!");
