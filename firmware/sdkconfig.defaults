@@ -31,7 +31,8 @@ CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
 # =============================================================================
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
-CONFIG_PARTITION_TABLE_OFFSET=0xc000
+# Partition table at the default 0x8000 (bootloader is ~22 KB, fits below it); the layout
+# itself is partitions.csv, written by espflash (`--partition-table` in .cargo/config.toml).
 
 # =============================================================================
 # 5. Processor L2 Cache Boost (ESP-DL Neural Engine Acceleration)
