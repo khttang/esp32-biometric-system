@@ -29,8 +29,9 @@ Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP
 | Face detection | Working: ESP-DL MSR+MNP models, green boxes drawn over the preview |
 | Face embedding | Working: ESP-DL MobileFaceNet, 512-d, aligned from 5 landmarks |
 | Model updates | Models live in their own flash partitions with a verified manifest; update them without reflashing the firmware ([Model Partitions](#model-partitions)) |
-| Enrollment | Not yet (M2): no templates exist, so matching never fires |
-| Template download / matching | Matching implemented and unit-tested; template download is not yet triggered by the state machine |
+| Enrollment | On-device: the admin view on the touch panel enrolls the face in view and deletes members; templates persist in flash ([Enrollment & Templates](#enrollment--templates)) |
+| Matching | Cosine similarity against enrolled templates of the same model release; the threshold (0.5) is Espressif's default and has **not** been measured on a test set yet |
+| Template download | Not yet (M4): the HTTP fetch code is not triggered by the state machine |
 | Voice recognition | Not implemented |
 
 Known issues:
@@ -38,6 +39,7 @@ Known issues:
 - **Embedding takes about 187 ms**, against Espressif's published 96 ms for MFN on the P4.
 - Occasional full-screen white/cyan flashes (seen on older builds too; suspected display cable or power).
 - Deep-sleep wake pins don't match the admin button (see [Power](#power--deep-sleep)).
+- **Templates are stored unencrypted** and the admin view is open to anyone at the device (see [Enrollment & Templates](#enrollment--templates)).
 
 ---
 
@@ -84,7 +86,7 @@ admin button is configured in Rust (`system.rs`).
 | LVGL (`taskLVGL`) | 0 | 4 | 7 KB | `esp_lvgl_port` | Render, sw-rotate 270°, flush to DPI framebuffer; 5 ms timer |
 | `gt911_poller` | 1 | 5 | 3 KB | C++ | Poll GT911 every 15 ms |
 | `cam_pipeline` | 1 | 6 | 8 KB | Rust `pipeline.rs` | Dequeue frame → PPA preview → (on request) detector image from preview → swap canvas; logs fps/PPA stats every 10 s |
-| `inference` | 1 | 3 | 32 KB | Rust `pipeline.rs` | Detect → overlay → embed → match, ≤ 10 Hz (~27 KB of stack never used) |
+| `inference` | 1 | 3 | 32 KB | Rust `pipeline.rs` | Detect → overlay → embed → match, ≤ 10 Hz (~23 KB of stack never used) |
 | audio capture | any | 5 | 4 KB | Rust `audio_worker.rs` | Read I2S mic into a bounded queue |
 | inactivity watchdog | any | 5 | 4 KB | Rust `power.rs` | Deep sleep after 180 s without input |
 | IDF system tasks | n/a | n/a | n/a | ESP-IDF | Event loop, lwIP, EMAC RX, ISP/CSI drivers |
@@ -133,7 +135,8 @@ no Kconfig option for this), keeping Core 1 free for the vision pipeline.
    facial landmarks. Boxes are mapped into canvas coordinates and drawn as LVGL overlay objects.
 5. **Recognition**: for each face with landmarks, ESP-DL `human_face_recognition` aligns the face to
    112×112 and computes a 512-d, L2-normalised MFN embedding. It is matched by cosine similarity
-   (threshold 0.75) against enrolled `GroupMember` templates.
+   (threshold 0.5) against the enrolled `GroupMember` templates that were produced by the same
+   model release. During an enrollment the embeddings are collected into a new template instead.
 
 The C++ side is a thin adapter (`face_inference.cpp`). Detection results come back to Rust, and
 matching and enrollment stay in Rust (`HumanFaceRecognizer`'s own database is not used).
@@ -201,6 +204,62 @@ tools/face-models.sh all     # all three steps
 
 Model files are not committed: `models/` is gitignored and the releases are pinned by SHA-256 in
 the script.
+
+### Enrollment & Templates
+
+Members are enrolled on the device itself; no server is involved.
+
+**Flow.** The right-hand panel shows a status line and an **Admin** button (the admin button on
+GPIO 0 does the same). The admin view has a name field with an on-screen keyboard, the member
+list, and **Enroll**, **Delete** and **Done**:
+
+1. **Enroll** asks the inference thread for a template. It needs exactly one face in view (with
+   several, there is no telling whose it should be).
+2. The inference thread averages 5 embeddings (`biometric_core::enrollment`). Each sample must
+   reach the match threshold against the mean of the earlier ones, so a second person stepping
+   in is not averaged into the template. The panel shows the progress.
+3. The main thread rejects the template if it already matches a member ("Already enrolled as …").
+   Otherwise it stores it and publishes the new member list to the matcher (`ArcSwap`, no lock on
+   the inference path).
+4. An enrollment that has not finished after 15 s is abandoned. The admin view closes after 60 s
+   without a touch.
+
+An empty name becomes `Member <n>`. Ids are `local-<n>`; `n` is a counter kept in flash, so an id
+is never reused after a deletion. All members enrolled on the device have the `USER` role.
+
+**Template format v1** (`biometric_core::template`). One binary record per member: a 12-byte
+header (magic `FTPL`, format version, role, field lengths, embedding dimension), then the id,
+name and model version as UTF-8 and the embedding as little-endian `f32`. That is about 2.1 KB
+for a 512-d embedding. Decoding is strict: wrong magic or version, lengths that disagree with the
+header, invalid UTF-8 and non-finite values are all rejected.
+
+**Bound to the model release.** Each template records the `version` from the feature model's
+manifest ([Model Partitions](#model-partitions)). Matching skips templates from any other release:
+an embedding from one model means nothing to another. After a model update the log says how many
+templates no longer match; those members must be enrolled again (delete, then enroll).
+
+**Storage** (`firmware/src/templates.rs`). Each record is an NVS blob (`tpl00`…`tpl31`, up to 32
+members) in the `templates` partition, a separate NVS partition so that erasing the system `nvs`
+leaves enrollments alone. NVS provides wear levelling, a CRC per entry and power-fail-safe writes.
+Templates are loaded at boot; a record that fails to decode is logged and skipped.
+
+**Threshold.** `MATCH_THRESHOLD` is 0.5, the default of Espressif's `HumanFaceRecognizer` for this
+model. It has not been measured with this pipeline yet. To measure it, watch the inference log
+line, which reports the similarity of each embedded face to its closest template every 10 s:
+
+```text
+… | closest template n=42 min 0.61 avg 0.74 max 0.83 (threshold 0.5)
+```
+
+Enrolled people in view should stay well above the threshold in the poses and lighting you care
+about (false rejects); people who are not enrolled should stay well below it (false accepts).
+
+**Limitations.**
+- Templates are stored **unencrypted** (flash/NVS encryption is planned for M4). They are biometric
+  data: anyone who can read the flash can read them.
+- Anyone at the device can open the admin view; there is no admin authentication yet.
+- There is no liveness check: a photo of an enrolled person matches.
+- Roles are stored but not used for anything yet.
 
 ### Measured Performance (ESP32-P4 rev 1.3, 360 MHz)
 
@@ -284,8 +343,10 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │   │       ├── geometry.rs           # PixelFormat, Rect, ImageRef, crop / fit / mapping math
 │   │       ├── contract.rs           # Model contract (input, partitions, model ids, embedding size)
 │   │       ├── manifest.rs           # Model partition image format: build + verify
-│   │       ├── matching.rs           # GroupMember, best_match, cosine similarity
-│   │       └── stats.rs              # Allocation-free latency statistics
+│   │       ├── matching.rs           # GroupMember, model-version-aware matching, cosine similarity
+│   │       ├── template.rs           # Template format v1: encode / decode one stored member
+│   │       ├── enrollment.rs         # Sample accumulator, member ids / names / slots
+│   │       └── stats.rs              # Allocation-free latency and score statistics
 │   └── model-packer/                 # Host tool: .espdl + manifest -> partition image
 ├── firmware/                         # ESP32-P4 application (Rust + ESP-IDF)
 │   ├── .cargo/config.toml            # Target, build-std, espflash runner, ESP-IDF version
@@ -304,8 +365,10 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │   │   └── CMakeLists.txt
 │   └── src/
 │       ├── main.rs                   # Entry point, main loop
-│       ├── system.rs                 # SystemResources builder, template fetch/cache
-│       ├── biometrics.rs             # State machine
+│       ├── system.rs                 # SystemResources builder, enroll / delete, template fetch
+│       ├── biometrics.rs             # State machine (recognition, admin view, enrollment)
+│       ├── templates.rs              # Enrolled templates as NVS blobs
+│       ├── ui.rs                     # Control panel: status line, admin view events
 │       ├── pipeline.rs               # Camera + inference threads (Core 1)
 │       ├── camera.rs                 # V4L2 frame lifetime (RAII)
 │       ├── models.rs                 # Verify model partitions before loading
@@ -330,7 +393,8 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 | face_msr | data | `0xA20000` | 128 KB (MSR model, 61 KB) |
 | face_mnp | data | `0xA40000` | 192 KB (MNP model, 130 KB) |
 | face_feat | data | `0xA70000` | 2 MB (MobileFaceNet, 1.3 MB) |
-| storage | data/spiffs | `0xC70000` | 3.56 MB |
+| templates | data/nvs | `0xC70000` | 256 KB (enrolled templates, up to 32 × 2.1 KB) |
+| storage | data/spiffs | `0xCB0000` | 3.31 MB |
 
 The partition table lives at the default `0x8000`, where `espflash` writes it and the app reads it.
 - The app image is about 3.6 MB, 69% of a slot.
@@ -401,7 +465,7 @@ cargo fmt --check && cargo clippy --release -- -D warnings   # same checks as CI
   A board without models boots normally: the preview runs and the log says which models are missing.
 - **After changing `partitions.csv`**, erase the chip once: `espflash erase-flash`, then
   `cargo run --release` and `tools/face-models.sh all`. Stale data from the old layout can
-  otherwise be misread.
+  otherwise be misread. Erasing the chip also erases the enrolled templates.
 
 ---
 

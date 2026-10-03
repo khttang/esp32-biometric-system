@@ -160,7 +160,7 @@ record the model version from the manifest (the runtime source of truth) from th
 - On-board: normal load; a single flipped bit in the embedder is rejected (detection continues);
   an erased detector partition is rejected (preview continues).
 
-### ⬜ M2: On-Device Enrollment
+### 🚧 M2: On-Device Enrollment
 
 Enroll and recognise people locally, with no server.
 
@@ -174,6 +174,21 @@ Enroll and recognise people locally, with no server.
 **Validation:**
 - Host tests for serialisation, versioning and matching edge cases.
 - On-board enroll → reboot → recognise → delete cycle.
+
+**Outcome so far:**
+- `biometric-core::template` (binary record, strict decoding), version-aware
+  `matching::{closest, best_match}`, and `enrollment` (mean of 5 mutually consistent samples).
+- Templates are NVS blobs in a new `templates` partition (256 KB carved from `storage`), up to
+  32 members.
+- The right-hand panel has a status line and an admin view (name field + keyboard, member list,
+  Enroll / Delete / Done). Touch input now reaches LVGL in panel coordinates, so widgets can be
+  pressed (LVGL applies the display rotation itself).
+- The match threshold moved from 0.75 to Espressif's default of 0.5, and the log reports the
+  similarity to the closest template.
+
+**Still open:**
+- The threshold has not been measured on a test set.
+- See the pull request for what has been validated on the board.
 
 ### ⬜ M3b: A/B Model Slots, Validation Run, Rollback
 
