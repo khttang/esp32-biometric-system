@@ -1,0 +1,170 @@
+# Roadmap
+
+This project is a learning resource for **edge inference on the ESP32-P4 in Rust**. The roadmap
+takes it from "camera and display work" to a device whose **models and enrolled faces can be
+updated in the field without reflashing firmware**, the way production edge-AI products are run.
+
+Each milestone is delivered as **one self-contained pull request**, so it can be read and reviewed
+on its own.
+
+---
+
+## Ground Rules for Every Milestone PR
+
+- **Scope:** one milestone per PR. Unrelated fixes go in their own PR.
+- **Guidelines:** follows [`CLAUDE.md`](../CLAUDE.md):
+  - targets Rust 1.90;
+  - native safe concurrency and zero-overhead abstractions;
+  - no needless `RefCell` or per-frame heap allocation.
+- **Tests:**
+  - hardware-independent logic lives in `crates/biometric-core` with host unit tests;
+  - hardware-dependent behaviour is validated on the ESP32-P4-NANO, and the PR records what was checked and how.
+- **Docs:** README and this roadmap are updated in the same PR. They describe what the code does, not what it is meant to do.
+- **Quality:** no compiler warnings in the firmware build.
+- **Limitations:** known limitations are stated in the PR and the README's Project Status, not left implicit.
+
+---
+
+## Background: How Edge-Inference Data Is Managed
+
+A deployed edge-AI device carries three kinds of artifacts with very different lifecycles:
+
+| Artifact | Changes | Typical handling |
+|---|---|---|
+| **Firmware** (code) | Rarely, risky | Signed image, A/B app partitions, automatic rollback if the new image doesn't confirm itself (`ota_0`/`ota_1`, `p4_mark_app_valid` already exist here) |
+| **Model weights** | Occasionally (retraining, new architecture) | Versioned artifact from the ML pipeline, delivered separately from firmware into its own A/B slot, verified before use |
+| **Enrollment data** (known faces) | Often (people added/removed) | Server is the source of truth; the device keeps a synced cache; handled as sensitive personal data |
+
+Five principles drive the design below:
+
+1. **Model contract (manifest).** Firmware and model must agree on:
+   - input size and pixel format;
+   - normalisation and quantisation;
+   - output dimension;
+   - required runtime/operator versions.
+
+   Each model ships with a manifest that also carries its version, hash and signature. The device refuses models whose contract it doesn't support.
+2. **Templates are bound to a model version.** An embedding from model v1 is meaningless to model v2.
+   - Every stored template records the `model_version` that produced it.
+   - Changing the model means re-computing templates, which in practice happens server-side from retained enrollment images, or by re-enrolling.
+3. **Safe update flow:**
+   1. Download.
+   2. Verify hash and signature.
+   3. Write to the *inactive* slot.
+   4. Validate: load the model and run a known test input against its expected output.
+   5. Switch an NVS pointer.
+   6. Keep the previous slot for rollback.
+
+   Roll out to a few devices first.
+4. **Device management.** Platforms such as ThingsBoard, AWS IoT Jobs or Azure device twins publish *desired* versions; the device reports *actual* versions and acts on the difference.
+5. **Privacy.** Face templates are biometric data (e.g. GDPR special category, Illinois BIPA):
+   - store templates, not images, on the device;
+   - encrypt flash/NVS;
+   - support deleting a person everywhere.
+
+---
+
+## Milestones
+
+Status: ✅ done · 🚧 in progress · ⬜ planned
+
+### ✅ Foundation (PR #6, #7)
+
+- Firmware builds again; hygiene pass.
+- Rust vision pipeline on Core 1: camera → PPA preview, plus inference hand-off.
+- Host-tested `biometric-core` crate.
+- Accurate README.
+- LVGL pinned to Core 0.
+
+### ⬜ M0: Toolchain & Quality Gates
+
+Make every later PR verifiable by anyone.
+
+- **Rust 1.90 compliance:** pin the firmware toolchain to Rust 1.90, either
+  - a nightly from the 1.90 cycle, or
+  - stable 1.90 with `build-std`.
+
+  Set `rust-version = "1.90"` everywhere and verify that `biometric-core` builds and tests on stable 1.90.
+- `rustfmt` and `clippy` configuration; fix findings.
+- Continuous integration (GitHub Actions):
+  - host tests on stable 1.90;
+  - firmware release build (with cached ESP-IDF);
+  - fmt/clippy checks.
+
+**Validation:**
+- CI green on the PR.
+- The firmware built with the new toolchain boots on the board.
+
+### ⬜ M1: Real Inference with Embedded Models
+
+Replace the stub detector and the untrained embedding model with Espressif's pretrained models,
+compiled into the firmware.
+
+- Integrate `espressif/human_face_detect` and `espressif/human_face_recognition`. Exact model variants and APIs are confirmed in the PR.
+- Document the **model contract**: input format and size, preprocessing, output dimension. Make firmware constants derive from it rather than being duplicated.
+- Show detection results on screen as an LVGL overlay (bounding boxes).
+- Measure and document inference latency and memory use on the ESP32-P4.
+- Retire the placeholder `mobilefacenet_quantized.espdl` and the untrained export scripts, or clearly mark them as a learning exercise.
+
+**Validation:**
+- Host tests for any new pure logic (box scaling between detector and display coordinates, contract checks).
+- On-board: faces detected at the documented rate; latency numbers recorded in the PR.
+
+### ⬜ M2: On-Device Enrollment
+
+Enroll and recognise people locally, with no server.
+
+- Template format v1 in `biometric-core`:
+  - member id and name, role, embedding, `model_version`;
+  - matching rejects templates from a different model version.
+- Admin-button and touch flow to enroll the currently detected face; delete a member.
+- Persist templates in flash (encrypted storage planned in M4); load them at boot.
+- Matching threshold documented and measured (false accept/reject on a small test set).
+
+**Validation:**
+- Host tests for serialisation, versioning and matching edge cases.
+- On-board enroll → reboot → recognise → delete cycle.
+
+### ⬜ M3: Models from Flash Partitions (A/B + Manifest)
+
+Update model weights without rebuilding firmware, locally first.
+
+- Repartition for two model slots plus a manifest, and fix the current `partitions.csv` offset overlap with `nvs`.
+- Load models from a partition via ESP-DL's partition loading; manifest parsing and contract checks.
+- Validation run on a golden input before activating a model; NVS pointer switch; rollback.
+- Host tooling and documentation to package a model plus manifest and flash it with `espflash write-bin`.
+
+**Validation:**
+- Host tests for manifest parsing and the activation and rollback state machine.
+- On-board: swap models without reflashing the app, and reject a corrupted or incompatible model.
+
+### ⬜ M4: Network Sync & Remote Model Updates
+
+Operate a fleet.
+
+- Template sync from a server (versioned, incremental) over Ethernet; the server is the source of truth.
+- Remote model updates driven by device-management shared attributes (ThingsBoard client from git history, revisited): download, hash/signature verification, then the M3 activation flow.
+- Flash/NVS encryption for templates and secrets.
+- Documented trust model: who signs models, and how devices get keys.
+
+**Validation:**
+- Host tests for sync diffing and signature checks.
+- End-to-end test against a local server, including interrupted downloads and a bad signature.
+
+### ⬜ M5: Telemetry & Model Monitoring
+
+Know whether the model is working in the field.
+
+- Report inference latency, match-score distributions, and enroll/match/reject counts.
+- No biometric data in telemetry.
+- Documentation on reading the metrics: drift, threshold tuning.
+
+**Validation:**
+- Host tests for metric aggregation.
+- On-board reporting to the device-management server.
+
+### Out of Scope (for now)
+
+- On-device voice recognition: `tools/enroll_user.py` computes speaker embeddings on the host only.
+- ESP-IDF 5.5 / `esp-idf-*` crate upgrades: tracked separately, as their own PR.
+- The occasional white/cyan display flashes: suspected cable or power; tracked as an issue.
