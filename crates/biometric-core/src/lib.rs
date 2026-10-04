@@ -14,3 +14,4 @@ pub mod matching;
 pub mod signing;
 pub mod stats;
 pub mod template;
+pub mod template_v1;

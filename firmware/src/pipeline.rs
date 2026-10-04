@@ -32,7 +32,7 @@ use biometric_core::contract::{
 };
 use biometric_core::enrollment::Enrollment;
 use biometric_core::geometry::{fit_rect, map_rect};
-use biometric_core::matching::{closest, GroupMember, MATCH_THRESHOLD};
+use biometric_core::matching::{closest, GroupMember, Modality, MATCH_THRESHOLD};
 use biometric_core::stats::{LatencyStats, ScoreStats};
 use esp_idf_svc::hal::cpu::Core;
 use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
@@ -502,16 +502,16 @@ fn enroll_sample(
     }
 }
 
-/// Warns about templates the loaded feature model cannot be compared with.
+/// Warns about members the loaded feature model cannot recognise.
 fn log_stale_templates(members: &[Arc<GroupMember>], model_version: &str) {
-    let stale = members
+    let unusable = members
         .iter()
-        .filter(|m| m.model_version != model_version)
+        .filter(|m| m.template(Modality::Face, model_version).is_none())
         .count();
-    if stale > 0 {
+    if unusable > 0 {
         warn!(
-            "[Pipeline] {stale} of {} templates were enrolled with another model release and \
-             will not match; re-enroll those members",
+            "[Pipeline] {unusable} of {} members have no face template for this model release \
+             and will not match; enroll them again under their name",
             members.len()
         );
     }

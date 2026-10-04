@@ -22,17 +22,54 @@ pub enum Role {
     Guest,
 }
 
+/// What a template was computed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Modality {
+    Face,
+    Voice,
+}
+
+/// One embedding of a member, for one modality and one model release.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Template {
+    pub modality: Modality,
+    /// Release of the model that produced `embedding` (the model manifest's `version`).
+    pub model_version: String,
+    /// L2-normalised embedding.
+    pub embedding: Vec<f32>,
+}
+
+/// A person known to the device, with the templates that recognise them.
+///
+/// A member outlives its templates: after a model change the old template no longer applies,
+/// and until a new one exists the member is known but cannot be recognised ("needs
+/// enrollment"). A member holds at most one template per modality and model release.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GroupMember {
-    /// Unique identifier, e.g. `local-0001` for a member enrolled on the device.
+    /// Unique across devices, e.g. `80f1b2d2da2e-0001` for a member enrolled on that device.
     pub id: String,
     pub name: String,
     pub role: Role,
-    /// Release of the feature model that produced `face_embedding` (the model manifest's
-    /// `version`).
-    pub model_version: String,
-    /// L2-normalised face embedding.
-    pub face_embedding: Vec<f32>,
+    #[serde(default)]
+    pub templates: Vec<Template>,
+}
+
+impl GroupMember {
+    /// The member's template for `modality` from model release `model_version`, if any.
+    pub fn template(&self, modality: Modality, model_version: &str) -> Option<&Template> {
+        self.templates
+            .iter()
+            .find(|t| t.modality == modality && t.model_version == model_version)
+    }
+
+    /// Adds `template`, replacing the one for the same modality and model release.
+    pub fn set_template(&mut self, template: Template) {
+        self.templates.retain(|t| {
+            t.modality != template.modality || t.model_version != template.model_version
+        });
+        self.templates.push(template);
+    }
 }
 
 impl AsRef<GroupMember> for GroupMember {
@@ -41,11 +78,11 @@ impl AsRef<GroupMember> for GroupMember {
     }
 }
 
-/// Index and similarity of the comparable template closest to `embedding`, whether or not it
-/// reaches [`MATCH_THRESHOLD`].
+/// Index of the member whose face template is closest to `embedding`, and the similarity,
+/// whether or not it reaches [`MATCH_THRESHOLD`].
 ///
-/// A template is comparable if it was produced by `model_version` and has the same length as
-/// `embedding`; others are skipped rather than compared on a truncated prefix.
+/// Only a face template produced by `model_version` and of the same length as `embedding` is
+/// comparable; members without one are skipped rather than compared on something else.
 pub fn closest<M: AsRef<GroupMember>>(
     embedding: &[f32],
     model_version: &str,
@@ -55,10 +92,11 @@ pub fn closest<M: AsRef<GroupMember>>(
         .iter()
         .map(AsRef::as_ref)
         .enumerate()
-        .filter(|(_, m)| {
-            m.model_version == model_version && m.face_embedding.len() == embedding.len()
+        .filter_map(|(index, m)| {
+            let template = m.template(Modality::Face, model_version)?;
+            (template.embedding.len() == embedding.len())
+                .then(|| (index, cosine_similarity(embedding, &template.embedding)))
         })
-        .map(|(index, m)| (index, cosine_similarity(embedding, &m.face_embedding)))
         .filter(|(_, similarity)| similarity.is_finite())
         .max_by(|a, b| a.1.total_cmp(&b.1))
 }
@@ -92,8 +130,15 @@ mod tests {
             id: id.into(),
             name: id.into(),
             role: Role::User,
-            model_version: MODEL.into(),
-            face_embedding: embedding.to_vec(),
+            templates: vec![face(MODEL, embedding)],
+        }
+    }
+
+    fn face(model_version: &str, embedding: &[f32]) -> Template {
+        Template {
+            modality: Modality::Face,
+            model_version: model_version.into(),
+            embedding: embedding.to_vec(),
         }
     }
 
@@ -163,7 +208,7 @@ mod tests {
     fn templates_from_another_model_version_never_match() {
         let live = normalized(&[1.0, 0.0]);
         let mut stale = member("stale", &live);
-        stale.model_version = "model 0.9".into();
+        stale.templates = vec![face("model 0.9", &live)];
         assert_eq!(closest(&live, MODEL, &[stale.clone()]), None);
 
         // A weaker template from the current model wins over an identical stale one.
@@ -186,25 +231,60 @@ mod tests {
     }
 
     #[test]
-    fn parses_server_template_json() {
-        let json = r#"[{"id":"Ada_Lovelace","name":"Ada","role":"ADMIN",
-            "model_version":"model 1.0","face_embedding":[0.6,0.8]}]"#;
+    fn member_with_templates_for_two_models_matches_under_each() {
+        let (old, new) = (normalized(&[1.0, 0.0]), normalized(&[0.0, 1.0]));
+        let mut both = member("both", &old);
+        both.set_template(face("model 2.0", &new));
+        let members = [both];
+        assert_eq!(best_match(&old, MODEL, &members), Some((0, 1.0)));
+        assert_eq!(best_match(&new, "model 2.0", &members), Some((0, 1.0)));
+        // The old model's embedding means nothing to the new model's template.
+        assert_eq!(best_match(&old, "model 2.0", &members), None);
+    }
+
+    #[test]
+    fn member_without_templates_or_with_only_a_voice_template_never_matches_a_face() {
+        let live = normalized(&[1.0, 0.0]);
+        let mut nobody = member("needs enrollment", &live);
+        nobody.templates.clear();
+        assert_eq!(closest(&live, MODEL, &[nobody]), None);
+
+        let mut voice = member("voice only", &live);
+        voice.templates[0].modality = Modality::Voice;
+        assert_eq!(closest(&live, MODEL, &[voice]), None);
+    }
+
+    #[test]
+    fn set_template_replaces_only_the_same_modality_and_model() {
+        let mut m = member("m", &[1.0, 0.0]);
+        m.set_template(face(MODEL, &[0.0, 1.0]));
+        assert_eq!(m.templates, [face(MODEL, &[0.0, 1.0])]);
+        m.set_template(face("model 2.0", &[0.6, 0.8]));
+        let mut voice = face(MODEL, &[0.5, 0.5]);
+        voice.modality = Modality::Voice;
+        m.set_template(voice.clone());
+        assert_eq!(m.templates.len(), 3);
+        assert_eq!(m.template(Modality::Voice, MODEL), Some(&voice));
+        assert_eq!(m.template(Modality::Voice, "model 2.0"), None);
+    }
+
+    #[test]
+    fn parses_member_json() {
+        let json = r#"[{"id":"80f1b2d2da2e-0001","name":"Ada","role":"ADMIN","templates":[
+            {"modality":"FACE","model_version":"model 1.0","embedding":[0.6,0.8]}]},
+            {"id":"80f1b2d2da2e-0002","name":"Bo","role":"USER"}]"#;
         let members: Vec<GroupMember> = serde_json::from_str(json).unwrap();
         assert_eq!(members[0].role, Role::Admin);
-        assert_eq!(members[0].model_version, MODEL);
-        assert_eq!(members[0].face_embedding, vec![0.6, 0.8]);
+        assert_eq!(members[0].templates, [face(MODEL, &[0.6, 0.8])]);
+        assert!(members[1].templates.is_empty());
     }
 
     #[test]
-    fn rejects_server_template_without_model_version() {
-        let json = r#"[{"id":"x","name":"x","role":"USER","face_embedding":[1.0]}]"#;
-        assert!(serde_json::from_str::<Vec<GroupMember>>(json).is_err());
-    }
-
-    #[test]
-    fn rejects_unknown_role() {
-        let json =
-            r#"[{"id":"x","name":"x","role":"ROOT","model_version":"m","face_embedding":[]}]"#;
-        assert!(serde_json::from_str::<Vec<GroupMember>>(json).is_err());
+    fn rejects_unknown_role_and_modality() {
+        let role = r#"[{"id":"x","name":"x","role":"ROOT","templates":[]}]"#;
+        assert!(serde_json::from_str::<Vec<GroupMember>>(role).is_err());
+        let modality = r#"[{"id":"x","name":"x","role":"USER","templates":[
+            {"modality":"IRIS","model_version":"m","embedding":[1.0]}]}]"#;
+        assert!(serde_json::from_str::<Vec<GroupMember>>(modality).is_err());
     }
 }

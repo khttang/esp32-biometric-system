@@ -223,7 +223,7 @@ were all rejected, and the properly signed images in the other slots loaded.
 What signing does **not** protect against:
 - **Physical access.** Without secure boot, anyone with the serial cable can flash a firmware
   that trusts a different key, or none. Signing protects the path by which models reach the
-  device (the remote updates of M4d), not the device itself. Secure boot is discussed in M4b.
+  device (the remote updates of M4d), not the device itself. See [Encryption at Rest](#encryption-at-rest-not-enabled).
 - **A stolen secret key.** Whoever has it can publish models until the key is rotated out.
 - **Replay.** An older image with a valid signature is still accepted. Rejecting downgrades is
   planned with remote updates (M4d).
@@ -357,24 +357,52 @@ GPIO 0 does the same). The admin view has a name field and the member list on th
 4. An enrollment that has not finished after 15 s is abandoned. The admin view closes after 60 s
    without a touch.
 
-An empty name becomes `Member <n>`. Ids are `local-<n>`; `n` is a counter kept in flash, so an id
-is never reused after a deletion. All members enrolled on the device have the `USER` role.
+An empty name becomes `Member <n>`. Ids are `<device>-<n>`, for example `80f1b2d2da2e-0004`:
+the device part is the board's factory MAC address, so ids of members enrolled on different
+devices never collide, and `n` is a counter kept in flash, so an id is never reused after a
+deletion. All members enrolled on the device have the `USER` role.
 
-**Template format v1** (`biometric_core::template`). One binary record per member: a 12-byte
-header (magic `FTPL`, format version, role, field lengths, embedding dimension), then the id,
-name and model version as UTF-8 and the embedding as little-endian `f32`. That is about 2.1 KB
-for a 512-d embedding. Decoding is strict: wrong magic or version, lengths that disagree with the
-header, invalid UTF-8 and non-finite values are all rejected.
+**Members and templates.** A member (id, name, role) is separate from its templates. A template
+is one embedding for one modality (face today; the format already has a value for voice) and one
+model release. A member holds at most one template per modality and release, and may hold none.
 
 **Bound to the model release.** Each template records the `version` from the feature model's
-manifest ([Model Partitions](#model-partitions)). Matching skips templates from any other release:
-an embedding from one model means nothing to another. After a model update the log says how many
-templates no longer match; those members must be enrolled again (delete, then enroll).
+manifest ([Model Partitions](#model-partitions)). Matching uses only a member's face template for
+the release that is loaded: an embedding from one model means nothing to another. After a model
+update a member whose template is for the old release stays on the device but cannot be
+recognised, and the log says how many members that is.
 
-**Storage** (`firmware/src/templates.rs`). Each record is an NVS blob (`tpl00`…`tpl31`, up to 32
-members) in the `templates` partition, a separate NVS partition so that erasing the system `nvs`
-leaves enrollments alone. NVS provides wear levelling, a CRC per entry and power-fail-safe writes.
-Templates are loaded at boot; a record that fails to decode is logged and skipped.
+**Enrolling again.** To give such a member a template for the new release, type their exact name
+and press **Enroll**: the new template is added to that member instead of creating a second
+person. A name only selects a member who has no face template for the loaded release, so it
+cannot be used to overwrite someone who is already recognisable.
+
+**Template format v2** (`biometric_core::template`). Two kinds of binary record:
+- a member record: 8-byte header (magic `FMBR`, format version, role, field lengths), then the id
+  and name as UTF-8;
+- a template record: 12-byte header (magic `FTPL`, format version, modality, field lengths,
+  embedding dimension), then the member's id and the model version as UTF-8 and the embedding as
+  little-endian `f32`. That is about 2.1 KB for a 512-d embedding.
+
+Decoding is strict: wrong magic or version, lengths that disagree with the header, invalid UTF-8
+and non-finite values are all rejected. A template names its member, so a record makes sense on
+its own.
+
+**Storage** (`firmware/src/templates.rs`). Records are NVS blobs in the `templates` partition, a
+separate NVS partition so that erasing the system `nvs` leaves enrollments alone. A member
+occupies a slot `NN` (up to 32): `mNN` is the member record, `tNN_0` and `tNN_1` its templates.
+Two templates per member are enough for a face template for the model in use plus one for a model
+being introduced; more (voice) needs a larger partition. NVS provides wear levelling, a CRC per
+entry and power-fail-safe single writes. Across the several writes of an enrollment or deletion,
+the member record is the commit point: templates are written before it and erased after it, and
+template blobs without a member are removed at the next start.
+
+**Migration from format v1.** Format v1 kept one face embedding inside the member record
+(`tplNN`, ids `local-<n>`). At start-up each v1 record is converted to a member record plus a
+face template under the id `<device>-<n>`, and erased only after both are written, so an
+interrupted conversion is repeated. On the development board three enrolled members were
+converted; a flash dump before and after showed their embedding bytes unchanged, and a second
+boot loaded them without converting again.
 
 **Threshold.** `MATCH_THRESHOLD` is 0.5, the default of Espressif's `HumanFaceRecognizer` for this
 model. [Measuring Accuracy on the Board](#measuring-accuracy-on-the-board) reports what that
@@ -388,11 +416,36 @@ closest template every 10 s, so live scores can be compared with the dataset's:
 ```
 
 **Limitations.**
-- Templates are stored **unencrypted** (NVS encryption is planned for M4b). They are biometric
-  data: anyone who can read the flash can read them.
+- Templates are stored **unencrypted**. They are biometric data: anyone who can read the flash
+  can read them. See [Encryption at Rest](#encryption-at-rest-not-enabled) for why and what it
+  takes to change that.
+- Deleting a member erases its NVS entries, but NVS only marks them as erased: the bytes stay in
+  flash until that page is recycled.
+- The admin list does not show which members need to be enrolled again; only the log does.
+- Re-enrollment selects the member by exact name; two members with the same name cannot be told
+  apart that way.
 - Anyone at the device can open the admin view; there is no admin authentication yet.
 - There is no liveness check: a photo of an enrolled person matches.
 - Roles are stored but not used for anything yet.
+
+### Encryption at Rest (not enabled)
+
+Encrypting the templates in flash needs a key that an attacker with the flash contents cannot
+read, and on this chip that means an eFuse, which is burned once and cannot be changed:
+
+- **NVS encryption** encrypts an NVS partition with keys that are themselves protected either by
+  flash encryption or by the chip's HMAC peripheral with an eFuse key. Both need an eFuse.
+  With the HMAC scheme, ESP-IDF v5.5.5 generates and **burns the eFuse key by itself at the first
+  boot** if none is present (`nvs_sec_provider.c`), so merely enabling `CONFIG_NVS_ENCRYPTION` on
+  a board is already the permanent step.
+- **What it would protect:** reading the flash chip, or dumping it over the serial port.
+- **What it would not protect:** without secure boot, someone can flash a firmware that asks the
+  chip to decrypt the templates. Full protection is NVS encryption plus secure boot plus flash
+  encryption, after which every firmware must be signed.
+
+This project's development board keeps its eFuses untouched, so none of this is enabled and it
+has not been tested here. `CONFIG_NVS_ENCRYPTION` must stay off until that decision is made for a
+given device.
 
 ### Measuring Accuracy on the Board
 
@@ -549,8 +602,9 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │   │       ├── signing.rs            # Ed25519 signatures and key files
 │   │       ├── activation.rs         # A/B slot activation and rollback state machine
 │   │       ├── matching.rs           # GroupMember, model-version-aware matching, cosine similarity
-│   │       ├── template.rs           # Template format v1: encode / decode one stored member
-│   │       ├── enrollment.rs         # Sample accumulator, member ids / names / slots
+│   │       ├── template.rs           # Template format v2: member and template records, v1 migration
+│   │       ├── template_v1.rs        # Template format v1 (read only, for migration)
+│   │       ├── enrollment.rs         # Sample accumulator, member ids / names / slots, re-enrollment
 │   │       ├── stats.rs              # Allocation-free latency and score statistics
 │   │       ├── evaluation.rs         # False accept / false reject rates from similarity scores
 │   │       └── eval_protocol.rs      # Wire format of the on-board evaluation harness
@@ -578,7 +632,7 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │       ├── main.rs                   # Entry point, main loop
 │       ├── system.rs                 # SystemResources builder, enroll / delete, template fetch
 │       ├── biometrics.rs             # State machine (recognition, admin view, enrollment)
-│       ├── templates.rs              # Enrolled templates as NVS blobs
+│       ├── templates.rs              # Members and templates as NVS blobs; v1 migration
 │       ├── ui.rs                     # Control panel: status line, admin view events
 │       ├── pipeline.rs               # Camera + inference threads (Core 1)
 │       ├── camera.rs                 # V4L2 frame lifetime (RAII)

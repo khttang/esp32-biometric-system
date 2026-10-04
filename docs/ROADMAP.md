@@ -168,7 +168,7 @@ Enroll and recognise people locally, with no server.
   - member id and name, role, embedding, `model_version`;
   - matching rejects templates from a different model version.
 - Admin-button and touch flow to enroll the currently detected face; delete a member.
-- Persist templates in flash (encrypted storage planned in M4b); load them at boot.
+- Persist templates in flash (encryption at rest was deferred, see M4b); load them at boot.
 - Matching threshold documented and measured (false accept/reject on a small test set).
 
 **Validation:**
@@ -287,22 +287,34 @@ A hash shows a model image is intact; a signature shows who published it.
 **Not done:**
 - No protection against replaying an older, validly signed image (planned with M4d).
 - Without secure boot, someone with the serial cable can flash firmware that trusts another key.
-  Signing protects the model update path, not the device against physical access (M4b).
+  Signing protects the model update path, not the device against physical access (README, Encryption at Rest).
 
-#### ⬜ M4b: Encryption at Rest and Template Format v2
+#### ✅ M4b: Template Format v2 (encryption at rest deferred)
 
-- NVS encryption for the template partition, with the key in eFuse. Secure boot and flash
-  encryption are documented as the production step; whether they are burned on the development
-  board is decided in the PR.
-- Template format v2:
+**Done:**
+- Template format v2 (`biometric-core::template`):
   - a member (id, name, role) is stored separately from its templates;
-  - each template names its modality (face now, voice later) and the model release it belongs to;
-  - a member can hold several templates at once, and a missing one means "needs enrollment";
-  - member ids are unique across devices (today's `local-0001` is not).
-- Migration of format v1 records.
+  - each template names its modality (face now, a value reserved for voice) and the model
+    release it belongs to;
+  - a member can hold several templates, and one without a usable template stays on the device
+    as "needs enrollment" instead of disappearing;
+  - member ids are `<factory MAC>-<n>`, unique across devices.
+- Enrolling again after a model change: typing an existing member's name adds the template to
+  that member, if they have none for the loaded release.
+- Format v1 records are converted at start-up. On the board, three enrolled members were
+  converted, their embedding bytes were unchanged in a flash dump, and a second boot loaded them
+  without converting again.
+- Storage: the member record is the commit point across the writes of an enrollment or
+  deletion; template blobs without a member are removed at start-up.
 
-**Validation:** host tests for the format and the migration; on the board, enrolled templates
-survive the upgrade, and a flash dump no longer shows them in clear.
+**Not done:**
+- **Encryption at rest.** On this chip it needs an eFuse key, and ESP-IDF's NVS encryption burns
+  one by itself at first boot once enabled. The development board's eFuses stay untouched, so
+  nothing is enabled or tested; the README explains the options and what each protects.
+- Not exercised on the board: enrolling, enrolling again by name, and deleting through the
+  touch panel on this build; a live match after the conversion; a power cut in the middle of a
+  conversion, enrollment or deletion (the recovery paths are by construction, not provoked).
+- Two templates per member fit the 256 KB partition; voice templates will need a larger one.
 
 #### ⬜ M4c: Template Sync
 
