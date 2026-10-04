@@ -1,59 +1,215 @@
-//! Enrolled templates in flash: one NVS blob per member, in the dedicated `templates` partition.
+//! Enrolled members and their templates in flash: NVS blobs in the dedicated `templates`
+//! partition.
 //!
 //! NVS gives what a hand-rolled file would have to reinvent: wear levelling, a CRC per entry,
-//! and writes that either complete or leave the old state after a power cut. Each blob is a
-//! `biometric_core::template` record under the key `tplNN`; a `next_seq` counter numbers the
+//! and writes that either complete or leave the old state after a power cut. A member occupies
+//! a storage slot `NN`: its identity is the blob `mNN` and its templates are the blobs `tNN_0`
+//! and `tNN_1` (`biometric_core::template`, format v2). A `next_seq` counter numbers the
 //! members enrolled on this device, so an id is never reused after a deletion.
 //!
-//! The partition is not encrypted yet (planned with flash encryption in M4): anyone who can
-//! read the flash can read the templates.
+//! The member record is the commit point. Templates are written before it and erased after
+//! it, so a power cut leaves either a complete member or template blobs without a member,
+//! which are removed at the next start.
+//!
+//! Records of format v1 (`tplNN`, one blob holding the member and one face embedding) are
+//! converted at start-up and then erased.
+//!
+//! The partition is not encrypted (see README, Enrollment & Templates): anyone who can read
+//! the flash can read the templates.
 
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use biometric_core::contract::{EMBEDDING_DIM, TEMPLATE_PARTITION};
-use biometric_core::enrollment::{first_free_slot, local_member_id, member_name, MAX_MEMBERS};
-use biometric_core::matching::{GroupMember, Role};
-use biometric_core::template;
+use biometric_core::enrollment::{
+    device_id, first_free_slot, member_id, member_name, reenrollment_target, template_slot,
+    MAX_MEMBERS,
+};
+use biometric_core::matching::{GroupMember, Modality, Role, Template};
+use biometric_core::template::{self, MAX_MEMBER_LEN, MAX_TEMPLATES_PER_MEMBER};
+use biometric_core::template_v1;
 use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsCustom};
 use log::{info, warn};
+
+use crate::ffi;
 
 const NAMESPACE: &str = "face_tpl";
 const NEXT_SEQ_KEY: &str = "next_seq";
 
 pub struct TemplateStore {
     nvs: EspNvs<NvsCustom>,
+    /// This device's part of the ids of members enrolled here.
+    device_id: String,
     /// Storage slot and member, in slot order; the admin list shows them in this order.
     entries: Vec<(u8, Arc<GroupMember>)>,
 }
 
+/// NVS keys are limited to 15 characters.
+fn member_key(slot: u8) -> String {
+    format!("m{slot:02}")
+}
+
+fn template_key(slot: u8, index: usize) -> String {
+    format!("t{slot:02}_{index}")
+}
+
+fn v1_key(slot: u8) -> String {
+    format!("tpl{slot:02}")
+}
+
+fn template_buffer() -> Vec<u8> {
+    let v2 = template::max_template_len(EMBEDDING_DIM);
+    vec![0u8; v2.max(template_v1::max_encoded_len(EMBEDDING_DIM))]
+}
+
+/// The factory MAC address, which makes ids of members enrolled here unique across devices.
+fn read_device_id() -> Result<String> {
+    let mut mac = [0u8; 6];
+    // Safety: writes six bytes into `mac`.
+    let ret = unsafe { ffi::esp_efuse_mac_get_default(mac.as_mut_ptr()) };
+    anyhow::ensure!(ret == 0, "reading the factory MAC address failed: {ret}");
+    Ok(device_id(&mac))
+}
+
 impl TemplateStore {
-    /// Opens the partition (formatting it on first use) and loads every valid template.
-    /// Unreadable records are reported and skipped; their slots are reused by later enrollments.
+    /// Opens the partition (formatting it on first use), converts format v1 records, and loads
+    /// every valid member. Unreadable records are reported and skipped.
     pub fn open() -> Result<Self> {
         let partition = EspNvsPartition::<NvsCustom>::take(TEMPLATE_PARTITION)
             .with_context(|| format!("NVS partition `{TEMPLATE_PARTITION}` unavailable"))?;
         let nvs = EspNvs::new(partition, NAMESPACE, true)
             .with_context(|| format!("opening NVS namespace `{NAMESPACE}`"))?;
+        let mut store = Self {
+            nvs,
+            device_id: read_device_id()?,
+            entries: Vec::new(),
+        };
+        store.migrate_v1();
+        store.load();
+        let without_face = store
+            .entries
+            .iter()
+            .filter(|(_, m)| !m.templates.iter().any(|t| t.modality == Modality::Face))
+            .count();
+        info!(
+            "[Templates] device {}: {} of {MAX_MEMBERS} member slots in use, {without_face} \
+             without a face template",
+            store.device_id,
+            store.entries.len()
+        );
+        Ok(store)
+    }
 
-        let mut buf = vec![0u8; template::max_encoded_len(EMBEDDING_DIM)];
-        let mut entries = Vec::new();
+    /// Converts every format v1 record to a member record plus a face template. The v1 record
+    /// is erased last, so an interrupted conversion is simply repeated at the next start.
+    fn migrate_v1(&mut self) {
+        let mut buf = template_buffer();
         for slot in 0..MAX_MEMBERS as u8 {
-            let key = slot_key(slot);
-            match nvs.get_blob(&key, &mut buf) {
-                Ok(None) => {}
-                Ok(Some(record)) => match template::decode(record) {
-                    Ok(member) => entries.push((slot, Arc::new(member))),
-                    Err(e) => warn!("[Templates] {key}: {e}; ignored"),
-                },
-                Err(e) => warn!("[Templates] {key}: read failed: {e}; ignored"),
+            let key = v1_key(slot);
+            let record = match self.nvs.get_blob(&key, &mut buf) {
+                Ok(Some(record)) => record,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!("[Templates] {key}: read failed: {e}; left as it is");
+                    continue;
+                }
+            };
+            let member = match template_v1::decode(record) {
+                Ok(v1) => template::migrate_v1(v1, &self.device_id),
+                Err(e) => {
+                    warn!("[Templates] {key}: {e}; left as it is");
+                    continue;
+                }
+            };
+            let converted = self
+                .write_template(slot, 0, &member.id, &member.templates[0])
+                .and_then(|()| self.write_member(slot, &member))
+                .and_then(|()| self.nvs.remove(&key).context("erasing the v1 record"));
+            match converted {
+                Ok(_) => info!(
+                    "[Templates] {key}: converted {} to format v2 as {}",
+                    member.name, member.id
+                ),
+                Err(e) => warn!("[Templates] {key}: conversion failed: {e:#}; will retry"),
             }
         }
-        info!(
-            "[Templates] {} of {MAX_MEMBERS} slots in use",
-            entries.len()
-        );
-        Ok(Self { nvs, entries })
+    }
+
+    /// Loads every member with its templates; removes template blobs that belong to no member.
+    fn load(&mut self) {
+        let mut member_buf = [0u8; MAX_MEMBER_LEN];
+        for slot in 0..MAX_MEMBERS as u8 {
+            let key = member_key(slot);
+            let member = match self.nvs.get_blob(&key, &mut member_buf) {
+                Ok(Some(record)) => template::decode_member(record)
+                    .inspect_err(|e| warn!("[Templates] {key}: {e}; ignored"))
+                    .ok(),
+                Ok(None) => None,
+                Err(e) => {
+                    warn!("[Templates] {key}: read failed: {e}; ignored");
+                    None
+                }
+            };
+            let stored = self.stored_templates(slot);
+            let Some(mut member) = member else {
+                // Left behind by an interrupted enrollment or deletion.
+                for (index, _) in stored.iter().enumerate().filter(|(_, t)| t.is_some()) {
+                    self.remove_template(slot, index, "has no member");
+                }
+                continue;
+            };
+            for (index, entry) in stored.into_iter().enumerate() {
+                match entry {
+                    Some((owner, template)) if owner == member.id => member.set_template(template),
+                    Some(_) => self.remove_template(slot, index, "belongs to another member"),
+                    None => {}
+                }
+            }
+            self.entries.push((slot, Arc::new(member)));
+        }
+    }
+
+    /// What each template blob of `slot` holds: the owning member's id and the template.
+    /// Unreadable blobs are reported and count as empty.
+    fn stored_templates(&self, slot: u8) -> [Option<(String, Template)>; MAX_TEMPLATES_PER_MEMBER] {
+        let mut buf = template_buffer();
+        core::array::from_fn(|index| {
+            let key = template_key(slot, index);
+            match self.nvs.get_blob(&key, &mut buf) {
+                Ok(Some(record)) => template::decode_template(record)
+                    .inspect_err(|e| warn!("[Templates] {key}: {e}; ignored"))
+                    .ok(),
+                Ok(None) => None,
+                Err(e) => {
+                    warn!("[Templates] {key}: read failed: {e}; ignored");
+                    None
+                }
+            }
+        })
+    }
+
+    fn remove_template(&self, slot: u8, index: usize, why: &str) {
+        let key = template_key(slot, index);
+        match self.nvs.remove(&key) {
+            Ok(_) => warn!("[Templates] {key} {why}; erased"),
+            Err(e) => warn!("[Templates] {key} {why}; erasing it failed: {e}"),
+        }
+    }
+
+    fn write_member(&self, slot: u8, member: &GroupMember) -> Result<()> {
+        let record =
+            template::encode_member(member).map_err(|e| anyhow!("encoding member: {e}"))?;
+        self.nvs
+            .set_blob(&member_key(slot), &record)
+            .context("writing the member")
+    }
+
+    fn write_template(&self, slot: u8, index: usize, id: &str, template: &Template) -> Result<()> {
+        let record = template::encode_template(id, template)
+            .map_err(|e| anyhow!("encoding template: {e}"))?;
+        self.nvs
+            .set_blob(&template_key(slot, index), &record)
+            .context("writing the template")
     }
 
     /// The enrolled members, in the order used by [`Self::delete`].
@@ -64,14 +220,28 @@ impl TemplateStore {
             .collect()
     }
 
-    /// Persists a new member with `embedding` (from the feature model release
-    /// `model_version`) and returns it. `entered_name` may be empty.
+    /// Persists a face template `embedding` from the feature model release `model_version`
+    /// and returns the member it belongs to.
+    ///
+    /// If `entered_name` names a member who has no face template for that release, the
+    /// template is added to that member (enrolling again after a model change). Otherwise a
+    /// new member is created; `entered_name` may then be empty.
     pub fn enroll(
         &mut self,
         entered_name: &str,
         embedding: Vec<f32>,
         model_version: &str,
     ) -> Result<Arc<GroupMember>> {
+        let face = Template {
+            modality: Modality::Face,
+            model_version: model_version.to_owned(),
+            embedding,
+        };
+        let members: Vec<&GroupMember> = self.entries.iter().map(|(_, m)| m.as_ref()).collect();
+        if let Some(position) = reenrollment_target(&members, entered_name, model_version) {
+            return self.add_template(position, face);
+        }
+
         let used = self.entries.iter().map(|&(slot, _)| slot);
         let Some(slot) = first_free_slot(used, MAX_MEMBERS) else {
             bail!("all {MAX_MEMBERS} member slots are in use");
@@ -82,30 +252,56 @@ impl TemplateStore {
             .context("reading the enrollment counter")?
             .unwrap_or(1);
         let member = GroupMember {
-            id: local_member_id(sequence),
+            id: member_id(&self.device_id, sequence),
             name: member_name(entered_name, sequence),
             role: Role::User,
-            model_version: model_version.to_owned(),
-            face_embedding: embedding,
+            templates: vec![face],
         };
-        let record = template::encode(&member).map_err(|e| anyhow!("encoding template: {e}"))?;
 
-        // Counter first: if power fails between the two writes an id is skipped, never reused.
+        // Counter first: if power fails between the writes an id is skipped, never reused.
+        // The member record last: it is what makes the member exist.
         self.nvs
             .set_u32(NEXT_SEQ_KEY, sequence.wrapping_add(1))
             .context("writing the enrollment counter")?;
-        self.nvs
-            .set_blob(&slot_key(slot), &record)
-            .context("writing the template")?;
+        self.write_template(slot, 0, &member.id, &member.templates[0])?;
+        self.write_member(slot, &member)?;
 
         let member = Arc::new(member);
         let position = self.entries.partition_point(|&(s, _)| s < slot);
         self.entries.insert(position, (slot, member.clone()));
         info!(
-            "[Templates] enrolled {} ({}) in slot {slot}, {} bytes",
-            member.name,
-            member.id,
-            record.len()
+            "[Templates] enrolled {} ({}) in slot {slot}",
+            member.name, member.id
+        );
+        Ok(member)
+    }
+
+    /// Adds `new` to the member at `position`, replacing a template it supersedes.
+    fn add_template(&mut self, position: usize, new: Template) -> Result<Arc<GroupMember>> {
+        let (slot, current) = &self.entries[position];
+        let slot = *slot;
+        let stored = self.stored_templates(slot);
+        let described: Vec<Option<(Modality, &str)>> = stored
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(|(_, t)| (t.modality, t.model_version.as_str()))
+            })
+            .collect();
+        let index = template_slot(&described, new.modality, &new.model_version);
+        self.write_template(slot, index, &current.id, &new)?;
+
+        let mut member = GroupMember::clone(current);
+        if let Some((_, replaced)) = &stored[index] {
+            member.templates.retain(|t| t != replaced);
+        }
+        member.set_template(new);
+        let member = Arc::new(member);
+        self.entries[position].1 = member.clone();
+        info!(
+            "[Templates] added a face template to {} ({}) in slot {slot}, blob {index}",
+            member.name, member.id
         );
         Ok(member)
     }
@@ -116,9 +312,16 @@ impl TemplateStore {
             .entries
             .get(index)
             .with_context(|| format!("no member at index {index}"))?;
+        // The member record first: without it the templates are erased at the next start
+        // even if erasing them here is interrupted.
         self.nvs
-            .remove(&slot_key(slot))
-            .context("erasing the template")?;
+            .remove(&member_key(slot))
+            .context("erasing the member")?;
+        for template in 0..MAX_TEMPLATES_PER_MEMBER {
+            if let Err(e) = self.nvs.remove(&template_key(slot, template)) {
+                warn!("[Templates] erasing {}: {e}", template_key(slot, template));
+            }
+        }
         let (_, member) = self.entries.remove(index);
         info!(
             "[Templates] deleted {} ({}) from slot {slot}",
@@ -126,9 +329,4 @@ impl TemplateStore {
         );
         Ok(member)
     }
-}
-
-/// NVS key of a storage slot (keys are limited to 15 characters).
-fn slot_key(slot: u8) -> String {
-    format!("tpl{slot:02}")
 }
