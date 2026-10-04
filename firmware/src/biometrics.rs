@@ -119,6 +119,9 @@ impl BiometricSystem {
                             );
                             resources.inactivity_timer.reset();
                             ui::set_status(&format!("Welcome, {}", member.name));
+                            if let Err(e) = resources.speaker.play_success_chime() {
+                                warn!("Match chime failed: {e:#}");
+                            }
                             self.action_display_timer = Some(now + MATCH_DISPLAY_TIME);
                             self.state = SystemState::ActionExecuted { member };
                             return;

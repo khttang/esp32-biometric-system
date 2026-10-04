@@ -24,7 +24,8 @@ Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP
 
 | Area | State |
 |---|---|
-| Display, touch, camera preview, Ethernet, I2S audio | Working |
+| Display, touch, camera preview, Ethernet | Working |
+| Audio | On-board codec configured; a chime plays at boot and on a match; the microphone is captured and its level logged. Nothing consumes the microphone audio yet |
 | Vision pipeline (camera → PPA → preview / inference threads) | Working |
 | Face detection | Working: ESP-DL MSR+MNP models, green boxes drawn over the preview |
 | Face embedding | Working: ESP-DL MobileFaceNet, 512-d, aligned from 5 landmarks |
@@ -51,7 +52,7 @@ Known issues:
 | Display | HX8394 720×1280 IPS | MIPI-DSI, 2 lanes @ 700 Mbps, 58 MHz DPI clock (the HX8394 driver's recommended timing, about 55 Hz), RGB565; rotated 270° in software to 1280×720 landscape |
 | Touch | GT911 | I2C `0x5D`, polled at ~66 Hz (INT pin not used) |
 | Camera | OV5647 | MIPI-CSI, RAW10 1280×960 @ 45 fps (binning) → ISP → RGB565 via `esp_video` (`/dev/video0`) |
-| Audio | I2S MEMS mic (INMP441-style) + speaker output | `I2S_NUM_0` full-duplex, 16 kHz, 16-bit mono |
+| Audio | On-board ES8311 codec, microphone and NS4150B speaker amplifier | `I2S_NUM_0` full-duplex, 16 kHz, 16-bit mono; codec configured over I2C0 (`0x18`) with `esp_codec_dev` |
 | Ethernet | IP101 PHY | RMII, external 50 MHz reference clock, PHY address 1 |
 | Panel power / reset | IO expander | I2C `0x45` |
 
@@ -59,13 +60,14 @@ Known issues:
 
 | Subsystem | Signal | GPIO | Notes |
 |---|---|---|---|
-| **I2C0** (shared) | SDA / SCL | 7 / 8 | Touch `0x5D`, IO expander `0x45`, camera SCCB; internal pull-ups |
+| **I2C0** (shared) | SDA / SCL | 7 / 8 | Touch `0x5D`, IO expander `0x45`, audio codec `0x18`, camera SCCB; internal pull-ups |
 | **Camera** | PWDN / RESET | 5 / 6 | Active low |
 | **MIPI PHY power** | LDO channel 3 | n/a | 2.5 V for the DSI PHY |
-| **I2S0** | BCLK / WS | 12 / 13 | Driven by the TX channel, shared with RX |
-| | DIN (mic) / DOUT (speaker) | 11 / 14 | |
+| **I2S0** (ES8311 codec) | MCLK / BCLK / WS | 13 / 12 / 10 | Shared by both directions |
+| | DOUT (to the codec's DAC) / DIN (from its ADC) | 9 / 11 | |
+| | Amplifier enable | 53 | Active high; driven by the codec driver |
 | **Ethernet RMII** | MDC / MDIO | 31 / 52 | MDIO pull-up enabled |
-| | REF_CLK (in) / PHY RESET | 50 / 53 | |
+| | REF_CLK (in) | 50 | The PHY is reset over MDIO, not by a pin |
 | | TX_EN / TXD0 / TXD1 | 49 / 34 / 35 | |
 | | CRS_DV / RXD0 / RXD1 | 28 / 29 / 30 | |
 | **System** | Admin button | 0 | Input, pull-up, active low |
@@ -87,7 +89,7 @@ admin button is configured in Rust (`system.rs`).
 | `gt911_poller` | 1 | 5 | 3 KB | C++ | Poll GT911 every 15 ms |
 | `cam_pipeline` | 1 | 6 | 8 KB | Rust `pipeline.rs` | Dequeue frame → PPA preview → (on request) detector image from preview → swap canvas; logs fps/PPA stats every 10 s |
 | `inference` | 1 | 3 | 32 KB | Rust `pipeline.rs` | Detect → overlay → embed → match, ≤ 10 Hz (~23 KB of stack never used) |
-| audio capture | any | 5 | 4 KB | Rust `audio_worker.rs` | Read I2S mic into a bounded queue |
+| audio capture | any | 5 | 8 KB | Rust `audio_worker.rs` | Read the microphone into a bounded queue; log its level every 10 s |
 | inactivity watchdog | any | 5 | 4 KB | Rust `power.rs` | Deep sleep after 180 s without input |
 | IDF system tasks | n/a | n/a | n/a | ESP-IDF | Event loop, lwIP, EMAC RX, ISP/CSI drivers |
 
@@ -558,7 +560,7 @@ output windows itself.
 2. `SystemResources::build()`:
    1. Take NVS, the system event loop and the timer service.
    2. `p4_hardware_init_all()` (C++):
-      1. I2S duplex audio.
+      1. Shared I2C bus, I2S duplex audio, ES8311 codec (amplifier on).
       2. I2C0 bus.
       3. DSI PHY LDO, DSI bus, panel power/reset via IO expander, HX8394 init.
       4. LVGL port + display (2 framebuffers, 270° rotation).

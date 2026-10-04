@@ -101,8 +101,13 @@ impl SystemResourcesBuilder {
         //init_audio_subsystem()
         //    .context("[SystemResources] initializes audio system")?;
         let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<AudioFrame>(AUDIO_QUEUE_DEPTH);
-        crate::audio_worker::spawn_audio_capture_thread(0, audio_tx);
-        let speaker = Speaker::new(0);
+        crate::audio_worker::spawn_audio_capture_thread(0, audio_tx)
+            .context("[SystemResources] Failed to start audio capture")?;
+        let mut speaker = Speaker::new(0);
+        // Audible sign that the codec, amplifier and speaker work.
+        if let Err(e) = speaker.play_success_chime() {
+            warn!("[SystemResources] boot chime failed: {e:#}");
+        }
 
         // 4. Admin Button (Pure Rust PinDriver on GPIO0)
         let admin_button = PinDriver::input(self.peripherals.pins.gpio0, Pull::Up)
