@@ -168,7 +168,7 @@ Enroll and recognise people locally, with no server.
   - member id and name, role, embedding, `model_version`;
   - matching rejects templates from a different model version.
 - Admin-button and touch flow to enroll the currently detected face; delete a member.
-- Persist templates in flash (encrypted storage planned in M4); load them at boot.
+- Persist templates in flash (encrypted storage planned in M4b); load them at boot.
 - Matching threshold documented and measured (false accept/reject on a small test set).
 
 **Validation:**
@@ -262,18 +262,79 @@ match threshold and to compare feature models before M4 fixes slot sizes.
 - Thresholds are per model, but the firmware has one constant. A second feature model would need
   its threshold carried with the model (candidate for the manifest in M4).
 
-### ⬜ M4: Network Sync & Remote Model Updates
+### M4: Operating a Fleet
 
-Operate a fleet.
+Four PRs, in this order. The device stays the place where people are enrolled; a server keeps
+the durable copy of the templates and distributes them and new models.
 
-- Template sync from a server (versioned, incremental) over Ethernet; the server is the source of truth.
-- Remote model updates driven by device-management shared attributes (ThingsBoard client from git history, revisited): download, hash/signature verification, then the M3b activation flow.
-- Flash/NVS encryption for templates and secrets.
-- Documented trust model: who signs models, and how devices get keys.
+#### ✅ M4a: Signed Models and the Trust Model
 
-**Validation:**
-- Host tests for sync diffing and signature checks.
-- End-to-end test against a local server, including interrupted downloads and a bad signature.
+A hash shows a model image is intact; a signature shows who published it.
+
+**Done:**
+- Ed25519 signature over the manifest (which covers the model data's hash), stored in the last
+  68 bytes of the manifest sector. `biometric-core::signing` and `manifest::verify_signed`; the
+  same code signs on the host and verifies on the board.
+- The firmware loads only images signed by a key in `firmware/trusted-model-keys.txt`, which is
+  compiled in. Unsigned images are rejected; there is no switch to allow them.
+- `model-packer --key`, `keygen` and `pubkey`; `tools/face-models.sh keygen`. The secret key lives
+  outside the repository.
+- Trust model documented in the README: who signs, how devices get keys, how to rotate them, and
+  what signing does not protect against.
+- On the board: unsigned, wrongly signed and tampered images were rejected and left the stage
+  disabled or on the other slot; properly signed images loaded (see the PR).
+
+**Not done:**
+- No protection against replaying an older, validly signed image (planned with M4d).
+- Without secure boot, someone with the serial cable can flash firmware that trusts another key.
+  Signing protects the model update path, not the device against physical access (M4b).
+
+#### ⬜ M4b: Encryption at Rest and Template Format v2
+
+- NVS encryption for the template partition, with the key in eFuse. Secure boot and flash
+  encryption are documented as the production step; whether they are burned on the development
+  board is decided in the PR.
+- Template format v2:
+  - a member (id, name, role) is stored separately from its templates;
+  - each template names its modality (face now, voice later) and the model release it belongs to;
+  - a member can hold several templates at once, and a missing one means "needs enrollment";
+  - member ids are unique across devices (today's `local-0001` is not).
+- Migration of format v1 records.
+
+**Validation:** host tests for the format and the migration; on the board, enrolled templates
+survive the upgrade, and a flash dump no longer shows them in clear.
+
+#### ⬜ M4c: Template Sync
+
+- The device uploads what it enrolled and downloads what other devices enrolled, over TLS with
+  a pinned server certificate and a per-device credential.
+- Incremental: the server numbers every accepted change; the device asks for everything after
+  the last number it saw. Local changes are pushed first, then remote ones pulled.
+- Deletions are kept as markers so they propagate. On a conflict the higher revision wins, and
+  a deletion beats an edit.
+- A small reference server in this repository, for tests and for readers to run.
+
+**Validation:** host tests for the sync logic; end-to-end against the local server, including an
+interrupted sync and two devices' worth of changes.
+
+#### ⬜ M4d: Remote Model Updates and Template Migration
+
+- Download a signed model image to the standby slot, resumable after an interruption, then the
+  M3b activation flow. Reject an image older than the one in use.
+- A new feature model cannot use existing templates. Instead of re-enrolling everyone, the
+  device runs the old and the new model side by side for a while: on a confident match by the
+  old model, the same face is embedded with the new one, until the person has a template for it.
+  People who do not show up before a deadline are flagged for enrollment. No face images are
+  stored.
+- Thresholds are per model (see On-Board Accuracy Evaluation), so the threshold travels with the
+  model.
+
+**Validation:** host tests for the download and migration state machines; on the board, an
+interrupted download, a bad signature, and a migrated template compared with a directly
+enrolled one.
+
+Measured ahead of this work on the board: a second copy of the feature model costs 2.1 MB of
+PSRAM (11.3 MB remain) and one extra run is 176 ms; the camera rate was unaffected.
 
 ### ⬜ M5: Telemetry & Model Monitoring
 

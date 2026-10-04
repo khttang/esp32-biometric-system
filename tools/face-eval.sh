@@ -86,7 +86,8 @@ flash() {
     unzip -o -q -j "$CANDIDATE_ARCHIVE" "models/p4/$CANDIDATE.espdl" -d "$ROOT/models/p4"
     (cd "$ROOT/crates/model-packer" && cargo run --quiet --release -- \
       --input "$ROOT/models/p4/$CANDIDATE.espdl" --model "$CANDIDATE" --version "$CANDIDATE_RELEASE" \
-      --label eval_feat --partitions "$PARTITIONS" --out "$EVAL/eval_feat.bin")
+      --label eval_feat --partitions "$PARTITIONS" --out "$EVAL/eval_feat.bin" \
+      --key "${MODEL_SIGNING_KEY:-$HOME/.config/esp32-biometric/model-signing.key}")
     echo "Writing eval_feat at $offset"
     espflash write-bin "$offset" "$EVAL/eval_feat.bin"
   fi

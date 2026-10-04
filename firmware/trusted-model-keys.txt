@@ -1,0 +1,8 @@
+# Public keys whose signatures this firmware accepts on face-model images, one per line as
+# 64 hex characters (Ed25519). Compiled into the firmware (firmware/src/models.rs).
+#
+# The matching secret keys sign images with model-packer and must never be committed.
+# To build for your own devices, create a key (tools/face-models.sh keygen) and replace the
+# key below with yours. To rotate, add the new key, release firmware, re-sign the models,
+# then remove the old key in a later firmware release.
+cb218683f40e367afc1c16ebc00b9fe51483f0c54d6f0b8f000ef952df2a92c9  # project development key

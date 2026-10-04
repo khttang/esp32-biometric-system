@@ -28,10 +28,10 @@ Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP
 | Vision pipeline (camera → PPA → preview / inference threads) | Working |
 | Face detection | Working: ESP-DL MSR+MNP models, green boxes drawn over the preview |
 | Face embedding | Working: ESP-DL MobileFaceNet, 512-d, aligned from 5 landmarks |
-| Model updates | Each model has two flash slots (A/B) with a verified manifest. A new image written to the standby slot is activated only after a golden run passes, and the previous image is kept for rollback; no firmware reflash ([Model Partitions](#model-partitions)) |
+| Model updates | Each model has two flash slots (A/B) with a signed, verified manifest; the firmware loads only images signed by a trusted key. A new image written to the standby slot is activated only after a golden run passes, and the previous image is kept for rollback; no firmware reflash ([Model Partitions](#model-partitions)) |
 | Enrollment | On-device: the admin view on the touch panel enrolls the face in view and deletes members; templates persist in flash ([Enrollment & Templates](#enrollment--templates)) |
 | Matching | Cosine similarity against enrolled templates of the same model release. Enroll → reboot → recognise → delete works on the board. The threshold (0.5) is Espressif's default; on a public dataset it accepted no impostor pair and rejected 21% of genuine single-image pairs; not yet measured with this camera on non-enrolled people ([Measuring Accuracy on the Board](#measuring-accuracy-on-the-board)) |
-| Template download | Not yet (M4): the HTTP fetch code is not triggered by the state machine |
+| Template download | Not yet (M4c): the HTTP fetch code is not triggered by the state machine |
 | Voice recognition | Not implemented |
 
 Known issues:
@@ -168,26 +168,72 @@ partitions with our own labels.
 Each model lives in flash partitions of its own, so a model update needs no firmware rebuild:
 
 ```text
-offset 0                                    size - 4096           size
-├─ .espdl model (`size` bytes) ─ 0xFF padding ─┼─ manifest JSON ─────┤
+offset 0                                    size - 4096                    size
+├─ .espdl model (`size` bytes) ─ 0xFF padding ─┼─ manifest JSON ─ signature ─┤
 ```
 
 - **Manifest:** in the partition's last 4 KiB sector:
   `{"format":2,"model":"human_face_feat_mfn_s8_v1","version":"human_face_recognition 0.3.2","size":1295200,"sha256":"…","golden_sha256":"…"}`.
   The `version` is recorded with enrolled templates, so templates are only compared with
   embeddings from the same model. Format 1 manifests (no `golden_sha256`) are still accepted.
+- **Signature:** the sector's last 68 bytes hold `SIG1` and an Ed25519 signature over the
+  manifest JSON. The manifest contains the data's hash, so the signature covers the whole image
+  ([Signed Models and the Trust Model](#signed-models-and-the-trust-model)).
 - **Verify before load:** at startup the inference thread memory-maps each partition and checks
-  that the manifest names the expected model, the size fits, and the data's SHA-256 matches. Only
-  then does ESP-DL load it.
+  that the manifest is signed by a trusted key, names the expected model, the size fits, and the
+  data's SHA-256 matches. Only then does ESP-DL load it.
+  - The signature is checked over the stored bytes before they are parsed, so an unauthenticated
+    manifest never reaches the JSON parser.
   - ESP-DL itself aborts the chip on an unmappable partition and has no integrity check.
-  - Verification takes 22 ms (MSR), 32 ms (MNP) and 380 ms (MobileFaceNet, 1.3 MB) per slot.
-    Both slots of every model are verified at each boot, about 0.9 s in total when all are filled.
+  - Verification takes 30 ms (MSR), 60 ms (MNP) and 405 ms (MobileFaceNet, 1.3 MB) per slot,
+    of which the signature check is roughly 10–25 ms. Both slots of every model are verified at
+    each boot, about 1 s in total when all are filled.
 - **A model can never take the device down:** if neither slot of a model holds a usable image,
   only the stage that needs it is disabled. Tested on the device with the single-slot layout: a
   corrupted embedder left detection running, and an erased detector left the preview running.
 - **Single source of truth:** the format lives in `biometric-core::manifest`. It is shared by the
   firmware (`firmware/src/models.rs`) and the host packer (`crates/model-packer`), with host tests
   for every failure mode.
+
+#### Signed Models and the Trust Model
+
+A SHA-256 shows that a model image is intact. It does not show who made it: whoever can write a
+model can write its hash too. So every image is signed, and the firmware loads only images signed
+by a key it trusts.
+
+- **Who signs:** whoever holds the secret key. `tools/face-models.sh keygen` creates one in
+  `~/.config/esp32-biometric/model-signing.key` (or `MODEL_SIGNING_KEY`), readable only by its
+  owner, and prints the public key. The secret key stays on the signing machine: never on a
+  device, never in the repository.
+- **How devices get keys:** the public keys are listed in `firmware/trusted-model-keys.txt` and
+  compiled into the firmware. A device trusts exactly the keys of the firmware it runs.
+- **Building for your own devices:** run `keygen`, replace the key in `trusted-model-keys.txt`
+  with yours, then build the firmware and run `tools/face-models.sh all`. Images signed with the
+  key committed here can only be produced by this project's maintainer.
+- **Rotating a key:** add the new public key, release firmware, re-sign the models with the new
+  key, and remove the old key in a later firmware release. Several keys can be trusted at once.
+- **No bypass:** an unsigned image is rejected like a corrupt one, and there is no build option
+  to allow it. The slot is skipped; if neither slot of a model is usable, only that stage is
+  disabled.
+
+Checked on the board, one slot each: an unsigned image, an image signed with another key, and a
+signed image whose manifest was changed afterwards (the version, with the model data intact)
+were all rejected, and the properly signed images in the other slots loaded.
+
+What signing does **not** protect against:
+- **Physical access.** Without secure boot, anyone with the serial cable can flash a firmware
+  that trusts a different key, or none. Signing protects the path by which models reach the
+  device (the remote updates of M4d), not the device itself. Secure boot is discussed in M4b.
+- **A stolen secret key.** Whoever has it can publish models until the key is rotated out.
+- **Replay.** An older image with a valid signature is still accepted. Rejecting downgrades is
+  planned with remote updates (M4d).
+- **A bad model signed in good faith.** The signature says who published it, not that it works;
+  the golden run below and the accuracy evaluation cover that.
+
+The signature scheme is in `biometric-core::signing` (Ed25519 via `ed25519-dalek`, pure Rust), so
+the packer and the firmware run the same code, with host tests for wrong keys, changed manifests,
+moved signatures and corrupt trailers. Each signature is made over a purpose string plus the
+manifest, so a signature made for one purpose cannot be reused for another.
 
 #### A/B Slots, Golden Run and Rollback
 
@@ -246,6 +292,7 @@ tools/face-models.sh fetch      # download Espressif's pinned releases, check th
 tools/face-models.sh pack  b    # build models/face_*_b.bin partition images (model-packer)
 tools/face-models.sh flash b    # espflash write-bin each image at its partition offset
 tools/face-models.sh all        # all three steps; the slot defaults to a
+tools/face-models.sh keygen     # once: create the signing key, print its public key
 ```
 
 To publish a model of your own, get its golden from a device: pack it without `--golden`
@@ -341,7 +388,7 @@ closest template every 10 s, so live scores can be compared with the dataset's:
 ```
 
 **Limitations.**
-- Templates are stored **unencrypted** (flash/NVS encryption is planned for M4). They are biometric
+- Templates are stored **unencrypted** (NVS encryption is planned for M4b). They are biometric
   data: anyone who can read the flash can read them.
 - Anyone at the device can open the admin view; there is no admin authentication yet.
 - There is no liveness check: a photo of an enrolled person matches.
@@ -498,7 +545,8 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │   │   └── src/
 │   │       ├── geometry.rs           # PixelFormat, Rect, ImageRef, crop / fit / mapping math
 │   │       ├── contract.rs           # Model contract (input, model ids and slots, embedding size)
-│   │       ├── manifest.rs           # Model partition image format: build + verify
+│   │       ├── manifest.rs           # Model partition image format: build, sign, verify
+│   │       ├── signing.rs            # Ed25519 signatures and key files
 │   │       ├── activation.rs         # A/B slot activation and rollback state machine
 │   │       ├── matching.rs           # GroupMember, model-version-aware matching, cosine similarity
 │   │       ├── template.rs           # Template format v1: encode / decode one stored member
@@ -506,7 +554,7 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │   │       ├── stats.rs              # Allocation-free latency and score statistics
 │   │       ├── evaluation.rs         # False accept / false reject rates from similarity scores
 │   │       └── eval_protocol.rs      # Wire format of the on-board evaluation harness
-│   ├── model-packer/                 # Host tool: .espdl + manifest -> partition image
+│   ├── model-packer/                 # Host tool: .espdl + manifest -> signed partition image; keygen
 │   └── face-eval/                    # Host tool: sends dataset images to the eval firmware, reports FAR/FRR
 ├── firmware/                         # ESP32-P4 application (Rust + ESP-IDF)
 │   ├── .cargo/config.toml            # Target, build-std, espflash runner, ESP-IDF version
@@ -515,6 +563,7 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │   ├── build.rs                      # Propagates ESP-IDF link args, links libstdc++
 │   ├── sdkconfig.defaults            # ESP-IDF Kconfig (PSRAM, cache, camera, LVGL, Ethernet …)
 │   ├── partitions.csv                # Flash layout (see below)
+│   ├── trusted-model-keys.txt        # Public keys allowed to sign model images (compiled in)
 │   ├── partitions-eval.csv           # Evaluation layout: second firmware slot -> candidate model
 │   ├── components_esp32p4.lock       # Locked ESP-IDF managed component versions
 │   ├── components/biometrics_wrapper/      # C++ ESP-IDF component

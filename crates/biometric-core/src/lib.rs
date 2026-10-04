@@ -11,5 +11,6 @@ pub mod evaluation;
 pub mod geometry;
 pub mod manifest;
 pub mod matching;
+pub mod signing;
 pub mod stats;
 pub mod template;
