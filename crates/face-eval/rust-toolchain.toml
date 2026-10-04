@@ -1,0 +1,4 @@
+[toolchain]
+# Host unit tests run on the project's target Rust version (see CLAUDE.md).
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]

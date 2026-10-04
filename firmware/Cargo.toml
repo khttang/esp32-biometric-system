@@ -27,6 +27,14 @@ opt-level = "z"        # Optimize for size in dev to prevent binary flash overfl
 opt-level = 3
 
 # -----------------------------------------------------------------------------
+# Features
+# -----------------------------------------------------------------------------
+[features]
+# Evaluation harness: the firmware serves images sent by crates/face-eval instead of running
+# the camera pipeline (see src/eval.rs). Never enable it on a deployed device.
+eval = []
+
+# -----------------------------------------------------------------------------
 # Dependencies
 # -----------------------------------------------------------------------------
 [dependencies]

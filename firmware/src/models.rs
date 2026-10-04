@@ -108,6 +108,17 @@ pub fn verify(label: &CStr, expected_model: &str) -> Result<ModelManifest> {
     Ok(manifest)
 }
 
+/// Verifies that partition `label` holds an intact model, whichever one its manifest names.
+/// For the evaluation harness, which accepts any feature model as the candidate.
+#[cfg(feature = "eval")]
+pub fn verify_any(label: &CStr) -> Result<ModelManifest> {
+    let partition = MappedPartition::map(label)?;
+    let named = manifest::read_manifest(partition.as_slice())
+        .map_err(|e| anyhow::anyhow!("partition {label:?}: {e}"))?;
+    manifest::verify(partition.as_slice(), &named.model)
+        .map_err(|e| anyhow::anyhow!("partition {label:?}: {e}"))
+}
+
 /// NVS namespace of the per-model activation records.
 const NAMESPACE: &str = "models";
 

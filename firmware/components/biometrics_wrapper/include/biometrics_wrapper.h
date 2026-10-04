@@ -118,6 +118,10 @@ int32_t p4_face_init_detector(const char *msr_partition, const char *mnp_partiti
 int32_t p4_face_init_embedder(const char *partition);
 // Embedding length of the loaded feature model (0 before p4_face_init_embedder).
 size_t p4_face_embedding_len(void);
+// A second feature model, loaded next to the active one and run on the same faces (used by the
+// evaluation harness to compare two models). Same contracts as the functions above.
+int32_t p4_face_init_candidate_embedder(const char *partition);
+size_t p4_face_candidate_embedding_len(void);
 // Images are packed PPA RGB888 (ESP-IDF layout: B, G, R bytes per pixel).
 // Detects faces in a packed RGB888 image. Writes up to `capacity` faces (highest score first) and
 // stores the number written in `*count`.
@@ -127,6 +131,9 @@ int32_t p4_face_detect(const uint8_t *rgb888, uint16_t width, uint16_t height, p
 // p4_face_embedding_len().
 int32_t p4_face_embed(const uint8_t *rgb888, uint16_t width, uint16_t height, const p4_face_t *face,
                       float *embedding, size_t len);
+// The same with the candidate feature model; `len` must equal p4_face_candidate_embedding_len().
+int32_t p4_face_embed_candidate(const uint8_t *rgb888, uint16_t width, uint16_t height,
+                                const p4_face_t *face, float *embedding, size_t len);
 
 #ifdef __cplusplus
 }

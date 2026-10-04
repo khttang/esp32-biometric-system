@@ -117,7 +117,8 @@ private:
     dl::detect::MNPPostprocessor *m_postprocessor;
 };
 
-// MobileFaceNet: aligns the face from its landmarks and computes an L2-normalised embedding.
+// Feature model: aligns the face from its landmarks and computes an L2-normalised embedding.
+// Espressif's MobileFaceNet (MFN) and its larger MBF model share this pre- and post-processing.
 class Mfn : public dl::feat::FeatImpl {
 public:
     explicit Mfn(dl::Model *model)
@@ -132,6 +133,8 @@ public:
 Msr *s_msr = nullptr;
 Mnp *s_mnp = nullptr;
 Mfn *s_feat = nullptr;
+// A second feature model run next to the active one, e.g. to compare the two.
+Mfn *s_candidate = nullptr;
 
 // Reused across calls to avoid a heap allocation per embedding (single-threaded use only).
 std::vector<int> s_landmarks(2 * P4_FACE_LANDMARKS);
@@ -148,6 +151,60 @@ dl::image::img_t make_ppa_rgb888_image(const uint8_t *data, uint16_t width, uint
     // ESP-DL's RGB888 means R, G, B in memory, so this buffer is BGR888 in ESP-DL terms.
     img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_BGR888;
     return img;
+}
+
+size_t feat_len(Mfn *feat)
+{
+    const int len = feat ? feat->get_feat_len() : 0;
+    return len > 0 ? static_cast<size_t>(len) : 0;
+}
+
+int32_t init_feat(Mfn *&slot, const char *partition, const char *what)
+{
+    if (slot) {
+        return ESP_OK;
+    }
+    if (!partition) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    dl::Model *model = load_model(partition);
+    Mfn *feat = model ? new (std::nothrow) Mfn(model) : nullptr;
+    if (!feat) {
+        delete model;
+        ESP_LOGE(TAG, "Failed to allocate the %s", what);
+        return ESP_ERR_NO_MEM;
+    }
+    slot = feat;
+    ESP_LOGI(TAG, "%s loaded from %s (embedding length %d)", what, partition, slot->get_feat_len());
+    return ESP_OK;
+}
+
+int32_t embed_with(Mfn *feat_model, const uint8_t *rgb888, uint16_t width, uint16_t height, const p4_face_t *face,
+                   float *embedding, size_t len)
+{
+    if (!feat_model) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!rgb888 || !face || !embedding || !face->has_landmarks || width == 0 || height == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (len != feat_len(feat_model)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    const dl::image::img_t img = make_ppa_rgb888_image(rgb888, width, height);
+    for (size_t i = 0; i < 2 * P4_FACE_LANDMARKS; ++i) {
+        s_landmarks[i] = face->landmarks[i];
+    }
+
+    // Aligns the face from the landmarks, runs the model and L2-normalises the output.
+    dl::TensorBase *feat = feat_model->run(img, s_landmarks);
+    if (!feat || !feat->data || feat->dtype != dl::DATA_TYPE_FLOAT) {
+        ESP_LOGE(TAG, "Unexpected feature tensor");
+        return ESP_FAIL;
+    }
+    std::memcpy(embedding, feat->data, len * sizeof(float));
+    return ESP_OK;
 }
 
 } // namespace
@@ -231,31 +288,22 @@ int32_t p4_face_init_detector(const char *msr_partition, const char *mnp_partiti
 
 int32_t p4_face_init_embedder(const char *partition)
 {
-    if (s_feat) {
-        return ESP_OK;
-    }
-    if (!partition) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    dl::Model *model = load_model(partition);
-    Mfn *feat = model ? new (std::nothrow) Mfn(model) : nullptr;
-    if (!feat) {
-        delete model;
-        ESP_LOGE(TAG, "Failed to allocate the face embedder");
-        return ESP_ERR_NO_MEM;
-    }
-    s_feat = feat;
-    ESP_LOGI(TAG, "Face embedder loaded from %s (embedding length %d)", partition, s_feat->get_feat_len());
-    return ESP_OK;
+    return init_feat(s_feat, partition, "Face embedder");
+}
+
+int32_t p4_face_init_candidate_embedder(const char *partition)
+{
+    return init_feat(s_candidate, partition, "Candidate face embedder");
 }
 
 size_t p4_face_embedding_len(void)
 {
-    if (!s_feat) {
-        return 0;
-    }
-    const int len = s_feat->get_feat_len();
-    return len > 0 ? static_cast<size_t>(len) : 0;
+    return feat_len(s_feat);
+}
+
+size_t p4_face_candidate_embedding_len(void)
+{
+    return feat_len(s_candidate);
 }
 
 int32_t p4_face_detect(const uint8_t *rgb888, uint16_t width, uint16_t height, p4_face_t *faces,
@@ -299,29 +347,13 @@ int32_t p4_face_detect(const uint8_t *rgb888, uint16_t width, uint16_t height, p
 int32_t p4_face_embed(const uint8_t *rgb888, uint16_t width, uint16_t height, const p4_face_t *face,
                       float *embedding, size_t len)
 {
-    if (!s_feat) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (!rgb888 || !face || !embedding || !face->has_landmarks || width == 0 || height == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (len != p4_face_embedding_len()) {
-        return ESP_ERR_INVALID_SIZE;
-    }
+    return embed_with(s_feat, rgb888, width, height, face, embedding, len);
+}
 
-    const dl::image::img_t img = make_ppa_rgb888_image(rgb888, width, height);
-    for (size_t i = 0; i < 2 * P4_FACE_LANDMARKS; ++i) {
-        s_landmarks[i] = face->landmarks[i];
-    }
-
-    // Aligns the face from the landmarks, runs the model and L2-normalises the output.
-    dl::TensorBase *feat = s_feat->run(img, s_landmarks);
-    if (!feat || !feat->data || feat->dtype != dl::DATA_TYPE_FLOAT) {
-        ESP_LOGE(TAG, "Unexpected feature tensor");
-        return ESP_FAIL;
-    }
-    std::memcpy(embedding, feat->data, len * sizeof(float));
-    return ESP_OK;
+int32_t p4_face_embed_candidate(const uint8_t *rgb888, uint16_t width, uint16_t height,
+                                const p4_face_t *face, float *embedding, size_t len)
+{
+    return embed_with(s_candidate, rgb888, width, height, face, embedding, len);
 }
 
 } // extern "C"

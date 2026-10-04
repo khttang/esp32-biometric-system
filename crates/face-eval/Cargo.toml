@@ -1,0 +1,13 @@
+[package]
+name = "face-eval"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "Measures face-recognition accuracy on the board: sends dataset images to the eval firmware and reports FAR/FRR"
+
+[dependencies]
+biometric-core = { path = "../biometric-core" }
+# JPEG decoding only.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# Without libudev, so the crate builds on a stock Linux CI runner; ports are named explicitly.
+serialport = { version = "4", default-features = false }

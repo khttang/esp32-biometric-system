@@ -1,0 +1,25 @@
+# EVALUATION LAYOUT (firmware feature `eval`, tools/face-eval.sh): identical to partitions.csv
+# except that the second firmware slot is replaced by `eval_feat`, which holds a candidate
+# feature model of up to 5 MB to compare with the active one. Not for deployed devices.
+#
+# ESP32-P4-NANO, 16 MB flash. Partition table at 0x8000 (default), written by espflash.
+# App slots hold the firmware only (~3.7 MB). Each face model has two slots (A/B) of its own, so
+# a new model can be written next to the one in use and activated without reflashing the app;
+# every slot holds one model plus a manifest in its last 4 KiB (see crates/model-packer).
+# ESP-DL memory-maps model partitions, so they must be 64 KiB aligned.
+# Enrolled face templates are NVS blobs in `templates` (its own NVS partition, so erasing or
+# resizing the system `nvs` never touches them).
+# Name,     Type, SubType, Offset,   Size
+nvs,       data, nvs,     0x9000,   0x10000
+otadata,   data, ota,     0x19000,  0x2000
+phy_init,  data, phy,     0x1B000,  0x1000
+ota_0,     app,  ota_0,   0x20000,  0x500000
+eval_feat, data, spiffs,  0x520000, 0x500000
+face_msr_a,  data, spiffs,  0xA20000, 0x20000
+face_mnp_a,  data, spiffs,  0xA40000, 0x30000
+face_feat_a, data, spiffs,  0xA70000, 0x200000
+templates,   data, nvs,     0xC70000, 0x40000
+face_msr_b,  data, spiffs,  0xCB0000, 0x20000
+face_mnp_b,  data, spiffs,  0xCD0000, 0x30000
+face_feat_b, data, spiffs,  0xD00000, 0x200000
+storage,     data, spiffs,  0xF00000, 0x100000
