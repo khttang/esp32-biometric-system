@@ -10,6 +10,8 @@
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
+#include "esp_codec_dev.h"
+#include "esp_codec_dev_defaults.h"
 #include "driver/ppa.h"
 
 #include "esp_video_init.h"
@@ -63,8 +65,7 @@ namespace BoardPins {
         constexpr gpio_num_t MDC   = GPIO_NUM_31;
         constexpr gpio_num_t MDIO  = GPIO_NUM_52;
         constexpr gpio_num_t CLK   = GPIO_NUM_50;
-        constexpr gpio_num_t RESET = GPIO_NUM_53;
-        
+
         namespace RMII {
             constexpr gpio_num_t TX_EN  = GPIO_NUM_49;
             constexpr gpio_num_t TXD0   = GPIO_NUM_34;
@@ -84,11 +85,14 @@ namespace BoardPins {
     namespace System {
         constexpr gpio_num_t ADMIN_BTN = GPIO_NUM_0;
     }
+    // On-board ES8311 codec and NS4150B amplifier (Waveshare ESP32-P4-NANO schematic).
     namespace Audio {
+        constexpr gpio_num_t MCLK      = GPIO_NUM_13;
         constexpr gpio_num_t BCLK      = GPIO_NUM_12;
-        constexpr gpio_num_t WS        = GPIO_NUM_13;
-        constexpr gpio_num_t DIN       = GPIO_NUM_11;
-        constexpr gpio_num_t DOUT      = GPIO_NUM_14;
+        constexpr gpio_num_t WS        = GPIO_NUM_10;
+        constexpr gpio_num_t DOUT      = GPIO_NUM_9;  // to the codec's DAC
+        constexpr gpio_num_t DIN       = GPIO_NUM_11; // from the codec's ADC (on-board microphone)
+        constexpr gpio_num_t PA_ENABLE = GPIO_NUM_53; // amplifier enable, active high
     }
 }
 
@@ -129,6 +133,33 @@ namespace VideoConfig {
 // Global Subsystem Handles
 static esp_lcd_panel_handle_t s_lcd_panel = NULL;
 static i2c_master_bus_handle_t s_i2c_bus_handle = NULL;
+static esp_codec_dev_handle_t g_codec_dev = NULL;
+
+namespace AudioConfig {
+    constexpr int   SPEAKER_VOLUME = 70;    // 0..100
+    constexpr float MIC_GAIN_DB    = 30.0f;
+}
+
+// Creates the shared I2C0 master bus (GPIO 7 SDA / GPIO 8 SCL) on first use: touch, IO
+// expander, camera and audio codec all sit on it.
+static esp_err_t ensure_i2c_bus(void) {
+    if (s_i2c_bus_handle) return ESP_OK;
+    i2c_master_bus_config_t i2c_bus_cfg = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = GPIO_NUM_7,
+        .scl_io_num = GPIO_NUM_8,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags = { .enable_internal_pullup = true },
+    };
+    esp_err_t err = i2c_new_master_bus(&i2c_bus_cfg, &s_i2c_bus_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE("p4_i2c", "Failed to create I2C master bus: 0x%x", err);
+        return err;
+    }
+    ESP_LOGI("p4_i2c", "I2C Master Bus (I2C_NUM_0) created successfully!");
+    return ESP_OK;
+}
 static i2c_master_dev_handle_t s_gt911_i2c_dev = NULL;
 
 
@@ -261,7 +292,7 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
 *  - TX channel (g_i2s_tx_handle): I2S_TX, 16-bit data, left-justified, mono, no DMA, no clock divider.
 *  - RX channel (g_i2s_rx_handle): I2S_RX, 16-bit data, left-justified, mono, no DMA, no clock divider.
 */
-static int init_i2s_duplex_c(uint32_t sample_rate, int bclk_gpio, int ws_gpio, int din_gpio, int dout_gpio) {
+static int init_i2s_duplex_c(uint32_t sample_rate, int mclk_gpio, int bclk_gpio, int ws_gpio, int din_gpio, int dout_gpio) {
     // 1. Clean up existing channels if re-initialized
     if (g_i2s_tx_handle) {
         i2s_channel_disable(g_i2s_tx_handle);
@@ -287,11 +318,11 @@ static int init_i2s_duplex_c(uint32_t sample_rate, int bclk_gpio, int ws_gpio, i
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
+            .mclk = (gpio_num_t)mclk_gpio,
             .bclk = (gpio_num_t)bclk_gpio,
             .ws   = (gpio_num_t)ws_gpio,
             .dout = (gpio_num_t)dout_gpio,
-            .din  = I2S_GPIO_UNUSED,
+            .din  = (gpio_num_t)din_gpio,
         },
     };
     ret = i2s_channel_init_std_mode(g_i2s_tx_handle, &tx_cfg);
@@ -300,15 +331,16 @@ static int init_i2s_duplex_c(uint32_t sample_rate, int bclk_gpio, int ws_gpio, i
         return (int)ret;
     }
 
-    // 4. Configure RX Channel (Reads Microphone DIN & Shares Clock Internal Lines)
+    // 4. Configure RX Channel (codec ADC data; clocks shared with TX)
     i2s_std_config_t rx_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        // The same pins as TX: both directions of one I2S port share its clocks.
         .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = I2S_GPIO_UNUSED, // Uses internal clock routed from TX
-            .ws   = I2S_GPIO_UNUSED, // Uses internal clock routed from TX
-            .dout = I2S_GPIO_UNUSED,
+            .mclk = (gpio_num_t)mclk_gpio,
+            .bclk = (gpio_num_t)bclk_gpio,
+            .ws   = (gpio_num_t)ws_gpio,
+            .dout = (gpio_num_t)dout_gpio,
             .din  = (gpio_num_t)din_gpio,
         },
     };
@@ -329,19 +361,83 @@ static int init_i2s_duplex_c(uint32_t sample_rate, int bclk_gpio, int ws_gpio, i
     return 0;
 }
 
-int read_i2s_mic_c(int i2s_port, int16_t *out_buffer, uint32_t samples_to_read, uint32_t *bytes_read, uint32_t timeout_ms) {
-    if (!g_i2s_rx_handle) return -1;
-    size_t r_bytes = 0;
-    esp_err_t ret = i2s_channel_read(g_i2s_rx_handle, out_buffer, samples_to_read * sizeof(int16_t), &r_bytes, pdMS_TO_TICKS(timeout_ms));
-    if (bytes_read) *bytes_read = (uint32_t)r_bytes;
-    return (int)ret;
+// Configures the ES8311 over I2C (clocking from MCLK, DAC and ADC on, amplifier enabled) and
+// opens it for 16-bit mono at `sample_rate`. The I2S channels must already exist.
+static int init_codec(uint32_t sample_rate) {
+    if (g_codec_dev) return 0;
+    audio_codec_i2s_cfg_t i2s_cfg = {};
+    i2s_cfg.port = I2S_NUM_0;
+    i2s_cfg.rx_handle = g_i2s_rx_handle;
+    i2s_cfg.tx_handle = g_i2s_tx_handle;
+    const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_cfg);
+
+    audio_codec_i2c_cfg_t i2c_cfg = {};
+    i2c_cfg.port = I2C_NUM_0;
+    i2c_cfg.addr = ES8311_CODEC_DEFAULT_ADDR;
+    i2c_cfg.bus_handle = s_i2c_bus_handle;
+    const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
+    const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
+    if (!data_if || !ctrl_if || !gpio_if) {
+        ESP_LOGE(TAG_AUDIO, "Failed to create the codec interfaces");
+        return ESP_FAIL;
+    }
+
+    es8311_codec_cfg_t es_cfg = {};
+    es_cfg.ctrl_if = ctrl_if;
+    es_cfg.gpio_if = gpio_if;
+    es_cfg.codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH;
+    es_cfg.pa_pin = BoardPins::Audio::PA_ENABLE;
+    es_cfg.use_mclk = true;
+    es_cfg.hw_gain.pa_voltage = 5.0f;
+    es_cfg.hw_gain.codec_dac_voltage = 3.3f;
+    const audio_codec_if_t *codec_if = es8311_codec_new(&es_cfg);
+    if (!codec_if) {
+        ESP_LOGE(TAG_AUDIO, "ES8311 did not answer on I2C");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    esp_codec_dev_cfg_t dev_cfg = {};
+    dev_cfg.dev_type = ESP_CODEC_DEV_TYPE_IN_OUT;
+    dev_cfg.codec_if = codec_if;
+    dev_cfg.data_if = data_if;
+    esp_codec_dev_handle_t dev = esp_codec_dev_new(&dev_cfg);
+    if (!dev) return ESP_FAIL;
+
+    esp_codec_dev_sample_info_t fs = {};
+    fs.bits_per_sample = 16;
+    fs.channel = 1;
+    fs.sample_rate = sample_rate;
+    int ret = esp_codec_dev_open(dev, &fs);
+    if (ret != ESP_CODEC_DEV_OK) {
+        ESP_LOGE(TAG_AUDIO, "Opening the codec failed: %d", ret);
+        return ESP_FAIL;
+    }
+    esp_codec_dev_set_out_vol(dev, AudioConfig::SPEAKER_VOLUME);
+    esp_codec_dev_set_in_gain(dev, AudioConfig::MIC_GAIN_DB);
+    g_codec_dev = dev;
+    ESP_LOGI(TAG_AUDIO, "ES8311 codec ready: volume %d, microphone gain %.0f dB", AudioConfig::SPEAKER_VOLUME,
+             (double)AudioConfig::MIC_GAIN_DB);
+    return 0;
 }
 
+// Blocks until `samples_to_read` samples have been read from the microphone.
+int read_i2s_mic_c(int i2s_port, int16_t *out_buffer, uint32_t samples_to_read, uint32_t *bytes_read, uint32_t timeout_ms) {
+    (void)i2s_port;
+    (void)timeout_ms;
+    if (!g_codec_dev || !out_buffer || !bytes_read) return -1;
+    const int len = (int)(samples_to_read * sizeof(int16_t));
+    int ret = esp_codec_dev_read(g_codec_dev, out_buffer, len);
+    *bytes_read = ret == ESP_CODEC_DEV_OK ? (uint32_t)len : 0;
+    return ret;
+}
+
+// Blocks until all samples have been handed to the I2S driver.
 int write_i2s_tx_c(int i2s_port, const int16_t *buffer, uint32_t sample_count, uint32_t timeout_ms) {
-    if (!g_i2s_tx_handle) return -1;
-    size_t w_bytes = 0;
-    esp_err_t ret = i2s_channel_write(g_i2s_tx_handle, buffer, sample_count * sizeof(int16_t), &w_bytes, pdMS_TO_TICKS(timeout_ms));
-    return (int)ret;
+    (void)i2s_port;
+    (void)timeout_ms;
+    if (!g_codec_dev || !buffer) return -1;
+    // esp_codec_dev takes a non-const buffer but does not modify it.
+    return esp_codec_dev_write(g_codec_dev, const_cast<int16_t *>(buffer), (int)(sample_count * sizeof(int16_t)));
 }
 
 // -----------------------------------------------------------------------------
@@ -357,7 +453,13 @@ bool p4_touch_is_pressed(void) {
 
 int32_t init_audio_system(void) {
     const uint32_t SAMPLE_RATE = 16000U;
-    return init_i2s_duplex_c(SAMPLE_RATE, BoardPins::Audio::BCLK, BoardPins::Audio::WS, BoardPins::Audio::DIN, BoardPins::Audio::DOUT);
+    // The codec is configured over the shared I2C bus.
+    esp_err_t err = ensure_i2c_bus();
+    if (err != ESP_OK) return err;
+    int ret = init_i2s_duplex_c(SAMPLE_RATE, BoardPins::Audio::MCLK, BoardPins::Audio::BCLK, BoardPins::Audio::WS,
+                                BoardPins::Audio::DIN, BoardPins::Audio::DOUT);
+    if (ret != 0) return ret;
+    return init_codec(SAMPLE_RATE);
 }
 
 static void custom_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
@@ -380,22 +482,8 @@ int32_t init_display_system(void) {
     ESP_LOGI(TAG_LVGL, "Initializing Hardware via esp_lvgl_port...");
 
     // 1. Shared I2C0 Master Bus (GPIO 7 SDA / GPIO 8 SCL)
-    if (!s_i2c_bus_handle) {
-        i2c_master_bus_config_t i2c_bus_cfg = {
-            .i2c_port = I2C_NUM_0,
-            .sda_io_num = GPIO_NUM_7,
-            .scl_io_num = GPIO_NUM_8,
-            .clk_source = I2C_CLK_SRC_DEFAULT,
-            .glitch_ignore_cnt = 7,
-            .flags = { .enable_internal_pullup = true },
-        };
-        esp_err_t err = i2c_new_master_bus(&i2c_bus_cfg, &s_i2c_bus_handle);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG_LVGL, "Failed to create I2C master bus: 0x%x", err);
-            return err;
-        }
-        ESP_LOGI(TAG_LVGL, "I2C Master Bus (I2C_NUM_0) created successfully!");
-    }
+    esp_err_t bus_err = ensure_i2c_bus();
+    if (bus_err != ESP_OK) return bus_err;
 
     // 2. Power on MIPI-DSI PHY (2.5V on LDO Channel 3)
     esp_ldo_channel_handle_t ldo_mipi_phy = NULL;
@@ -752,16 +840,8 @@ void p4_mark_app_valid(void) {
 int32_t init_p4_ethernet(void) {
     ESP_LOGI(TAG_ETH, "Initializing Waveshare ESP32-P4-NANO EMAC Ethernet...");
 
-    gpio_config_t rst_cfg = {};
-    rst_cfg.pin_bit_mask = (1ULL << BoardPins::Ethernet::RESET);
-    rst_cfg.mode = GPIO_MODE_OUTPUT;
-    gpio_config(&rst_cfg);
-
-    gpio_set_level(BoardPins::Ethernet::RESET, 0);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    gpio_set_level(BoardPins::Ethernet::RESET, 1);
-    vTaskDelay(pdMS_TO_TICKS(100));
-
+    // No reset pulse: the PHY is reset over MDIO by its driver. GPIO 53, which this code used
+    // to pulse, is the audio amplifier's enable pin on this board.
     esp_err_t ret = esp_netif_init();
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) return ret;
 

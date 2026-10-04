@@ -84,6 +84,40 @@ impl ScoreStats {
     }
 }
 
+/// Loudness of 16-bit PCM audio over a logging window: shows whether a microphone is alive
+/// (a dead input reads as constant zeros) and whether it clips.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AudioLevel {
+    samples: u64,
+    sum_of_squares: u64,
+    peak: u16,
+}
+
+impl AudioLevel {
+    pub fn record(&mut self, pcm: &[i16]) {
+        for &sample in pcm {
+            let magnitude = sample.unsigned_abs();
+            self.peak = self.peak.max(magnitude);
+            self.sum_of_squares += u64::from(magnitude) * u64::from(magnitude);
+        }
+        self.samples += pcm.len() as u64;
+    }
+
+    pub fn samples(&self) -> u64 {
+        self.samples
+    }
+
+    /// Largest absolute sample value; 32768 means the input clipped.
+    pub fn peak(&self) -> u16 {
+        self.peak
+    }
+
+    /// Root mean square of the samples, or `None` if nothing was recorded.
+    pub fn rms(&self) -> Option<f32> {
+        (self.samples > 0).then(|| (self.sum_of_squares as f64 / self.samples as f64).sqrt() as f32)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +194,35 @@ mod tests {
         s.record(Duration::MAX);
         assert_eq!(s.max(), Some(Duration::from_micros(u64::MAX)));
         assert_eq!(s.count(), 2);
+    }
+
+    #[test]
+    fn audio_level_of_silence_and_of_nothing() {
+        let mut level = AudioLevel::default();
+        assert_eq!(level.rms(), None);
+        level.record(&[0; 64]);
+        assert_eq!(
+            (level.samples(), level.peak(), level.rms()),
+            (64, 0, Some(0.0))
+        );
+    }
+
+    #[test]
+    fn audio_level_tracks_peak_and_rms_across_frames() {
+        let mut level = AudioLevel::default();
+        level.record(&[3, -4]);
+        level.record(&[0, 0]);
+        assert_eq!(level.peak(), 4);
+        // sqrt((9 + 16) / 4)
+        assert_eq!(level.rms(), Some(2.5));
+        assert_eq!(level.samples(), 4);
+    }
+
+    #[test]
+    fn audio_level_handles_the_most_negative_sample() {
+        let mut level = AudioLevel::default();
+        level.record(&[i16::MIN, i16::MAX]);
+        assert_eq!(level.peak(), 32768);
+        assert!(level.rms().unwrap() > 32767.0);
     }
 }

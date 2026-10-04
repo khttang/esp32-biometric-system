@@ -3,21 +3,19 @@ use std::f32::consts::PI;
 
 use crate::ffi;
 
-#[allow(dead_code)]
 const AUDIO_SAMPLE_RATE: u32 = 16_000;
 
-/// I2S speaker output (shares I2S_NUM_0 with the microphone)
-#[allow(dead_code)] // TODO: play_success_chime on ActionExecuted
+/// Speaker output through the on-board codec (shares I2S_NUM_0 with the microphone).
 pub struct Speaker {
     i2s_port: i32,
 }
 
-#[allow(dead_code)]
 impl Speaker {
     pub fn new(i2s_port: i32) -> Self {
         Self { i2s_port }
     }
 
+    /// Two rising notes, about 0.4 s. Blocks until the samples are handed to the I2S driver.
     pub fn play_success_chime(&mut self) -> Result<()> {
         let mut chime_pcm = Vec::new();
         Self::generate_sine_wave(880.0, 0.15, &mut chime_pcm); // A5

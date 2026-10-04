@@ -1,4 +1,5 @@
 use anyhow::Result;
+use biometric_core::stats::AudioLevel;
 use log::{error, info, warn};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::thread;
@@ -6,6 +7,10 @@ use std::thread;
 use crate::ffi;
 
 pub const AUDIO_FRAME_SAMPLES: usize = 512;
+const SAMPLE_RATE_HZ: u64 = 16_000;
+const CAPTURE_STACK_SIZE: usize = 8 * 1024;
+/// The microphone level is logged once per this many samples (10 s).
+const LEVEL_LOG_SAMPLES: u64 = 10 * SAMPLE_RATE_HZ;
 /// ~0.5s of 16 kHz audio buffered before new frames are dropped
 pub const AUDIO_QUEUE_DEPTH: usize = 16;
 
@@ -48,17 +53,30 @@ impl AudioWorker {
 pub fn spawn_audio_capture_thread(
     i2s_port: i32,
     audio_tx: SyncSender<AudioFrame>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+) -> Result<std::thread::JoinHandle<()>> {
+    // The codec read path, a frame on the stack and logging need more than the 4 KB default.
+    let thread = thread::Builder::new().stack_size(CAPTURE_STACK_SIZE);
+    let handle = thread.spawn(move || {
         let worker = AudioWorker::new(i2s_port);
 
-        info!("[Audio] I2S MEMS Microphone capture thread running...");
+        info!("[Audio] microphone capture thread running");
         let mut pcm_buffer = [0i16; AUDIO_FRAME_SAMPLES];
+        let mut level = AudioLevel::default();
 
         loop {
             // Blocking read from DMA in C—thread yields until buffer is filled
             match worker.capture_frame(&mut pcm_buffer) {
                 Ok(samples_read) => {
+                    level.record(&pcm_buffer[..samples_read]);
+                    if level.samples() >= LEVEL_LOG_SAMPLES {
+                        info!(
+                            "[Audio] microphone over {} s: peak {} of 32768, rms {:.0}",
+                            level.samples() / SAMPLE_RATE_HZ,
+                            level.peak(),
+                            level.rms().unwrap_or(0.0)
+                        );
+                        level = AudioLevel::default();
+                    }
                     if samples_read > 0 {
                         let frame = AudioFrame {
                             samples: pcm_buffer,
@@ -79,5 +97,6 @@ pub fn spawn_audio_capture_thread(
                 }
             }
         }
-    })
+    })?;
+    Ok(handle)
 }
