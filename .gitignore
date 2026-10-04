@@ -5,3 +5,6 @@
 
 # Downloaded and packaged face models (tools/face-models.sh)
 /models/
+
+# Local Wi-Fi credentials for bench tests (never commit)
+/firmware/wifi-credentials.txt
