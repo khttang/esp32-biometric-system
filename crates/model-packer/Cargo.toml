@@ -7,3 +7,5 @@ description = "Packages an ESP-DL model and its manifest into a flash partition 
 
 [dependencies]
 biometric-core = { path = "../biometric-core" }
+# Operating-system randomness for `keygen`.
+getrandom = "0.3"

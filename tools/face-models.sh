@@ -5,6 +5,7 @@
 #   tools/face-models.sh pack  [a|b]    # build partition images (model + manifest) with model-packer
 #   tools/face-models.sh flash [a|b]    # write the images with espflash (set ESPFLASH_PORT to choose a port)
 #   tools/face-models.sh all   [a|b]    # fetch + pack + flash
+#   tools/face-models.sh keygen         # create the signing key; prints its public key
 #
 # Models are not part of the firmware build. Each has two flash slots (a, the default, and b)
 # and a manifest (model id, version, size, SHA-256, golden) that the firmware verifies before
@@ -12,6 +13,11 @@
 # not in use: the firmware gives it a golden run at the next boot and switches only if it passes.
 #
 # Set NO_GOLDEN=1 to pack without goldens, e.g. to have the device compute and log them.
+#
+# Images are signed with the key in MODEL_SIGNING_KEY (default
+# ~/.config/esp32-biometric/model-signing.key); the firmware only loads images signed by a key
+# in firmware/trusted-model-keys.txt. Create your own key with `tools/face-models.sh keygen`
+# and put the public key it prints into that file.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,6 +25,7 @@ MODELS="$ROOT/models"
 PARTITIONS="$ROOT/firmware/partitions.csv"
 PACKER_DIR="$ROOT/crates/model-packer"
 REGISTRY="https://components-file.espressif.com/components/espressif"
+SIGNING_KEY="${MODEL_SIGNING_KEY:-$HOME/.config/esp32-biometric/model-signing.key}"
 
 # Pinned model releases: component, version, SHA-256 of the release archive.
 RELEASES=(
@@ -73,8 +80,21 @@ fetch() {
   done
 }
 
+keygen() {
+  (cd "$PACKER_DIR" && cargo run --quiet --release -- keygen --out "$SIGNING_KEY")
+  echo "Secret key written to $SIGNING_KEY; add the public key above to firmware/trusted-model-keys.txt" >&2
+}
+
+require_key() {
+  if [[ ! -f "$SIGNING_KEY" ]]; then
+    echo "No signing key at $SIGNING_KEY: run tools/face-models.sh keygen (or set MODEL_SIGNING_KEY)" >&2
+    exit 1
+  fi
+}
+
 pack() {
   local slot; slot="$(slot_arg "${1:-}")"
+  require_key
   for image in "${IMAGES[@]}"; do
     read -r base model component version golden <<<"$image"
     partition="${base}_${slot}"
@@ -84,6 +104,7 @@ pack() {
     (cd "$PACKER_DIR" && cargo run --quiet --release -- \
       --input "$MODELS/p4/$model.espdl" --model "$model" --version "$component $version" \
       --label "$partition" --partitions "$PARTITIONS" --out "$MODELS/$partition.bin" \
+      --key "$SIGNING_KEY" \
       ${golden_args[@]+"${golden_args[@]}"})
   done
 }
@@ -108,5 +129,6 @@ case "${1:-}" in
   pack) pack "${2:-}" ;;
   flash) flash "${2:-}" ;;
   all) fetch && pack "${2:-}" && flash "${2:-}" ;;
-  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  keygen) keygen ;;
+  *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

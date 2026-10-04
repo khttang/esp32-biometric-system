@@ -3,8 +3,9 @@
 //! The ESP-DL models live in their own flash partitions so they can be updated without
 //! reflashing the firmware (see `crates/model-packer`). ESP-DL aborts the chip if a partition
 //! cannot be mapped and has no integrity check, so every partition is verified here first:
-//! the manifest in its last sector must name the expected model and match the data's SHA-256
-//! (`biometric_core::manifest`).
+//! the manifest in its last sector must be signed by a trusted key, name the expected model
+//! and match the data's SHA-256 (`biometric_core::manifest`). The trusted public keys are
+//! compiled in from `trusted-model-keys.txt`; an unsigned image is never loaded.
 //!
 //! Each model has an A and a B slot. [`ModelStore::select`] picks the one to load, following
 //! `biometric_core::activation`: a new image found in the standby slot is given a *golden run*
@@ -26,12 +27,14 @@
 use core::ffi::{c_void, CStr};
 use core::ptr::NonNull;
 use std::ffi::CString;
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use anyhow::{bail, ensure, Context, Result};
 use biometric_core::activation::{self, Activation, Decision, Slot};
 use biometric_core::contract::ModelSpec;
 use biometric_core::manifest::{self, encode_hex, ModelManifest};
+use biometric_core::signing::{self, PublicKey};
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use log::{error, info, warn};
 
@@ -91,15 +94,25 @@ impl Drop for MappedPartition {
     }
 }
 
-/// Verifies that partition `label` holds an intact copy of `expected_model`; returns its
-/// manifest. The mapping is released before returning, so ESP-DL can map it afresh.
+/// Keys whose signature on a model image this firmware accepts. Compiled in, so changing who
+/// may publish models takes a firmware release. An unreadable key file leaves no trusted
+/// key, and then no model loads.
+static TRUSTED_KEYS: LazyLock<Vec<PublicKey>> = LazyLock::new(|| {
+    signing::parse_public_keys(include_str!("../trusted-model-keys.txt")).unwrap_or_else(|e| {
+        error!("[Models] trusted-model-keys.txt: {e}; no model will be accepted");
+        Vec::new()
+    })
+});
+
+/// Verifies that partition `label` holds an intact copy of `expected_model`, signed by a
+/// trusted key; returns its manifest. The mapping is released before returning, so ESP-DL can map it afresh.
 pub fn verify(label: &CStr, expected_model: &str) -> Result<ModelManifest> {
     let started = Instant::now();
     let partition = MappedPartition::map(label)?;
-    let manifest = manifest::verify(partition.as_slice(), expected_model)
+    let manifest = manifest::verify_signed(partition.as_slice(), expected_model, &TRUSTED_KEYS)
         .map_err(|e| anyhow::anyhow!("partition {label:?}: {e}"))?;
     info!(
-        "[Models] {label:?}: {} ({}), {} bytes, SHA-256 verified in {} ms",
+        "[Models] {label:?}: {} ({}), {} bytes, signature and SHA-256 verified in {} ms",
         manifest.model,
         manifest.version,
         manifest.size,
@@ -108,14 +121,15 @@ pub fn verify(label: &CStr, expected_model: &str) -> Result<ModelManifest> {
     Ok(manifest)
 }
 
-/// Verifies that partition `label` holds an intact model, whichever one its manifest names.
+/// Verifies that partition `label` holds an intact, signed model, whichever one its manifest
+/// names.
 /// For the evaluation harness, which accepts any feature model as the candidate.
 #[cfg(feature = "eval")]
 pub fn verify_any(label: &CStr) -> Result<ModelManifest> {
     let partition = MappedPartition::map(label)?;
-    let named = manifest::read_manifest(partition.as_slice())
+    let named = manifest::authenticate(partition.as_slice(), &TRUSTED_KEYS)
         .map_err(|e| anyhow::anyhow!("partition {label:?}: {e}"))?;
-    manifest::verify(partition.as_slice(), &named.model)
+    manifest::verify_signed(partition.as_slice(), &named.model, &TRUSTED_KEYS)
         .map_err(|e| anyhow::anyhow!("partition {label:?}: {e}"))
 }
 
