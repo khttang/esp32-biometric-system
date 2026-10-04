@@ -174,4 +174,38 @@ storage,  data, spiffs,  0xC60000, 3712K
         let last = all.last().unwrap();
         assert!(last.offset + last.size <= 16 * 1024 * 1024, "past 16 MB");
     }
+
+    #[test]
+    fn evaluation_table_differs_only_in_the_second_firmware_slot() {
+        // The evaluation firmware reads the models from the regular slots, so every other
+        // partition must sit exactly where the regular table puts it.
+        fn entries(csv: &str) -> Vec<&str> {
+            csv.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .collect()
+        }
+        let regular = entries(include_str!("../../../firmware/partitions.csv"));
+        let evaluation = entries(include_str!("../../../firmware/partitions-eval.csv"));
+        assert_eq!(regular.len(), evaluation.len());
+        let changed: Vec<(&str, &str)> = regular
+            .into_iter()
+            .zip(evaluation)
+            .filter(|(regular, evaluation)| regular != evaluation)
+            .collect();
+        let [(regular, evaluation)] = changed[..] else {
+            panic!("expected exactly one changed entry, got {changed:?}");
+        };
+        assert!(regular.starts_with("ota_1,"), "{regular}");
+        let csv = include_str!("../../../firmware/partitions-eval.csv");
+        let candidate = find(csv, "eval_feat").unwrap();
+        let slot = find(include_str!("../../../firmware/partitions.csv"), "ota_1").unwrap();
+        assert_eq!(
+            (candidate.offset, candidate.size),
+            (slot.offset, slot.size),
+            "{evaluation}"
+        );
+        // ESP-DL memory-maps model partitions: 64 KiB aligned.
+        assert_eq!(candidate.offset % 0x10000, 0);
+    }
 }

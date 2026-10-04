@@ -30,7 +30,7 @@ Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP
 | Face embedding | Working: ESP-DL MobileFaceNet, 512-d, aligned from 5 landmarks |
 | Model updates | Each model has two flash slots (A/B) with a verified manifest. A new image written to the standby slot is activated only after a golden run passes, and the previous image is kept for rollback; no firmware reflash ([Model Partitions](#model-partitions)) |
 | Enrollment | On-device: the admin view on the touch panel enrolls the face in view and deletes members; templates persist in flash ([Enrollment & Templates](#enrollment--templates)) |
-| Matching | Cosine similarity against enrolled templates of the same model release. Enroll → reboot → recognise → delete works on the board. The threshold (0.5) is Espressif's default and has **not** been measured on a test set yet |
+| Matching | Cosine similarity against enrolled templates of the same model release. Enroll → reboot → recognise → delete works on the board. The threshold (0.5) is Espressif's default; on a public dataset it accepted no impostor pair and rejected 21% of genuine single-image pairs; not yet measured with this camera on non-enrolled people ([Measuring Accuracy on the Board](#measuring-accuracy-on-the-board)) |
 | Template download | Not yet (M4): the HTTP fetch code is not triggered by the state machine |
 | Voice recognition | Not implemented |
 
@@ -330,18 +330,15 @@ leaves enrollments alone. NVS provides wear levelling, a CRC per entry and power
 Templates are loaded at boot; a record that fails to decode is logged and skipped.
 
 **Threshold.** `MATCH_THRESHOLD` is 0.5, the default of Espressif's `HumanFaceRecognizer` for this
-model. It has not been measured on a test set with this pipeline yet. The one data point so far:
-a single enrolled person scored 0.32–0.87 per frame (0.77 on average) and was recognised at 0.84
-and, after a reboot, 0.77. Nothing is known yet about how people who are not enrolled score. To
-measure it, watch the inference log line, which reports the similarity of each embedded face to
-its closest template every 10 s:
+model. [Measuring Accuracy on the Board](#measuring-accuracy-on-the-board) reports what that
+threshold does on a public dataset. It has not been measured with this camera on people who are
+not enrolled; the one live data point is a single enrolled person, who scored 0.32–0.87 per frame
+(0.77 on average). The inference log line reports the similarity of each embedded face to its
+closest template every 10 s, so live scores can be compared with the dataset's:
 
 ```text
 … | closest template n=42 min 0.61 avg 0.74 max 0.83 (threshold 0.5)
 ```
-
-Enrolled people in view should stay well above the threshold in the poses and lighting you care
-about (false rejects); people who are not enrolled should stay well below it (false accepts).
 
 **Limitations.**
 - Templates are stored **unencrypted** (flash/NVS encryption is planned for M4). They are biometric
@@ -349,6 +346,76 @@ about (false rejects); people who are not enrolled should stay well below it (fa
 - Anyone at the device can open the admin view; there is no admin authentication yet.
 - There is no liveness check: a photo of an enrolled person matches.
 - Roles are stored but not used for anything yet.
+
+### Measuring Accuracy on the Board
+
+How often does the device accept the wrong person, or reject the right one? That depends on the
+quantised models as they run on this chip, so it is measured on the board, not on a PC:
+
+1. `tools/face-eval.sh flash` flashes the firmware built with the `eval` cargo feature. That
+   build does not start the camera; it loads the models and waits on the console UART.
+2. `tools/face-eval.sh capture` (host tool `crates/face-eval`) sends images of the
+   [LFW](http://vis-www.cs.umass.edu/lfw/) dataset to the board, one at a time. For each image
+   the board runs the same detector and feature models as in normal operation, on the largest
+   face it finds, and returns the embeddings.
+3. `tools/face-eval.sh report` compares every pair of embeddings on the host: two images of the
+   same person are a *genuine* pair, images of two different people an *impostor* pair.
+4. `tools/face-eval.sh restore` flashes the regular firmware again.
+
+Two rates describe a threshold: the **false accept rate** is the share of impostor pairs that
+score at or above it, and the **false reject rate** is the share of genuine pairs that score
+below it. Raising the threshold trades false accepts for false rejects; the **equal error rate**
+is where the two meet.
+
+The evaluation build can load a second, *candidate* feature model and run it on the same
+detections, so two models are compared like for like. The candidate lives in `eval_feat`, a
+partition that `firmware/partitions-eval.csv` puts in place of the unused second firmware slot.
+
+**Results** (ESP32-P4 rev 1.3, ESP-IDF v5.5.5, the pinned model releases; 400 LFW people with two
+or more images, up to four images each, chosen at even intervals through the sorted names):
+
+- 1,189 images sent; a face was detected in 1,181 (8 without).
+- 1,317 genuine pairs and 695,473 impostor pairs.
+- The run took about 48 minutes, 2.4 s per image, most of it the transfer.
+
+| Metric | MFN (`human_face_feat_mfn_s8_v1`, in use) | MBF (`human_face_feat_mbf_s8_v1`, candidate) |
+|---|---|---|
+| Equal error rate | 1.07% | 0.76% |
+| False accepts at the current threshold (0.5) | none in 695,473 pairs | none in 695,473 pairs |
+| False rejects at the current threshold (0.5) | 21.2% | 36.7% |
+| Highest impostor score | 0.444 | 0.374 |
+| Threshold for 1% false accepts → false rejects there | 0.245 → 1.2% | 0.174 → 0.6% |
+| Threshold for 0.1% false accepts → false rejects there | 0.323 → 2.7% | 0.233 → 1.5% |
+| Threshold for 0.01% false accepts → false rejects there | 0.381 → 5.4% | 0.281 → 3.9% |
+| Mean genuine / impostor score | 0.592 / 0.026 | 0.534 / 0.027 |
+| Model size / one run on the board | 1.3 MB / 176 ms | 3.5 MB / 326 ms |
+
+What this shows:
+- **0.5 is a cautious threshold for MFN.** No impostor pair reached it, but one genuine pair in
+  five fell below it when a single image is compared with a single image.
+- **Each model needs its own threshold.** MBF scores lower overall, so MFN's threshold would
+  reject far more genuine pairs with MBF. A threshold belongs to a model release, like a template.
+- **MBF is somewhat more accurate.** At equal false accept rates it rejects fewer genuine pairs
+  (3.9% against 5.4% at 0.01%), for nearly twice the inference time and a 3.5 MB image, which does
+  not fit the 2 MB feature slots of the regular layout.
+
+`MATCH_THRESHOLD` is unchanged by this measurement.
+
+**How it works.** The host sends a 16-byte header (magic, width, height, length, CRC-32) and the
+pixels as packed B, G, R bytes at 921,600 baud; the board answers with one text line carrying the
+detector's score and each model's embedding as hex, with its own CRC-32
+(`biometric_core::eval_protocol`). A text line survives next to log output on the same UART. The
+metrics are in `biometric_core::evaluation`. Results are written as they arrive, so an
+interrupted capture resumes where it stopped.
+
+**What the numbers do and do not say.**
+- LFW images are press photos of public figures: varied pose, lighting and age, but not taken
+  with this device's camera, and each is sent as a 250 × 250 image, not as a 640 × 480 frame.
+- Each comparison is one image against one image. The device compares a live frame with a
+  template averaged from five samples, which should do better, but that is not measured here.
+- The smallest false accept rate that can be measured is one over the number of impostor pairs.
+- The `eval` feature is for the bench: it accepts images from anyone on the serial port. Never
+  flash it on a deployed device.
 
 ### Measured Performance (ESP32-P4 rev 1.3, 360 MHz)
 
@@ -436,8 +503,11 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │   │       ├── matching.rs           # GroupMember, model-version-aware matching, cosine similarity
 │   │       ├── template.rs           # Template format v1: encode / decode one stored member
 │   │       ├── enrollment.rs         # Sample accumulator, member ids / names / slots
-│   │       └── stats.rs              # Allocation-free latency and score statistics
-│   └── model-packer/                 # Host tool: .espdl + manifest -> partition image
+│   │       ├── stats.rs              # Allocation-free latency and score statistics
+│   │       ├── evaluation.rs         # False accept / false reject rates from similarity scores
+│   │       └── eval_protocol.rs      # Wire format of the on-board evaluation harness
+│   ├── model-packer/                 # Host tool: .espdl + manifest -> partition image
+│   └── face-eval/                    # Host tool: sends dataset images to the eval firmware, reports FAR/FRR
 ├── firmware/                         # ESP32-P4 application (Rust + ESP-IDF)
 │   ├── .cargo/config.toml            # Target, build-std, espflash runner, ESP-IDF version
 │   ├── rust-toolchain.toml           # Pinned nightly + rust-src
@@ -445,6 +515,7 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │   ├── build.rs                      # Propagates ESP-IDF link args, links libstdc++
 │   ├── sdkconfig.defaults            # ESP-IDF Kconfig (PSRAM, cache, camera, LVGL, Ethernet …)
 │   ├── partitions.csv                # Flash layout (see below)
+│   ├── partitions-eval.csv           # Evaluation layout: second firmware slot -> candidate model
 │   ├── components_esp32p4.lock       # Locked ESP-IDF managed component versions
 │   ├── components/biometrics_wrapper/      # C++ ESP-IDF component
 │   │   ├── biometrics_wrapper.cpp    # Display/LVGL, touch, camera V4L2, audio, Ethernet, OTA
@@ -468,6 +539,7 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │       ├── speaker.rs                # I2S speaker output (chime)
 │       └── power.rs                  # Inactivity watchdog, deep sleep, boot crash counter
 ├── tools/face-models.sh              # Fetch, package and flash the face models
+├── tools/face-eval.sh                # Measure recognition accuracy on the board with a public dataset
 ├── models/                           # (gitignored) downloaded models + partition images
 └── docs/ROADMAP.md                    # Milestones
 ```
@@ -527,7 +599,7 @@ and used as `crate::ffi`.
 
 ```sh
 # Host unit tests (no board needed)
-cd crates/biometric-core   # and crates/model-packer
+cd crates/biometric-core   # and crates/model-packer, crates/face-eval
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 
 # Firmware: always use the release profile
@@ -536,6 +608,7 @@ cargo build --release          # first build downloads ESP-IDF + tools (needs ne
 cargo run --release            # build, flash (espflash, partitions.csv) and open the serial monitor
 ../tools/face-models.sh all     # first time, or after a model change: write the face models
 cargo fmt --check && cargo clippy --release -- -D warnings   # same checks as CI
+cargo clippy --release --features eval -- -D warnings          # the evaluation build, also in CI
 ```
 
 - **CI** (`.github/workflows/ci.yml`) runs on every pull request and push to `main`:

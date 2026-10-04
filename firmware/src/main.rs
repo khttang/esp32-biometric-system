@@ -5,6 +5,8 @@ use esp_idf_svc::sys as ffi;
 mod audio_worker;
 mod biometrics;
 mod camera;
+#[cfg(feature = "eval")]
+mod eval;
 mod models;
 mod pipeline;
 mod power;
@@ -28,6 +30,12 @@ fn main() -> Result<()> {
     info!("============================================");
     info!("  ESP32-P4 Biometric Agent Firmware v0.1.0  ");
     info!("============================================");
+
+    // Evaluation build: serve images from the host instead of running the device (see eval.rs).
+    #[cfg(feature = "eval")]
+    if cfg!(feature = "eval") {
+        return eval::run();
+    }
 
     // 2. Mark running app image as valid (prevents automatic OTA rollback)
     system::validate_running_app();

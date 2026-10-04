@@ -6,6 +6,8 @@
 pub mod activation;
 pub mod contract;
 pub mod enrollment;
+pub mod eval_protocol;
+pub mod evaluation;
 pub mod geometry;
 pub mod manifest;
 pub mod matching;

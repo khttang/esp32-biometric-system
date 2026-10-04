@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [biometric-core, model-packer]
+        crate: [biometric-core, model-packer, face-eval]
     defaults:
       run:
         working-directory: crates/${{ matrix.crate }}
@@ -85,6 +85,10 @@ jobs:
 
       - name: clippy
         run: cargo clippy --release -- -D warnings
+
+      # The evaluation harness is a cargo feature and would otherwise never be checked.
+      - name: clippy (eval feature)
+        run: cargo clippy --release --features eval -- -D warnings
 
       - name: Release build
         run: cargo build --release

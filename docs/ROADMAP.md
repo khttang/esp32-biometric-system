@@ -194,7 +194,8 @@ Enroll and recognise people locally, with no server.
   not enrolled.
 
 **Follow-ups (own PRs):**
-- Threshold measurement on a small test set, including non-enrolled people.
+- Threshold measurement on a small test set, including non-enrolled people. Partly done by the
+  evaluation harness below (public dataset); still open with this camera and live people.
 - The display showed every frame about 150 px off, which made the first version of the touch
   panel unusable. Fixed separately by using the HX8394 driver's DSI timing.
 
@@ -236,6 +237,30 @@ Enroll and recognise people locally, with no server.
   when the camera thread interrupted the run. Cause: an ESP32-P4 hardware-loop erratum that
   ESP-IDF v5.5.5's context switch does not fully cover. Worked around in
   `hwlp_erratum.S` (see README); preempted runs are now bit-exact.
+
+### ✅ On-Board Accuracy Evaluation
+
+Measure recognition accuracy on the real hardware without people at the camera, to settle the
+match threshold and to compare feature models before M4 fixes slot sizes.
+
+**Done:**
+- Firmware cargo feature `eval`: the board serves images sent over the console UART and returns
+  the embeddings of every loaded feature model (`firmware/src/eval.rs`).
+- A second, candidate feature model can run next to the active one; `partitions-eval.csv` gives
+  it the unused second firmware slot.
+- Host tool `crates/face-eval` and `tools/face-eval.sh` (fetch, flash, capture, report, restore).
+- Metrics and wire format in `biometric-core` (`evaluation`, `eval_protocol`) with host tests.
+- Run on the board with 1,189 LFW images of 400 people (1,317 genuine and 695,473 impostor pairs):
+  - MFN (in use): equal error rate 1.07%; at threshold 0.5 no false accepts, 21.2% false rejects.
+  - MBF (candidate): equal error rate 0.76%; at 0.01% false accepts it rejects 3.9% of genuine
+    pairs against MFN's 5.4%, at 326 ms per run against 176 ms and 3.5 MB against 1.3 MB.
+
+**Not done:**
+- `MATCH_THRESHOLD` is unchanged; choosing a value from these numbers is a separate decision.
+- Not measured with this device's camera, on live non-enrolled people, or against the
+  five-sample templates the device actually stores.
+- Thresholds are per model, but the firmware has one constant. A second feature model would need
+  its threshold carried with the model (candidate for the manifest in M4).
 
 ### ⬜ M4: Network Sync & Remote Model Updates
 
