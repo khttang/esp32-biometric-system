@@ -87,7 +87,7 @@ admin button is configured in Rust (`system.rs`).
 | `main` | 0 | 1 | 8 KB | ESP-IDF (Rust `main`) | Boot, then state machine loop (~20 ms period) |
 | LVGL (`taskLVGL`) | 0 | 4 | 7 KB | `esp_lvgl_port` | Render, sw-rotate 270°, flush to DPI framebuffer; 5 ms timer |
 | `gt911_poller` | 1 | 5 | 3 KB | C++ | Poll GT911 every 15 ms |
-| `cam_pipeline` | 1 | 6 | 8 KB | Rust `pipeline.rs` | Dequeue frame → PPA preview → (on request) detector image from preview → swap canvas; logs fps/PPA stats every 10 s |
+| `cam_pipeline` | 1 | 6 | 8 KB | Rust `pipeline.rs` | Dequeue frame → PPA preview → (on request) detector image from preview → swap canvas (LVGL try-lock, skipped when LVGL is busy); logs fps, PPA and swap stats every 10 s |
 | `inference` | 1 | 3 (highest during a golden run) | 32 KB | Rust `pipeline.rs` | Detect → overlay → embed → match, ≤ 10 Hz (~23 KB of stack never used). At start-up, a golden run of a new model image runs at the highest priority, so `cam_pipeline` and the preview pause for its duration |
 | audio capture | any | 5 | 8 KB | Rust `audio_worker.rs` | Read the microphone into a bounded queue; log its level every 10 s |
 | inactivity watchdog | any | 5 | 4 KB | Rust `power.rs` | Deep sleep after 180 s without input |
@@ -101,7 +101,7 @@ no Kconfig option for this), keeping Core 1 free for the vision pipeline.
 │ main (prio 1)                                           │   │ cam_pipeline (prio 6)                                   │
 │   BiometricSystem::tick() every ~20 ms                  │   │   Camera::next_frame()  (blocking V4L2 DQBUF)           │
 │   ◀── InferenceEvent { FaceSeen | Match(member) } ──────┼───┤   PPA 1280×960 → 640×480 RGB565 preview                 │
-│   touch / admin button → InactivityTimer::reset()       │   │   p4_ui_present_camera(back buffer)  (LVGL lock, 5 ms)  │
+│   touch / admin button → InactivityTimer::reset()       │   │   p4_ui_present_camera(back buffer)  (LVGL try-lock)    │
 │                                                         │   │   on request: PPA 1280×960 → 640×480 RGB888 ──┐         │
 │ LVGL (prio 4)                                           │   │ inference (prio 3)                             ▼         │
 │   render canvas + right panel, rotate 270°, DSI flush   │   │   detect → overlay → align+embed → match ─────┐         │
@@ -122,7 +122,9 @@ no Kconfig option for this), keeping Core 1 free for the vision pipeline.
      limits per-frame re-rendering and rotation to image pixels.
    - `p4_ui_present_camera()` swaps the canvas to the new buffer under the LVGL lock; the camera
      thread then fills the other one.
-   - If LVGL is busy for more than 5 ms, that frame's preview update is skipped.
+   - The camera thread does not wait for that lock: if LVGL holds it, that frame's preview
+     update is skipped (about 0.2 % of frames, measured with an idle scene). The camera log
+     line reports the time spent in the swap and the number of skipped swaps.
 3. **Inference hand-off**: the inference thread owns a single 640×480 RGB888 detector buffer. It
    requests a frame by handing the buffer back.
    - The camera fills it from the next frame's **preview**: a 640×480 → 640×480 pixel-format
