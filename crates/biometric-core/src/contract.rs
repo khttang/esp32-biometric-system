@@ -10,6 +10,8 @@
 //! The firmware checks [`EMBEDDING_DIM`] against the loaded model at startup and disables
 //! recognition on a mismatch rather than comparing incompatible vectors.
 
+use core::ffi::CStr;
+
 use crate::geometry::PixelFormat;
 
 /// Detector input produced by the camera pipeline: the full sensor frame at half resolution,
@@ -17,9 +19,6 @@ use crate::geometry::PixelFormat;
 pub const DETECTOR_WIDTH: u32 = 640;
 pub const DETECTOR_HEIGHT: u32 = 480;
 pub const DETECTOR_FORMAT: PixelFormat = PixelFormat::Rgb888;
-
-/// Facial landmarks reported per face (eyes, nose, mouth corners) and used for alignment.
-pub const LANDMARK_COUNT: usize = 5;
 
 /// Length of the face embedding produced by the feature model.
 pub const EMBEDDING_DIM: usize = 512;
@@ -34,23 +33,23 @@ pub struct ModelSpec {
     /// Espressif's model components.
     pub id: &'static str,
     /// Partition labels of slots A and B; must match `firmware/partitions.csv`.
-    pub partitions: [&'static str; 2],
+    pub partitions: [&'static CStr; 2],
 }
 
 pub const MSR_MODEL: ModelSpec = ModelSpec {
     key: "msr",
     id: "human_face_detect_msr_s8_v1",
-    partitions: ["face_msr_a", "face_msr_b"],
+    partitions: [c"face_msr_a", c"face_msr_b"],
 };
 pub const MNP_MODEL: ModelSpec = ModelSpec {
     key: "mnp",
     id: "human_face_detect_mnp_s8_v1",
-    partitions: ["face_mnp_a", "face_mnp_b"],
+    partitions: [c"face_mnp_a", c"face_mnp_b"],
 };
 pub const FEATURE_MODEL: ModelSpec = ModelSpec {
     key: "feat",
     id: "human_face_feat_mfn_s8_v1",
-    partitions: ["face_feat_a", "face_feat_b"],
+    partitions: [c"face_feat_a", c"face_feat_b"],
 };
 
 /// NVS partition holding the enrolled templates (see [`crate::template`]); must match

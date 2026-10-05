@@ -1,5 +1,4 @@
-use log::{error, info, warn};
-use std::sync::Arc;
+use log::{info, warn};
 use std::time::{Duration, Instant};
 
 use biometric_core::enrollment::{ENROLL_SAMPLES, MAX_MEMBERS};
@@ -9,8 +8,6 @@ use crate::pipeline::{Command, InferenceEvent};
 use crate::system::SystemResources;
 use crate::ui::{self, UiEvent};
 
-pub use biometric_core::matching::GroupMember;
-
 /// How long a match stays on screen.
 const MATCH_DISPLAY_TIME: Duration = Duration::from_secs(3);
 /// The admin view closes by itself after this long without a touch.
@@ -19,10 +16,8 @@ const ADMIN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const ENROLL_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]
-#[allow(dead_code)] // TODO: UpdatingRuntimeData/Error become reachable once network triggers are wired
 pub enum SystemState {
     Initialize,
-    RetrieveRuntimeData,
     DetectionValidation,
     /// Admin view open: members can be enrolled and deleted.
     Admin {
@@ -33,18 +28,14 @@ pub enum SystemState {
         name: String,
         deadline: Instant,
     },
-    UpdatingRuntimeData {
-        force_full_resync: bool,
-    },
+    /// A match is on screen until `until`.
     ActionExecuted {
-        member: Arc<GroupMember>,
+        until: Instant,
     },
-    Error(String),
 }
 
 pub struct BiometricSystem {
     state: SystemState,
-    action_display_timer: Option<Instant>,
     admin_was_pressed: bool,
 }
 
@@ -52,18 +43,12 @@ impl BiometricSystem {
     pub fn new() -> Self {
         Self {
             state: SystemState::Initialize,
-            action_display_timer: None,
             admin_was_pressed: false,
         }
     }
 
     /// Primary execution cycle called continuously from the main loop
-    pub fn tick(
-        &mut self,
-        resources: &mut SystemResources,
-        admin_button_pressed: bool,
-        has_update: bool,
-    ) {
+    pub fn tick(&mut self, resources: &mut SystemResources, admin_button_pressed: bool) {
         let now = Instant::now();
 
         // Any user input keeps the device awake (deep sleep is owned by power::spawn_inactivity_watchdog)
@@ -91,12 +76,7 @@ impl BiometricSystem {
             // 2. DETECTION & VALIDATION: Main Active Loop
             // -----------------------------------------------------------------
             SystemState::DetectionValidation => {
-                // A. Check for Admin / Network Update Trigger
-                if admin_clicked && has_update {
-                    info!("Admin update triggered. Transitioning to RetrieveRuntimeData...");
-                    self.state = SystemState::RetrieveRuntimeData;
-                    return;
-                }
+                // A. Check for the Admin trigger
                 if admin_clicked || ui_event == Some(UiEvent::Admin) {
                     info!("Entering admin mode.");
                     show_member_list(resources);
@@ -122,8 +102,9 @@ impl BiometricSystem {
                             if let Err(e) = resources.speaker.play_success_chime() {
                                 warn!("Match chime failed: {e:#}");
                             }
-                            self.action_display_timer = Some(now + MATCH_DISPLAY_TIME);
-                            self.state = SystemState::ActionExecuted { member };
+                            self.state = SystemState::ActionExecuted {
+                                until: now + MATCH_DISPLAY_TIME,
+                            };
                             return;
                         }
                         // Leftovers of an enrollment that was cancelled meanwhile.
@@ -153,12 +134,10 @@ impl BiometricSystem {
                     return;
                 }
                 match ui_event {
+                    // Whether there is room is decided when the template is stored: enrolling
+                    // an existing member again needs no free slot.
                     Some(UiEvent::Enroll { name }) => {
-                        if resources.group_members.load().len() >= MAX_MEMBERS {
-                            ui::set_status(&format!(
-                                "All {MAX_MEMBERS} member slots are in use. Delete one first."
-                            ));
-                        } else if resources
+                        if resources
                             .vision_commands
                             .try_send(Command::StartEnroll)
                             .is_err()
@@ -239,66 +218,17 @@ impl BiometricSystem {
             }
 
             // -----------------------------------------------------------------
-            // 5. RETRIEVE RUNTIME DATA: Admin update check
+            // 5. ACTION EXECUTED: Unlock / Success UI feedback
             // -----------------------------------------------------------------
-            SystemState::RetrieveRuntimeData => {
-                resources.inactivity_timer.reset();
-                info!("State: RetrieveRuntimeData - Fetching user biometric profiles...");
-
-                let members_guard = resources.group_members.load();
-                if members_guard.is_empty() && resources.check_ethernet_link_status() {
-                    if let Err(e) = resources.fetch_runtime_templates() {
-                        warn!("Failed to load runtime templates: {:?}", e);
-                    }
-                }
-                self.state = SystemState::DetectionValidation;
-            }
-
-            // -----------------------------------------------------------------
-            // 6. UPDATING RUNTIME DATA: Flash sync
-            // -----------------------------------------------------------------
-            SystemState::UpdatingRuntimeData { force_full_resync } => {
-                resources.inactivity_timer.reset();
-                info!(
-                    "State: UpdatingRuntimeData (Force Full Resync: {})",
-                    force_full_resync
-                );
-
-                if !resources.check_ethernet_link_status() {
-                    error!("Cannot sync: Ethernet cable is disconnected!");
-                } else {
-                    info!("Ethernet link verified. Starting outbound HTTP sync...");
-                    if *force_full_resync {
-                        info!("Fetching biometric templates over Ethernet...");
-                        if let Err(e) = resources.fetch_runtime_templates() {
-                            warn!("Failed to load runtime templates: {:?}", e);
-                        }
-                    }
-                }
-                self.state = SystemState::DetectionValidation;
-            }
-
-            // -----------------------------------------------------------------
-            // 7. ACTION EXECUTED: Unlock / Success UI feedback
-            // -----------------------------------------------------------------
-            SystemState::ActionExecuted { .. } => {
+            SystemState::ActionExecuted { until } => {
+                let until = *until;
                 drain_vision_events(resources);
-                if let Some(timer) = self.action_display_timer {
-                    if now >= timer {
-                        info!("Action feedback complete. Returning to DetectionValidation.");
-                        resources.inactivity_timer.reset();
-                        self.action_display_timer = None;
-                        show_idle_status(resources);
-                        self.state = SystemState::DetectionValidation;
-                    }
+                if now >= until {
+                    info!("Action feedback complete. Returning to DetectionValidation.");
+                    resources.inactivity_timer.reset();
+                    show_idle_status(resources);
+                    self.state = SystemState::DetectionValidation;
                 }
-            }
-
-            // -----------------------------------------------------------------
-            // 8. ERROR: Recovery / Fault State
-            // -----------------------------------------------------------------
-            SystemState::Error(err_msg) => {
-                error!("Catastrophic error encountered: {}", err_msg);
             }
         }
     }
@@ -339,14 +269,14 @@ fn finish_enrollment(
         }
         Err(e) => {
             warn!("Enrollment failed: {e:#}");
-            "Enrollment failed (see log).".to_owned()
+            format!("Enrollment failed: {e}.")
         }
     }
 }
 
 fn show_member_list(resources: &SystemResources) {
     let roster = resources.group_members.load();
-    ui::set_members(roster.iter().map(|member| member.name.as_str()));
+    ui::set_members(&roster);
 }
 
 fn show_idle_status(resources: &SystemResources) {

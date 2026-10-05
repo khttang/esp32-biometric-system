@@ -29,11 +29,6 @@ impl LatencyStats {
     pub fn max(&self) -> Option<Duration> {
         (self.count > 0).then(|| Duration::from_micros(self.max_us))
     }
-
-    /// Returns the current statistics and starts a new window.
-    pub fn take(&mut self) -> Self {
-        core::mem::take(self)
-    }
 }
 
 /// Range and mean of similarity scores over a logging window, used to judge the match
@@ -76,11 +71,6 @@ impl ScoreStats {
 
     pub fn max(&self) -> Option<f32> {
         (self.count > 0).then_some(self.max)
-    }
-
-    /// Returns the current statistics and starts a new window.
-    pub fn take(&mut self) -> Self {
-        core::mem::take(self)
     }
 }
 
@@ -154,14 +144,6 @@ mod tests {
     }
 
     #[test]
-    fn score_stats_take_resets() {
-        let mut s = ScoreStats::default();
-        s.record(0.9);
-        assert_eq!(s.take().count(), 1);
-        assert_eq!(s, ScoreStats::default());
-    }
-
-    #[test]
     fn empty_stats_have_no_mean_or_max() {
         let s = LatencyStats::default();
         assert_eq!((s.count(), s.mean(), s.max()), (0, None, None));
@@ -176,15 +158,6 @@ mod tests {
         assert_eq!(s.count(), 3);
         assert_eq!(s.mean(), Some(Duration::from_millis(30)));
         assert_eq!(s.max(), Some(Duration::from_millis(60)));
-    }
-
-    #[test]
-    fn take_returns_window_and_resets() {
-        let mut s = LatencyStats::default();
-        s.record(Duration::from_millis(5));
-        let window = s.take();
-        assert_eq!(window.count(), 1);
-        assert_eq!(s, LatencyStats::default());
     }
 
     #[test]

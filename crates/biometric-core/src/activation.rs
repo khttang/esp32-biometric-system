@@ -27,16 +27,21 @@
 //!
 //! Images are identified by [`crate::manifest::ModelManifest::image_id`], so writing the same
 //! image again does not trigger another trial, while any new image does.
+//!
+//! Only the standby slot is watched. The state does not record which image is in the active
+//! slot, so an image written over the active slot is loaded without a trial, and so is the
+//! first image on a device that has no saved state. Updates must go to the standby slot.
 
 use core::fmt;
 
 pub type Digest = [u8; 32];
 
 /// Trials of one candidate that may end without a conclusion before it is rejected.
-pub const MAX_TRIAL_ATTEMPTS: u8 = 2;
+const MAX_TRIAL_ATTEMPTS: u8 = 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Slot {
+    #[default]
     A,
     B,
 }
@@ -88,24 +93,14 @@ pub enum Decision {
     Unavailable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The default is a device that has never switched: slot A, nothing evaluated.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Activation {
     pub active: Slot,
     /// The image last evaluated in the standby slot.
     pub standby: Option<(Digest, Verdict)>,
     /// The candidate on trial and how many trials of it have been started.
     pub trying: Option<(Digest, u8)>,
-}
-
-impl Default for Activation {
-    /// A device that has never switched: slot A, nothing evaluated.
-    fn default() -> Self {
-        Self {
-            active: Slot::A,
-            standby: None,
-            trying: None,
-        }
-    }
 }
 
 impl Activation {
@@ -147,6 +142,13 @@ impl Activation {
         }
     }
 
+    /// Ends the trial started by [`Self::begin`] without a verdict, e.g. because the trial
+    /// marker could not be saved. The candidate is tried again at the next start.
+    pub fn abandon(&mut self, slots: &Slots) -> Decision {
+        self.trying = None;
+        self.settle(slots)
+    }
+
     /// Uses the active slot, or rolls back to the standby slot if the active image is unusable
     /// and the standby one is the image that was active before.
     fn settle(&mut self, slots: &Slots) -> Decision {
@@ -166,9 +168,10 @@ impl Activation {
 }
 
 /// Length of an [`Activation`] record in NVS.
-pub const ENCODED_LEN: usize = 69;
+pub const ENCODED_LEN: usize = 68;
 
-const RECORD_VERSION: u8 = 1;
+/// Version 1 had a trailing checksum byte; NVS already protects each blob with a CRC.
+const RECORD_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordError {
@@ -213,7 +216,6 @@ impl Activation {
             record[35] = attempts;
             record[36..68].copy_from_slice(&digest);
         }
-        record[68] = checksum(&record[..68]);
         record
     }
 
@@ -223,9 +225,6 @@ impl Activation {
             .map_err(|_| RecordError::Length(record.len()))?;
         if record[0] != RECORD_VERSION {
             return Err(RecordError::UnsupportedVersion(record[0]));
-        }
-        if record[68] != checksum(&record[..68]) {
-            return Err(RecordError::Invalid("checksum"));
         }
         let digest = |start: usize| -> Digest {
             record[start..start + 32]
@@ -253,11 +252,6 @@ impl Activation {
             trying,
         })
     }
-}
-
-/// XOR of the bytes plus one, so an all-zero (or all-0xFF) record never checks out.
-fn checksum(bytes: &[u8]) -> u8 {
-    bytes.iter().fold(0u8, |acc, b| acc ^ b).wrapping_add(1)
 }
 
 #[cfg(test)]
@@ -455,6 +449,18 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_trial_is_started_again_at_the_next_boot() {
+        let slots = [Some(OLD), Some(NEW)];
+        let mut state = Activation::default();
+        assert_eq!(state.begin(&slots), Decision::Trial(Slot::B));
+        assert_eq!(state.abandon(&slots), Decision::Use(Slot::A));
+        // Nothing was decided about the candidate, and the attempt does not count.
+        assert_eq!(state, Activation::default());
+        assert_eq!(state.begin(&slots), Decision::Trial(Slot::B));
+        assert_eq!(state.trying, Some((NEW, 1)));
+    }
+
+    #[test]
     fn record_round_trips_every_shape() {
         for state in [
             Activation::default(),
@@ -488,20 +494,15 @@ mod tests {
             Activation::decode(&[0xFF; ENCODED_LEN]),
             Err(RecordError::UnsupportedVersion(0xFF))
         );
-        let mut flipped = record;
-        flipped[1] ^= 1; // would silently select the other slot
-        assert_eq!(
-            Activation::decode(&flipped),
-            Err(RecordError::Invalid("checksum"))
-        );
+        // A version 1 record (69 bytes, with a checksum) is not read as version 2.
+        assert_eq!(Activation::decode(&[1u8; 69]), Err(RecordError::Length(69)));
     }
 
     #[test]
-    fn record_rejects_out_of_range_fields_with_a_valid_checksum() {
+    fn record_rejects_out_of_range_fields() {
         for (offset, field) in [(1, "active slot"), (2, "standby verdict")] {
             let mut record = Activation::default().encode();
             record[offset] = 7;
-            record[68] = checksum(&record[..68]);
             assert_eq!(
                 Activation::decode(&record),
                 Err(RecordError::Invalid(field))

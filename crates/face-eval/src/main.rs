@@ -12,6 +12,7 @@
 //! The usual entry point is `tools/face-eval.sh`.
 
 mod dataset;
+mod evaluation;
 mod link;
 mod report;
 mod results;
@@ -21,8 +22,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use crate::evaluation::Scores;
 use biometric_core::eval_protocol::Response;
-use biometric_core::evaluation::Scores;
 
 const USAGE: &str = "usage: face-eval capture --port <serial port> --dataset <dir> --out <dir> \
                      [--people <n>] [--per-person <n>]\n       face-eval report --results <dir>";

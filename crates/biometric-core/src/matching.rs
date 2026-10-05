@@ -5,17 +5,20 @@
 //! template therefore records the `model_version` that produced it, and matching skips
 //! templates from any other version instead of producing meaningless scores.
 
-use serde::{Deserialize, Serialize};
+use core::borrow::Borrow;
 
 /// Cosine similarity a live embedding must reach to count as a match.
 ///
-/// This is the default of Espressif's `HumanFaceRecognizer` for the same model. It has not yet
-/// been measured on a test set with this pipeline; the firmware logs the similarity to the
-/// closest template so it can be.
+/// This is the default of Espressif's `HumanFaceRecognizer` for the same model. Measured on
+/// the board with LFW, one image against one image, it gave no false accepts and 21.2 % false
+/// rejects (see README, "Measuring Accuracy on the Board"). The firmware also logs the similarity to the closest
+/// template, so the threshold can be judged against what the device sees.
 pub const MATCH_THRESHOLD: f32 = 0.5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+/// How far the squared length of an embedding may be from 1 for it to count as L2-normalised.
+const UNIT_NORM_TOLERANCE: f32 = 0.05;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Admin,
     User,
@@ -23,15 +26,14 @@ pub enum Role {
 }
 
 /// What a template was computed from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Modality {
     Face,
     Voice,
 }
 
 /// One embedding of a member, for one modality and one model release.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Template {
     pub modality: Modality,
     /// Release of the model that produced `embedding` (the model manifest's `version`).
@@ -45,13 +47,12 @@ pub struct Template {
 /// A member outlives its templates: after a model change the old template no longer applies,
 /// and until a new one exists the member is known but cannot be recognised ("needs
 /// enrollment"). A member holds at most one template per modality and model release.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GroupMember {
     /// Unique across devices, e.g. `80f1b2d2da2e-0001` for a member enrolled on that device.
     pub id: String,
     pub name: String,
     pub role: Role,
-    #[serde(default)]
     pub templates: Vec<Template>,
 }
 
@@ -72,30 +73,24 @@ impl GroupMember {
     }
 }
 
-impl AsRef<GroupMember> for GroupMember {
-    fn as_ref(&self) -> &GroupMember {
-        self
-    }
-}
-
 /// Index of the member whose face template is closest to `embedding`, and the similarity,
 /// whether or not it reaches [`MATCH_THRESHOLD`].
 ///
 /// Only a face template produced by `model_version` and of the same length as `embedding` is
 /// comparable; members without one are skipped rather than compared on something else.
-pub fn closest<M: AsRef<GroupMember>>(
+pub fn closest<M: Borrow<GroupMember>>(
     embedding: &[f32],
     model_version: &str,
     members: &[M],
 ) -> Option<(usize, f32)> {
     members
         .iter()
-        .map(AsRef::as_ref)
+        .map(Borrow::borrow)
         .enumerate()
-        .filter_map(|(index, m)| {
+        .filter_map(|(index, m): (usize, &GroupMember)| {
             let template = m.template(Modality::Face, model_version)?;
             (template.embedding.len() == embedding.len())
-                .then(|| (index, cosine_similarity(embedding, &template.embedding)))
+                .then(|| (index, dot(embedding, &template.embedding)))
         })
         .filter(|(_, similarity)| similarity.is_finite())
         .max_by(|a, b| a.1.total_cmp(&b.1))
@@ -103,7 +98,7 @@ pub fn closest<M: AsRef<GroupMember>>(
 
 /// Index and similarity of the enrolled member matching `embedding`, if the closest comparable
 /// template reaches [`MATCH_THRESHOLD`].
-pub fn best_match<M: AsRef<GroupMember>>(
+pub fn best_match<M: Borrow<GroupMember>>(
     embedding: &[f32],
     model_version: &str,
     members: &[M],
@@ -112,9 +107,17 @@ pub fn best_match<M: AsRef<GroupMember>>(
         .filter(|&(_, similarity)| similarity >= MATCH_THRESHOLD)
 }
 
-/// Dot product, which equals cosine similarity for L2-normalised vectors.
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+/// Dot product of two vectors of the same length. For L2-normalised vectors it is their
+/// cosine similarity.
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// Whether `v` is a finite, L2-normalised vector, as the feature model emits them.
+pub fn is_normalised(v: &[f32]) -> bool {
+    let norm_sq = dot(v, v);
+    norm_sq.is_finite() && (norm_sq - 1.0).abs() <= UNIT_NORM_TOLERANCE
 }
 
 #[cfg(test)]
@@ -150,7 +153,17 @@ mod tests {
     #[test]
     fn identical_unit_vectors_have_similarity_one() {
         let v = normalized(&[0.3, -0.4, 0.5, 0.1]);
-        assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-6);
+        assert!((dot(&v, &v) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalised_means_finite_and_of_unit_length() {
+        assert!(is_normalised(&normalized(&[0.3, -0.4, 0.5])));
+        assert!(is_normalised(&[1.02, 0.0]));
+        assert!(!is_normalised(&[2.0, 0.0]));
+        assert!(!is_normalised(&[0.0, 0.0]));
+        assert!(!is_normalised(&[f32::NAN, 0.0]));
+        assert!(!is_normalised(&[f32::INFINITY, 0.0]));
     }
 
     #[test]
@@ -266,25 +279,5 @@ mod tests {
         assert_eq!(m.templates.len(), 3);
         assert_eq!(m.template(Modality::Voice, MODEL), Some(&voice));
         assert_eq!(m.template(Modality::Voice, "model 2.0"), None);
-    }
-
-    #[test]
-    fn parses_member_json() {
-        let json = r#"[{"id":"80f1b2d2da2e-0001","name":"Ada","role":"ADMIN","templates":[
-            {"modality":"FACE","model_version":"model 1.0","embedding":[0.6,0.8]}]},
-            {"id":"80f1b2d2da2e-0002","name":"Bo","role":"USER"}]"#;
-        let members: Vec<GroupMember> = serde_json::from_str(json).unwrap();
-        assert_eq!(members[0].role, Role::Admin);
-        assert_eq!(members[0].templates, [face(MODEL, &[0.6, 0.8])]);
-        assert!(members[1].templates.is_empty());
-    }
-
-    #[test]
-    fn rejects_unknown_role_and_modality() {
-        let role = r#"[{"id":"x","name":"x","role":"ROOT","templates":[]}]"#;
-        assert!(serde_json::from_str::<Vec<GroupMember>>(role).is_err());
-        let modality = r#"[{"id":"x","name":"x","role":"USER","templates":[
-            {"modality":"IRIS","model_version":"m","embedding":[1.0]}]}]"#;
-        assert!(serde_json::from_str::<Vec<GroupMember>>(modality).is_err());
     }
 }

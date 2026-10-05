@@ -3,8 +3,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use biometric_core::evaluation::Scores;
 use biometric_core::matching::MATCH_THRESHOLD;
+
+use crate::evaluation::Scores;
 
 use crate::results::Row;
 
@@ -152,8 +153,8 @@ mod tests {
             row("c", None),
         ];
         let labels = labels(&rows);
-        let good = Scores::from_pairs(&[[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], &labels);
-        let bad = Scores::from_pairs(&[[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]], &labels);
+        let good = Scores::from_pairs(&[vec![1.0, 0.0], vec![1.0, 0.0], vec![0.0, 1.0]], &labels);
+        let bad = Scores::from_pairs(&[vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 0.0]], &labels);
         let report = render(&rows, &[("good".into(), good), ("bad".into(), bad)]);
         assert!(
             report.contains("Images: 4 sent, 3 with a detected face (1 without)."),

@@ -23,15 +23,15 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::signing::{self, PublicKey, SecretKey, SignatureError, SIGNATURE_LEN};
+use crate::hex;
+use crate::signing::{self, SecretKey, SignatureError, VerifyingKey, SIGNATURE_LEN};
 
 /// Size of the trailing sector that holds the manifest (one flash erase sector).
 pub const MANIFEST_SECTOR_SIZE: usize = 4096;
 
-/// Manifest layout version written by [`build_image`]. Format 2 added `golden_sha256`.
-pub const MANIFEST_FORMAT: u32 = 2;
-/// Oldest layout version still accepted (a format 1 manifest is a format 2 one without a golden).
-pub const MIN_MANIFEST_FORMAT: u32 = 1;
+/// Manifest layout version written by [`build_image`] and the only one accepted. Format 1 had
+/// no `golden_sha256` and predates signing, so no loadable format 1 image exists.
+const MANIFEST_FORMAT: u32 = 2;
 
 /// Value of erased NOR flash.
 const ERASED: u8 = 0xFF;
@@ -41,7 +41,7 @@ const SIGNATURE_MAGIC: [u8; 4] = *b"SIG1";
 /// The signature trailer: magic, then an Ed25519 signature over the manifest JSON.
 const SIGNATURE_TRAILER_LEN: usize = SIGNATURE_MAGIC.len() + SIGNATURE_LEN;
 /// Longest manifest JSON: it stops short of the trailer and leaves one erased byte to end it.
-pub const MANIFEST_MAX_LEN: usize = MANIFEST_SECTOR_SIZE - SIGNATURE_TRAILER_LEN - 1;
+const MANIFEST_MAX_LEN: usize = MANIFEST_SECTOR_SIZE - SIGNATURE_TRAILER_LEN - 1;
 /// Purpose string of a manifest signature (see [`crate::signing`]).
 const SIGNATURE_CONTEXT: &[u8] = b"esp32-biometric-system model manifest";
 
@@ -84,11 +84,10 @@ impl ModelManifest {
         hasher.finalize().into()
     }
 
-    /// The golden digest, if the manifest has one. [`verify`] has already checked its syntax.
+    /// The golden digest, if the manifest has one. [`check_data`] checks its syntax; a
+    /// malformed one reads as none here.
     pub fn golden(&self) -> Option<[u8; 32]> {
-        self.golden_sha256
-            .as_deref()
-            .and_then(|hex| decode_hex_digest(hex).ok())
+        self.golden_sha256.as_deref().and_then(hex::decode_32)
     }
 }
 
@@ -140,8 +139,7 @@ impl fmt::Display for ManifestError {
             Self::UnsupportedFormat(v) => {
                 write!(
                     f,
-                    "unsupported manifest format {v} \
-                     (expected {MIN_MANIFEST_FORMAT}..={MANIFEST_FORMAT})"
+                    "unsupported manifest format {v} (expected {MANIFEST_FORMAT})"
                 )
             }
             Self::WrongModel { expected, found } => {
@@ -167,7 +165,7 @@ impl fmt::Display for ManifestError {
 impl std::error::Error for ManifestError {}
 
 /// Bytes available for model data in a partition of `partition_len` bytes.
-pub fn data_capacity(partition_len: usize) -> Result<usize, ManifestError> {
+fn data_capacity(partition_len: usize) -> Result<usize, ManifestError> {
     partition_len
         .checked_sub(MANIFEST_SECTOR_SIZE)
         .filter(|&capacity| capacity > 0)
@@ -175,14 +173,14 @@ pub fn data_capacity(partition_len: usize) -> Result<usize, ManifestError> {
 }
 
 /// Parses the manifest from the last sector of a partition image.
-pub fn read_manifest(partition: &[u8]) -> Result<ModelManifest, ManifestError> {
+fn read_manifest(partition: &[u8]) -> Result<ModelManifest, ManifestError> {
     parse_manifest(manifest_json(partition)?)
 }
 
 /// The manifest JSON bytes exactly as stored: what a signature covers.
 fn manifest_json(partition: &[u8]) -> Result<&[u8], ManifestError> {
     let capacity = data_capacity(partition.len())?;
-    let sector = &partition[capacity..capacity + MANIFEST_MAX_LEN + 1];
+    let sector = &partition[capacity..capacity + MANIFEST_MAX_LEN];
     // The JSON ends at the first erased byte (or NUL); everything after it is padding.
     let end = sector
         .iter()
@@ -197,7 +195,7 @@ fn manifest_json(partition: &[u8]) -> Result<&[u8], ManifestError> {
 fn parse_manifest(json: &[u8]) -> Result<ModelManifest, ManifestError> {
     let manifest: ModelManifest =
         serde_json::from_slice(json).map_err(|e| ManifestError::Malformed(e.to_string()))?;
-    if !(MIN_MANIFEST_FORMAT..=MANIFEST_FORMAT).contains(&manifest.format) {
+    if manifest.format != MANIFEST_FORMAT {
         return Err(ManifestError::UnsupportedFormat(manifest.format));
     }
     Ok(manifest)
@@ -209,7 +207,7 @@ fn trailer_range(partition_len: usize) -> core::ops::Range<usize> {
 }
 
 /// The image's signature; `None` if it has none (the trailer is erased).
-pub fn signature(partition: &[u8]) -> Result<Option<[u8; SIGNATURE_LEN]>, ManifestError> {
+fn signature(partition: &[u8]) -> Result<Option<[u8; SIGNATURE_LEN]>, ManifestError> {
     data_capacity(partition.len())?;
     let trailer = &partition[trailer_range(partition.len())];
     if trailer.iter().all(|&b| b == ERASED) {
@@ -234,11 +232,11 @@ pub fn sign_image(image: &mut [u8], secret: &SecretKey) -> Result<(), ManifestEr
 
 /// Checks that the manifest was signed by one of the `trusted` keys and returns it. The
 /// signature is checked over the stored bytes before they are parsed, so an unauthenticated
-/// manifest never reaches the JSON parser. The model data is not checked: use
-/// [`verify_signed`] before loading a model.
+/// manifest never reaches the JSON parser. The model data is not checked: follow up with
+/// [`check_data`], or use [`verify_signed`], before loading a model.
 pub fn authenticate(
     partition: &[u8],
-    trusted: &[PublicKey],
+    trusted: &[VerifyingKey],
 ) -> Result<ModelManifest, ManifestError> {
     let json = manifest_json(partition)?;
     let signature = signature(partition)?.ok_or(ManifestError::Unsigned)?;
@@ -252,22 +250,36 @@ pub fn authenticate(
 pub fn verify_signed(
     partition: &[u8],
     expected_model: &str,
-    trusted: &[PublicKey],
+    trusted: &[VerifyingKey],
 ) -> Result<ModelManifest, ManifestError> {
-    authenticate(partition, trusted)?;
-    verify(partition, expected_model)
+    let manifest = authenticate(partition, trusted)?;
+    check_model(&manifest, expected_model)?;
+    check_data(partition, &manifest)?;
+    Ok(manifest)
 }
 
 /// Checks that `partition` holds `expected_model` with intact data; returns its manifest.
 /// This shows integrity only, not who made the image: the firmware uses [`verify_signed`].
 pub fn verify(partition: &[u8], expected_model: &str) -> Result<ModelManifest, ManifestError> {
     let manifest = read_manifest(partition)?;
+    check_model(&manifest, expected_model)?;
+    check_data(partition, &manifest)?;
+    Ok(manifest)
+}
+
+fn check_model(manifest: &ModelManifest, expected_model: &str) -> Result<(), ManifestError> {
     if manifest.model != expected_model {
         return Err(ManifestError::WrongModel {
             expected: expected_model.to_owned(),
-            found: manifest.model,
+            found: manifest.model.clone(),
         });
     }
+    Ok(())
+}
+
+/// Checks that the model data in `partition` is what `manifest`, read from the same
+/// partition, describes: its size fits, its digests are well formed and its SHA-256 matches.
+pub fn check_data(partition: &[u8], manifest: &ModelManifest) -> Result<(), ManifestError> {
     let capacity = data_capacity(partition.len())?;
     let size = manifest.size as usize;
     if size == 0 || size > capacity {
@@ -276,14 +288,14 @@ pub fn verify(partition: &[u8], expected_model: &str) -> Result<ModelManifest, M
             capacity,
         });
     }
-    let expected_digest = decode_hex_digest(&manifest.sha256)?;
+    let expected_digest = hex::decode_32(&manifest.sha256).ok_or(ManifestError::InvalidDigest)?;
     if let Some(golden) = &manifest.golden_sha256 {
-        decode_hex_digest(golden)?;
+        hex::decode_32(golden).ok_or(ManifestError::InvalidDigest)?;
     }
     if Sha256::digest(&partition[..size]).as_slice() != expected_digest {
         return Err(ManifestError::HashMismatch);
     }
-    Ok(manifest)
+    Ok(())
 }
 
 /// Builds a complete, unsigned partition image (model + padding + manifest) for
@@ -310,8 +322,8 @@ pub fn build_image(
             size: model_data.len() as u64,
             capacity,
         })?,
-        sha256: encode_hex(&Sha256::digest(model_data)),
-        golden_sha256: golden.map(|digest| encode_hex(digest)),
+        sha256: hex::encode(&Sha256::digest(model_data)),
+        golden_sha256: golden.map(|digest| hex::encode(digest)),
     };
     let json =
         serde_json::to_vec(&manifest).map_err(|e| ManifestError::Malformed(e.to_string()))?;
@@ -323,36 +335,6 @@ pub fn build_image(
     image[..model_data.len()].copy_from_slice(model_data);
     image[capacity..capacity + json.len()].copy_from_slice(&json);
     Ok(image)
-}
-
-/// Lower-case hex of `bytes`.
-pub fn encode_hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(DIGITS[usize::from(b >> 4)] as char);
-        s.push(DIGITS[usize::from(b & 0x0f)] as char);
-    }
-    s
-}
-
-/// Parses a 64-character hex SHA-256.
-pub fn decode_hex_digest(hex: &str) -> Result<[u8; 32], ManifestError> {
-    let bytes = hex.as_bytes();
-    if bytes.len() != 64 {
-        return Err(ManifestError::InvalidDigest);
-    }
-    let nibble = |c: u8| match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => Err(ManifestError::InvalidDigest),
-    };
-    let mut out = [0u8; 32];
-    for (i, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
-        out[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -384,18 +366,21 @@ mod tests {
     }
 
     #[test]
-    fn format_1_manifest_without_golden_is_still_accepted() {
+    fn format_1_manifest_is_no_longer_accepted() {
         let data = model_data();
         let mut img = vec![0xFF; PARTITION];
         img[..data.len()].copy_from_slice(&data);
         let json = format!(
             r#"{{"format":1,"model":"{MODEL}","version":"v","size":{},"sha256":"{}"}}"#,
             data.len(),
-            encode_hex(&Sha256::digest(&data))
+            hex::encode(&Sha256::digest(&data))
         );
         let at = PARTITION - MANIFEST_SECTOR_SIZE;
         img[at..at + json.len()].copy_from_slice(json.as_bytes());
-        assert_eq!(verify(&img, MODEL).unwrap().golden(), None);
+        assert_eq!(
+            verify(&img, MODEL),
+            Err(ManifestError::UnsupportedFormat(1))
+        );
     }
 
     #[test]
@@ -458,7 +443,7 @@ mod tests {
     fn known_sha256_vector() {
         // SHA-256("abc"), FIPS 180-2 test vector.
         assert_eq!(
-            encode_hex(&Sha256::digest(b"abc")),
+            hex::encode(&Sha256::digest(b"abc")),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
@@ -512,19 +497,19 @@ mod tests {
             Err(ManifestError::UnsupportedFormat(3))
         );
         let img = with_manifest(&format!(
-            r#"{{"format":0,"model":"{MODEL}","version":"v","size":1,"sha256":"{}"}}"#,
+            r#"{{"format":1,"model":"{MODEL}","version":"v","size":1,"sha256":"{}"}}"#,
             "0".repeat(64)
         ));
         assert_eq!(
             read_manifest(&img),
-            Err(ManifestError::UnsupportedFormat(0))
+            Err(ManifestError::UnsupportedFormat(1))
         );
     }
 
     #[test]
     fn size_overlapping_the_manifest_sector_is_rejected() {
         let img = with_manifest(&format!(
-            r#"{{"format":1,"model":"{MODEL}","version":"v","size":{},"sha256":"{}"}}"#,
+            r#"{{"format":2,"model":"{MODEL}","version":"v","size":{},"sha256":"{}"}}"#,
             PARTITION - MANIFEST_SECTOR_SIZE + 1,
             "0".repeat(64)
         ));
@@ -537,7 +522,7 @@ mod tests {
     #[test]
     fn zero_size_and_bad_digest_are_rejected() {
         let zero = with_manifest(&format!(
-            r#"{{"format":1,"model":"{MODEL}","version":"v","size":0,"sha256":"{}"}}"#,
+            r#"{{"format":2,"model":"{MODEL}","version":"v","size":0,"sha256":"{}"}}"#,
             "0".repeat(64)
         ));
         assert!(matches!(
@@ -545,7 +530,7 @@ mod tests {
             Err(ManifestError::SizeOutOfRange { .. })
         ));
         let bad = with_manifest(&format!(
-            r#"{{"format":1,"model":"{MODEL}","version":"v","size":1,"sha256":"{}"}}"#,
+            r#"{{"format":2,"model":"{MODEL}","version":"v","size":1,"sha256":"{}"}}"#,
             "zz".repeat(32)
         ));
         assert_eq!(verify(&bad, MODEL), Err(ManifestError::InvalidDigest));
@@ -554,7 +539,7 @@ mod tests {
     #[test]
     fn unknown_manifest_fields_are_rejected() {
         let img = with_manifest(&format!(
-            r#"{{"format":1,"model":"{MODEL}","version":"v","size":1,"sha256":"{}","extra":1}}"#,
+            r#"{{"format":2,"model":"{MODEL}","version":"v","size":1,"sha256":"{}","extra":1}}"#,
             "0".repeat(64)
         ));
         assert!(matches!(
@@ -591,7 +576,7 @@ mod tests {
 
     const SECRET: SecretKey = [0x11; 32];
 
-    fn trusted() -> [PublicKey; 1] {
+    fn trusted() -> [VerifyingKey; 1] {
         [signing::public_key(&SECRET)]
     }
 

@@ -16,12 +16,13 @@ use std::thread;
 
 use anyhow::{anyhow, ensure, Context, Result};
 use biometric_core::contract::{
-    DETECTOR_HEIGHT, DETECTOR_WIDTH, FEATURE_MODEL, MNP_MODEL, MSR_MODEL,
+    DETECTOR_FORMAT, DETECTOR_HEIGHT, DETECTOR_WIDTH, FEATURE_MODEL, MNP_MODEL, MSR_MODEL,
 };
 use biometric_core::eval_protocol::{
-    self, crc32, Request, BYTES_PER_PIXEL, MODEL_PREFIX, READY_PREFIX, REQUEST_HEADER_LEN,
-    REQUEST_MAGIC, TRANSFER_BAUD,
+    self, crc32, Request, MODEL_PREFIX, READY_PREFIX, REQUEST_HEADER_LEN, REQUEST_MAGIC,
+    TRANSFER_BAUD,
 };
+use biometric_core::geometry::image_len;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::warn;
 
@@ -121,8 +122,7 @@ fn serve() -> Result<()> {
         ffi::uart_set_baudrate(UART, TRANSFER_BAUD);
     }
 
-    let frame_len = DETECTOR_WIDTH as usize * DETECTOR_HEIGHT as usize * BYTES_PER_PIXEL;
-    let mut pixels = vec![0u8; frame_len];
+    let mut pixels = vec![0u8; image_len(DETECTOR_WIDTH, DETECTOR_HEIGHT, DETECTOR_FORMAT)];
     let mut line = String::new();
     loop {
         line.clear();

@@ -21,51 +21,40 @@ pub struct AudioFrame {
     pub len: usize,
 }
 
-pub struct AudioWorker {
-    port: i32,
-}
+/// Reads one frame from the microphone; returns the number of samples read. Blocks until
+/// `buffer` is full.
+fn capture_frame(i2s_port: i32, buffer: &mut [i16]) -> Result<usize, i32> {
+    let mut bytes_read: u32 = 0;
+    // Safety: `buffer` is valid for `buffer.len()` samples and `bytes_read` is a valid
+    // out-pointer, both for the duration of the call.
+    let ret = unsafe {
+        ffi::read_i2s_mic_c(
+            i2s_port,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            &mut bytes_read,
+            1000,
+        )
+    };
 
-impl AudioWorker {
-    pub fn new(port: i32) -> Self {
-        Self { port }
-    }
-
-    pub fn capture_frame(&self, buffer: &mut [i16]) -> Result<usize, i32> {
-        let mut bytes_read: u32 = 0;
-        let ret = unsafe {
-            ffi::read_i2s_mic_c(
-                self.port,
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
-                &mut bytes_read,
-                1000,
-            )
-        };
-
-        if ret == 0 {
-            Ok((bytes_read as usize) / std::mem::size_of::<i16>())
-        } else {
-            Err(ret)
-        }
+    if ret == 0 {
+        Ok((bytes_read as usize) / std::mem::size_of::<i16>())
+    } else {
+        Err(ret)
     }
 }
 
-pub fn spawn_audio_capture_thread(
-    i2s_port: i32,
-    audio_tx: SyncSender<AudioFrame>,
-) -> Result<std::thread::JoinHandle<()>> {
+pub fn spawn_audio_capture_thread(i2s_port: i32, audio_tx: SyncSender<AudioFrame>) -> Result<()> {
     // The codec read path, a frame on the stack and logging need more than the 4 KB default.
     let thread = thread::Builder::new().stack_size(CAPTURE_STACK_SIZE);
-    let handle = thread.spawn(move || {
-        let worker = AudioWorker::new(i2s_port);
-
+    thread.spawn(move || {
         info!("[Audio] microphone capture thread running");
         let mut pcm_buffer = [0i16; AUDIO_FRAME_SAMPLES];
         let mut level = AudioLevel::default();
 
         loop {
             // Blocking read from DMA in C—thread yields until buffer is filled
-            match worker.capture_frame(&mut pcm_buffer) {
+            match capture_frame(i2s_port, &mut pcm_buffer) {
                 Ok(samples_read) => {
                     level.record(&pcm_buffer[..samples_read]);
                     if level.samples() >= LEVEL_LOG_SAMPLES {
@@ -98,5 +87,5 @@ pub fn spawn_audio_capture_thread(
             }
         }
     })?;
-    Ok(handle)
+    Ok(())
 }

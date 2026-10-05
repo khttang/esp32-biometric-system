@@ -6,9 +6,10 @@
 //! - the false accept rate (FAR) is the share of impostor pairs that score at or above it, and
 //! - the false reject rate (FRR) is the share of genuine pairs that score below it,
 //!
-//! matching [`crate::matching::best_match`], which accepts a score equal to the threshold.
+//! matching `biometric_core::matching::best_match`, which accepts a score equal to the
+//! threshold.
 
-use crate::matching::cosine_similarity;
+use biometric_core::matching::dot;
 
 /// Genuine and impostor similarity scores, each sorted ascending.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -19,7 +20,7 @@ pub struct Scores {
 
 impl Scores {
     /// Non-finite scores are dropped: they cannot be compared with a threshold.
-    pub fn new(mut genuine: Vec<f32>, mut impostor: Vec<f32>) -> Self {
+    fn new(mut genuine: Vec<f32>, mut impostor: Vec<f32>) -> Self {
         for scores in [&mut genuine, &mut impostor] {
             scores.retain(|s| s.is_finite());
             scores.sort_unstable_by(f32::total_cmp);
@@ -31,12 +32,12 @@ impl Scores {
     ///
     /// Embeddings must be L2-normalised and of one length. `labels` and `embeddings` are
     /// parallel; extra entries of the longer one are ignored.
-    pub fn from_pairs<E: AsRef<[f32]>>(embeddings: &[E], labels: &[u32]) -> Self {
+    pub fn from_pairs(embeddings: &[Vec<f32>], labels: &[u32]) -> Self {
         let n = embeddings.len().min(labels.len());
         let (mut genuine, mut impostor) = (Vec::new(), Vec::new());
         for i in 0..n {
             for j in i + 1..n {
-                let score = cosine_similarity(embeddings[i].as_ref(), embeddings[j].as_ref());
+                let score = dot(&embeddings[i], &embeddings[j]);
                 if labels[i] == labels[j] {
                     genuine.push(score);
                 } else {
@@ -210,7 +211,12 @@ mod tests {
 
     #[test]
     fn pairs_are_split_by_label() {
-        let embeddings = [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.6, 0.8]];
+        let embeddings = [
+            vec![1.0, 0.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![0.6, 0.8],
+        ];
         let s = Scores::from_pairs(&embeddings, &[7, 7, 8, 8]);
         // Genuine: (0,1) = 1.0 and (2,3) = 0.8. Impostor: the other four pairs.
         assert_eq!(s.genuine(), &[0.8, 1.0]);

@@ -9,13 +9,14 @@
 
 use core::fmt;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey};
+
+/// An Ed25519 public key that has been checked to be a valid one.
+pub use ed25519_dalek::VerifyingKey;
 
 pub const KEY_LEN: usize = 32;
 pub const SIGNATURE_LEN: usize = 64;
 
-/// An Ed25519 public key.
-pub type PublicKey = [u8; KEY_LEN];
 /// An Ed25519 secret key (the 32-byte seed).
 pub type SecretKey = [u8; KEY_LEN];
 
@@ -39,13 +40,15 @@ impl fmt::Display for SignatureError {
 impl std::error::Error for SignatureError {}
 
 /// The public key that belongs to `secret`.
-pub fn public_key(secret: &SecretKey) -> PublicKey {
-    SigningKey::from_bytes(secret).verifying_key().to_bytes()
+pub fn public_key(secret: &SecretKey) -> VerifyingKey {
+    SigningKey::from_bytes(secret).verifying_key()
 }
 
 /// What is actually signed: the context, a NUL, then the message. The context names the kind
 /// of thing being signed, so a signature made for one purpose is not valid for another.
 fn framed(context: &[u8], message: &[u8]) -> Vec<u8> {
+    // A NUL in the context would let context and message be shifted into each other.
+    debug_assert!(!context.contains(&0));
     let mut framed = Vec::with_capacity(context.len() + 1 + message.len());
     framed.extend_from_slice(context);
     framed.push(0);
@@ -60,27 +63,26 @@ pub fn sign(secret: &SecretKey, context: &[u8], message: &[u8]) -> [u8; SIGNATUR
         .to_bytes()
 }
 
-/// Checks `signature` over `message` for `context`; returns the index of the trusted key that
-/// made it.
+/// Checks that one of the `trusted` keys made `signature` over `message` for `context`.
 pub fn verify(
-    trusted: &[PublicKey],
+    trusted: &[VerifyingKey],
     context: &[u8],
     message: &[u8],
     signature: &[u8; SIGNATURE_LEN],
-) -> Result<usize, SignatureError> {
+) -> Result<(), SignatureError> {
     if trusted.is_empty() {
         return Err(SignatureError::NoTrustedKeys);
     }
     let framed = framed(context, message);
     let signature = Signature::from_bytes(signature);
-    trusted
+    if trusted
         .iter()
-        // A trusted entry that is not a valid key matches nothing.
-        .position(|key| {
-            VerifyingKey::from_bytes(key)
-                .is_ok_and(|key| key.verify_strict(&framed, &signature).is_ok())
-        })
-        .ok_or(SignatureError::Invalid)
+        .any(|key| key.verify_strict(&framed, &signature).is_ok())
+    {
+        Ok(())
+    } else {
+        Err(SignatureError::Invalid)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,21 +115,19 @@ fn parse_lines(text: &str) -> Result<Vec<(usize, [u8; KEY_LEN])>, KeyFileError> 
         .map(|(index, line)| (index + 1, line.split('#').next().unwrap_or("").trim()))
         .filter(|(_, key)| !key.is_empty())
         .map(|(line, key)| {
-            crate::manifest::decode_hex_digest(key)
+            crate::hex::decode_32(key)
                 .map(|key| (line, key))
-                .map_err(|_| KeyFileError::BadKey { line })
+                .ok_or(KeyFileError::BadKey { line })
         })
         .collect()
 }
 
 /// Parses a file of trusted public keys (see `firmware/trusted-model-keys.txt`).
-pub fn parse_public_keys(text: &str) -> Result<Vec<PublicKey>, KeyFileError> {
+pub fn parse_public_keys(text: &str) -> Result<Vec<VerifyingKey>, KeyFileError> {
     parse_lines(text)?
         .into_iter()
         .map(|(line, key)| {
-            VerifyingKey::from_bytes(&key)
-                .map(|_| key)
-                .map_err(|_| KeyFileError::NotAPublicKey { line })
+            VerifyingKey::from_bytes(&key).map_err(|_| KeyFileError::NotAPublicKey { line })
         })
         .collect()
 }
@@ -143,7 +143,7 @@ pub fn parse_secret_key(text: &str) -> Result<SecretKey, KeyFileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::encode_hex;
+    use crate::hex::{decode_32, encode as encode_hex};
 
     const SECRET: SecretKey = [7; KEY_LEN];
     const OTHER_SECRET: SecretKey = [8; KEY_LEN];
@@ -165,12 +165,10 @@ mod tests {
     fn matches_the_rfc_8032_test_vector() {
         // RFC 8032, section 7.1, test 1 (empty message). `sign` frames the message, so this
         // checks the key derivation here and the raw primitive through dalek directly.
-        let secret = crate::manifest::decode_hex_digest(
-            "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
-        )
-        .unwrap();
+        let secret =
+            decode_32("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60").unwrap();
         assert_eq!(
-            encode_hex(&public_key(&secret)),
+            encode_hex(public_key(&secret).as_bytes()),
             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
         );
         let signature = SigningKey::from_bytes(&secret).sign(b"").to_bytes();
@@ -185,7 +183,7 @@ mod tests {
     fn a_signature_verifies_with_its_public_key() {
         let signature = sign(&SECRET, CONTEXT, b"message");
         let trusted = [public_key(&OTHER_SECRET), public_key(&SECRET)];
-        assert_eq!(verify(&trusted, CONTEXT, b"message", &signature), Ok(1));
+        assert_eq!(verify(&trusted, CONTEXT, b"message", &signature), Ok(()));
     }
 
     #[test]
@@ -240,31 +238,12 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_trusted_entry_matches_nothing() {
-        let invalid = not_a_public_key();
-        let signature = sign(&SECRET, CONTEXT, b"message");
-        assert_eq!(
-            verify(&[invalid], CONTEXT, b"message", &signature),
-            Err(SignatureError::Invalid)
-        );
-        assert_eq!(
-            verify(
-                &[invalid, public_key(&SECRET)],
-                CONTEXT,
-                b"message",
-                &signature
-            ),
-            Ok(1)
-        );
-    }
-
-    #[test]
     fn key_files_allow_comments_and_blank_lines() {
         let (a, b) = (public_key(&SECRET), public_key(&OTHER_SECRET));
         let text = format!(
             "# trusted keys\n\n{}  # first\n  {}\n",
-            encode_hex(&a),
-            encode_hex(&b)
+            encode_hex(a.as_bytes()),
+            encode_hex(b.as_bytes())
         );
         assert_eq!(parse_public_keys(&text), Ok(vec![a, b]));
         assert_eq!(parse_public_keys("# nothing\n"), Ok(vec![]));

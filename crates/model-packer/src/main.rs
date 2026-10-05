@@ -28,7 +28,8 @@ mod partitions;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use biometric_core::manifest::{self, encode_hex};
+use biometric_core::hex;
+use biometric_core::manifest;
 use biometric_core::signing::{self, SecretKey};
 
 const USAGE: &str = "\
@@ -78,7 +79,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         partitions: need(table, "--partitions")?.into(),
         out: need(out, "--out")?.into(),
         golden: golden
-            .map(|hex| manifest::decode_hex_digest(&hex).map_err(|e| format!("--golden: {e}")))
+            .map(|digest| {
+                hex::decode_32(&digest).ok_or("--golden: a digest is 64 hex characters".to_owned())
+            })
             .transpose()?,
         key: key.map(PathBuf::from),
     })
@@ -105,18 +108,18 @@ fn keygen(out: &Path) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", out.display()))?;
     let text = format!(
         "# Model signing key (SECRET). Keep it off the device and out of the repository.\n{}\n",
-        encode_hex(&secret)
+        hex::encode(&secret)
     );
     std::io::Write::write_all(&mut file, text.as_bytes())
         .map_err(|e| format!("{}: {e}", out.display()))?;
-    println!("{}", encode_hex(&signing::public_key(&secret)));
+    println!("{}", hex::encode(signing::public_key(&secret).as_bytes()));
     Ok(())
 }
 
 fn pubkey(key: &Path) -> Result<(), String> {
     println!(
         "{}",
-        encode_hex(&signing::public_key(&read_secret_key(key)?))
+        hex::encode(signing::public_key(&read_secret_key(key)?).as_bytes())
     );
     Ok(())
 }
@@ -160,7 +163,10 @@ fn run(args: Args) -> Result<(), String> {
             manifest::sign_image(&mut image, &secret).map_err(|e| e.to_string())?;
             let written = manifest::verify_signed(&image, &args.model, &[public])
                 .map_err(|e| e.to_string())?;
-            (written, format!("signed by {}", encode_hex(&public)))
+            (
+                written,
+                format!("signed by {}", hex::encode(public.as_bytes())),
+            )
         }
         None => {
             let written = manifest::verify(&image, &args.model).map_err(|e| e.to_string())?;

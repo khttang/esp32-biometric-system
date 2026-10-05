@@ -8,11 +8,10 @@
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{bail, Result};
+use biometric_core::geometry::{ImageRef, PixelFormat};
 use log::error;
 
 use crate::ffi;
-use crate::ppa::{ImageRef, PixelFormat};
 
 static TAKEN: AtomicBool = AtomicBool::new(false);
 
@@ -26,18 +25,24 @@ impl Camera {
         (!TAKEN.swap(true, Ordering::AcqRel)).then_some(Self { _private: () })
     }
 
-    /// Blocks until the ISP delivers the next RGB565 frame.
-    pub fn next_frame(&mut self) -> Result<Frame<'_>> {
+    /// Blocks until the ISP delivers the next RGB565 frame. The error is the C return code.
+    pub fn next_frame(&mut self) -> Result<Frame<'_>, i32> {
         let mut raw = ffi::p4_camera_frame_t::default();
         // Safety: `raw` is a valid out-pointer; C fills it from VIDIOC_DQBUF.
         let ret = unsafe { ffi::p4_camera_capture_frame(&mut raw) };
-        if ret != 0 || raw.data.is_null() {
-            bail!("p4_camera_capture_frame failed: {ret}");
+        if ret != 0 {
+            return Err(ret);
         }
-        Ok(Frame {
+        // A buffer is dequeued from here on: dropping `frame` hands it back, also on the
+        // error path below.
+        let frame = Frame {
             raw,
             _camera: PhantomData,
-        })
+        };
+        if frame.raw.data.is_null() {
+            return Err(-1);
+        }
+        Ok(frame)
     }
 }
 

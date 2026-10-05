@@ -32,7 +32,7 @@ Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP
 | Model updates | Each model has two flash slots (A/B) with a signed, verified manifest; the firmware loads only images signed by a trusted key. A new image written to the standby slot is activated only after a golden run passes, and the previous image is kept for rollback; no firmware reflash ([Model Partitions](#model-partitions)) |
 | Enrollment | On-device: the admin view on the touch panel enrolls the face in view and deletes members; templates persist in flash ([Enrollment & Templates](#enrollment--templates)) |
 | Matching | Cosine similarity against enrolled templates of the same model release. Enroll → reboot → recognise → delete works on the board. The threshold (0.5) is Espressif's default; on a public dataset it accepted no impostor pair and rejected 21% of genuine single-image pairs; not yet measured with this camera on non-enrolled people ([Measuring Accuracy on the Board](#measuring-accuracy-on-the-board)) |
-| Template download | Not yet (M4c): the HTTP fetch code is not triggered by the state machine |
+| Template download | Not implemented. The unused HTTP fetch code was removed; templates exist only on the device |
 | Voice recognition | Not implemented |
 
 Known issues:
@@ -88,7 +88,7 @@ admin button is configured in Rust (`system.rs`).
 | LVGL (`taskLVGL`) | 0 | 4 | 7 KB | `esp_lvgl_port` | Render, sw-rotate 270°, flush to DPI framebuffer; 5 ms timer |
 | `gt911_poller` | 1 | 5 | 3 KB | C++ | Poll GT911 every 15 ms |
 | `cam_pipeline` | 1 | 6 | 8 KB | Rust `pipeline.rs` | Dequeue frame → PPA preview → (on request) detector image from preview → swap canvas; logs fps/PPA stats every 10 s |
-| `inference` | 1 | 3 | 32 KB | Rust `pipeline.rs` | Detect → overlay → embed → match, ≤ 10 Hz (~23 KB of stack never used) |
+| `inference` | 1 | 3 (highest during a golden run) | 32 KB | Rust `pipeline.rs` | Detect → overlay → embed → match, ≤ 10 Hz (~23 KB of stack never used). At start-up, a golden run of a new model image runs at the highest priority, so `cam_pipeline` and the preview pause for its duration |
 | audio capture | any | 5 | 8 KB | Rust `audio_worker.rs` | Read the microphone into a bounded queue; log its level every 10 s |
 | inactivity watchdog | any | 5 | 4 KB | Rust `power.rs` | Deep sleep after 180 s without input |
 | IDF system tasks | n/a | n/a | n/a | ESP-IDF | Event loop, lwIP, EMAC RX, ISP/CSI drivers |
@@ -177,7 +177,8 @@ offset 0                                    size - 4096                    size
 - **Manifest:** in the partition's last 4 KiB sector:
   `{"format":2,"model":"human_face_feat_mfn_s8_v1","version":"human_face_recognition 0.3.2","size":1295200,"sha256":"…","golden_sha256":"…"}`.
   The `version` is recorded with enrolled templates, so templates are only compared with
-  embeddings from the same model. Format 1 manifests (no `golden_sha256`) are still accepted.
+  embeddings from the same model. Only format 2 is accepted; format 1 (no `golden_sha256`)
+  predates signing, so no loadable format 1 image exists.
 - **Signature:** the sector's last 68 bytes hold `SIG1` and an Ed25519 signature over the
   manifest JSON. The manifest contains the data's hash, so the signature covers the whole image
   ([Signed Models and the Trust Model](#signed-models-and-the-trust-model)).
@@ -243,6 +244,10 @@ Every model has two slots (`face_msr_a`/`_b`, `face_mnp_a`/`_b`, `face_feat_a`/`
 active; an update is written to the other, the standby slot. Nothing else has to be told: at boot
 the firmware sees an image in the standby slot that it has not evaluated and gives it a trial.
 
+Only the standby slot is watched. An image written over the *active* slot is loaded without a
+trial, and so is the first image on a device with no saved state, because the state does not
+record which image the active slot held. Updates must therefore go to the standby slot.
+
 1. **Golden run.** The candidate is loaded, run once on a fixed pseudo-random input, and the
    SHA-256 of its output tensors is compared with the manifest's `golden_sha256`. The SHA-256 of
    the file proves the bytes are intact; the golden run shows that *this firmware's* ESP-DL build
@@ -259,7 +264,7 @@ the firmware sees an image in the standby slot that it has not evaluated and giv
    image it is rejected. Two attempts are allowed so that a power cut does not condemn a good
    model.
 
-The state per model (active slot, the verdict on the standby image, the trial marker) is a 69-byte
+The state per model (active slot, the verdict on the standby image, the trial marker) is a 68-byte
 record in the `models` NVS namespace. The decision logic is `biometric_core::activation`, a pure
 state machine with host tests; `firmware/src/models.rs` feeds it and runs the trial. An image is
 identified by a hash over its manifest fields, so the same model repackaged with another version
@@ -387,7 +392,7 @@ cannot be used to overwrite someone who is already recognisable.
   little-endian `f32`. That is about 2.1 KB for a 512-d embedding.
 
 Decoding is strict: wrong magic or version, lengths that disagree with the header, invalid UTF-8
-and non-finite values are all rejected. A template names its member, so a record makes sense on
+and embeddings that are not finite unit vectors are all rejected. A template names its member, so a record makes sense on
 its own.
 
 **Storage** (`firmware/src/templates.rs`). Records are NVS blobs in the `templates` partition, a
@@ -399,12 +404,9 @@ entry and power-fail-safe single writes. Across the several writes of an enrollm
 the member record is the commit point: templates are written before it and erased after it, and
 template blobs without a member are removed at the next start.
 
-**Migration from format v1.** Format v1 kept one face embedding inside the member record
-(`tplNN`, ids `local-<n>`). At start-up each v1 record is converted to a member record plus a
-face template under the id `<device>-<n>`, and erased only after both are written, so an
-interrupted conversion is repeated. On the development board three enrolled members were
-converted; a flash dump before and after showed their embedding bytes unchanged, and a second
-boot loaded them without converting again.
+**Format v1 is no longer read.** Format v1 kept one face embedding inside the member record
+(`tplNN`, ids `local-<n>`). The start-up conversion to the current format was removed; a `tplNN`
+record still in flash is ignored, and that member has to be enrolled again.
 
 **Threshold.** `MATCH_THRESHOLD` is 0.5, the default of Espressif's `HumanFaceRecognizer` for this
 model. [Measuring Accuracy on the Board](#measuring-accuracy-on-the-board) reports what that
@@ -574,8 +576,8 @@ output windows itself.
       inference thread verifies each model partition and loads the detector and embedder
       independently (`p4_face_init_detector` / `p4_face_init_embedder`).
 3. State machine loop (`biometrics.rs`):
-   `Initialize → DetectionValidation ⇄ ActionExecuted`, plus `RetrieveRuntimeData` /
-   `UpdatingRuntimeData` for template sync.
+   `Initialize → DetectionValidation ⇄ ActionExecuted`, and `Admin ⇄ Enrolling` from the
+   admin view.
 
 C++ init failures are returned to Rust. In release builds `power::handle_fatal_init_error` retries
 up to 3 times (crash counter in RTC RAM), then deep-sleeps for an hour; debug builds panic.
@@ -603,15 +605,14 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │   │       ├── manifest.rs           # Model partition image format: build, sign, verify
 │   │       ├── signing.rs            # Ed25519 signatures and key files
 │   │       ├── activation.rs         # A/B slot activation and rollback state machine
-│   │       ├── matching.rs           # GroupMember, model-version-aware matching, cosine similarity
-│   │       ├── template.rs           # Template format v2: member and template records, v1 migration
-│   │       ├── template_v1.rs        # Template format v1 (read only, for migration)
+│   │       ├── matching.rs           # GroupMember, model-version-aware matching, dot product
+│   │       ├── template.rs           # Member and template records as stored in flash
+│   │       ├── hex.rs                # Hex text for digests, keys and device ids
 │   │       ├── enrollment.rs         # Sample accumulator, member ids / names / slots, re-enrollment
 │   │       ├── stats.rs              # Allocation-free latency and score statistics
-│   │       ├── evaluation.rs         # False accept / false reject rates from similarity scores
 │   │       └── eval_protocol.rs      # Wire format of the on-board evaluation harness
 │   ├── model-packer/                 # Host tool: .espdl + manifest -> signed partition image; keygen
-│   └── face-eval/                    # Host tool: sends dataset images to the eval firmware, reports FAR/FRR
+│   └── face-eval/                    # Host tool: sends dataset images to the eval firmware, computes FAR/FRR
 ├── firmware/                         # ESP32-P4 application (Rust + ESP-IDF)
 │   ├── .cargo/config.toml            # Target, build-std, espflash runner, ESP-IDF version
 │   ├── rust-toolchain.toml           # Pinned nightly + rust-src
@@ -632,9 +633,9 @@ admin button is on GPIO 0 and the GT911 INT is not wired in this firmware.
 │   │   └── CMakeLists.txt
 │   └── src/
 │       ├── main.rs                   # Entry point, main loop
-│       ├── system.rs                 # SystemResources builder, enroll / delete, template fetch
+│       ├── system.rs                 # SystemResources: board bring-up, enroll / delete
 │       ├── biometrics.rs             # State machine (recognition, admin view, enrollment)
-│       ├── templates.rs              # Members and templates as NVS blobs; v1 migration
+│       ├── templates.rs              # Members and templates as NVS blobs
 │       ├── ui.rs                     # Control panel: status line, admin view events
 │       ├── pipeline.rs               # Camera + inference threads (Core 1)
 │       ├── camera.rs                 # V4L2 frame lifetime (RAII)

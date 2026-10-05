@@ -34,6 +34,8 @@ Commands are in the README's "Build, Flash & Test" section. Three things to reme
   Allocate at startup and reuse. Allocation on rare paths (enrollment, boot, migration) is fine.
 - **`unsafe`:** every `unsafe` block has a `// Safety:` comment stating why it is sound. Keep the
   block as small as the FFI call or pointer operation it covers.
+- **Lints:** do not add code (a trait impl, a helper) or an `#[allow(...)]` only to satisfy a
+  lint. Report the lint with `file:line` and the options, and ask.
 - **Core affinity:** Core 1 is reserved for the vision pipeline. Do not add work to Core 1 or
   change task priorities without saying so and updating the README thread model table.
 

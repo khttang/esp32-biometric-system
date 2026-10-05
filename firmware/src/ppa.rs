@@ -8,13 +8,12 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
+use biometric_core::geometry::{ImageRef, PixelFormat, Rect};
 use esp_idf_svc::sys::{self, esp, EspError};
 
-pub use biometric_core::geometry::{image_len, ImageRef, PixelFormat, Rect};
-
-/// L2 cache line size (CONFIG_CACHE_L2_CACHE_LINE_128B). PPA output buffers must be
-/// aligned to it and sized in multiples of it.
-const CACHE_LINE: usize = 128;
+/// L2 cache line size, from the build configuration. PPA output buffers must be aligned to it
+/// and sized in multiples of it.
+const CACHE_LINE: usize = sys::CONFIG_CACHE_L2_CACHE_LINE_SIZE as usize;
 
 fn srm_color_mode(format: PixelFormat) -> sys::ppa_srm_color_mode_t {
     match format {
@@ -76,19 +75,6 @@ pub struct Target<'a> {
     pub format: PixelFormat,
 }
 
-impl<'a> Target<'a> {
-    /// Fill the whole `width`×`height` picture.
-    pub fn full(buf: &'a mut DmaBuf, width: u32, height: u32, format: PixelFormat) -> Self {
-        Self {
-            buf,
-            width,
-            height,
-            rect: Rect::full(width, height),
-            format,
-        }
-    }
-}
-
 /// One PPA scale-rotate-mirror client. Each thread that issues PPA work owns its own.
 pub struct Ppa {
     client: sys::ppa_client_handle_t,
@@ -104,6 +90,7 @@ impl Ppa {
             ..Default::default()
         };
         let mut client: sys::ppa_client_handle_t = core::ptr::null_mut();
+        // Safety: both pointers are valid for the call; `client` is only used if it succeeds.
         esp!(unsafe { sys::ppa_register_client(&config, &mut client) })?;
         Ok(Self { client })
     }

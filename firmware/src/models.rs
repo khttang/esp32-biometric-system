@@ -26,15 +26,15 @@
 
 use core::ffi::{c_void, CStr};
 use core::ptr::NonNull;
-use std::ffi::CString;
 use std::sync::LazyLock;
 use std::time::Instant;
 
 use anyhow::{bail, ensure, Context, Result};
 use biometric_core::activation::{self, Activation, Decision, Slot};
 use biometric_core::contract::ModelSpec;
-use biometric_core::manifest::{self, encode_hex, ModelManifest};
-use biometric_core::signing::{self, PublicKey};
+use biometric_core::hex;
+use biometric_core::manifest::{self, ModelManifest};
+use biometric_core::signing::{self, VerifyingKey};
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use log::{error, info, warn};
 
@@ -97,7 +97,7 @@ impl Drop for MappedPartition {
 /// Keys whose signature on a model image this firmware accepts. Compiled in, so changing who
 /// may publish models takes a firmware release. An unreadable key file leaves no trusted
 /// key, and then no model loads.
-static TRUSTED_KEYS: LazyLock<Vec<PublicKey>> = LazyLock::new(|| {
+static TRUSTED_KEYS: LazyLock<Vec<VerifyingKey>> = LazyLock::new(|| {
     signing::parse_public_keys(include_str!("../trusted-model-keys.txt")).unwrap_or_else(|e| {
         error!("[Models] trusted-model-keys.txt: {e}; no model will be accepted");
         Vec::new()
@@ -106,7 +106,7 @@ static TRUSTED_KEYS: LazyLock<Vec<PublicKey>> = LazyLock::new(|| {
 
 /// Verifies that partition `label` holds an intact copy of `expected_model`, signed by a
 /// trusted key; returns its manifest. The mapping is released before returning, so ESP-DL can map it afresh.
-pub fn verify(label: &CStr, expected_model: &str) -> Result<ModelManifest> {
+fn verify(label: &CStr, expected_model: &str) -> Result<ModelManifest> {
     let started = Instant::now();
     let partition = MappedPartition::map(label)?;
     let manifest = manifest::verify_signed(partition.as_slice(), expected_model, &TRUSTED_KEYS)
@@ -127,10 +127,13 @@ pub fn verify(label: &CStr, expected_model: &str) -> Result<ModelManifest> {
 #[cfg(feature = "eval")]
 pub fn verify_any(label: &CStr) -> Result<ModelManifest> {
     let partition = MappedPartition::map(label)?;
-    let named = manifest::authenticate(partition.as_slice(), &TRUSTED_KEYS)
+    let manifest = manifest::authenticate(partition.as_slice(), &TRUSTED_KEYS)
+        .and_then(|manifest| {
+            manifest::check_data(partition.as_slice(), &manifest)?;
+            Ok(manifest)
+        })
         .map_err(|e| anyhow::anyhow!("partition {label:?}: {e}"))?;
-    manifest::verify_signed(partition.as_slice(), &named.model, &TRUSTED_KEYS)
-        .map_err(|e| anyhow::anyhow!("partition {label:?}: {e}"))
+    Ok(manifest)
 }
 
 /// NVS namespace of the per-model activation records.
@@ -138,7 +141,7 @@ const NAMESPACE: &str = "models";
 
 /// The slot chosen for a model: verified, and safe to hand to ESP-DL.
 pub struct Selected {
-    pub partition: CString,
+    pub partition: &'static CStr,
     pub manifest: ModelManifest,
 }
 
@@ -157,11 +160,9 @@ impl ModelStore {
     /// Verifies both slots of `spec`, runs a trial if the standby slot holds a new image, and
     /// returns the slot to load. `None` means the model is unavailable.
     pub fn select(&self, spec: &ModelSpec) -> Option<Selected> {
-        let labels = spec
-            .partitions
-            .map(|label| CString::new(label).expect("partition labels contain no NUL"));
+        let labels = spec.partitions;
         let mut manifests = [Slot::A, Slot::B].map(|slot| {
-            verify(&labels[slot.index()], spec.id)
+            verify(labels[slot.index()], spec.id)
                 .inspect_err(|e| info!("[Models] {} slot {slot} not usable: {e:#}", spec.key))
                 .ok()
         });
@@ -175,17 +176,20 @@ impl ModelStore {
                 .as_ref()
                 .expect("a trial slot holds a verified image");
             // The marker must be in flash before the model runs: see the module comment.
-            let passed = match self.save(spec.key, &state) {
-                Ok(()) => golden_run(spec.key, slot, &labels[slot.index()], candidate),
+            decision = match self.save(spec.key, &state) {
+                Ok(()) => {
+                    let passed = golden_run(spec.key, slot, labels[slot.index()], candidate);
+                    state.conclude(&images, passed)
+                }
                 Err(e) => {
+                    // No verdict on the candidate: it is tried again at the next start.
                     error!(
                         "[Models] {}: cannot record the trial ({e:#}); not run",
                         spec.key
                     );
-                    false
+                    state.abandon(&images)
                 }
             };
-            decision = state.conclude(&images, passed);
         }
         if state != saved {
             if state.active != saved.active {
@@ -207,9 +211,8 @@ impl ModelStore {
                     "[Models] {}: using slot {slot}: {} ({})",
                     spec.key, manifest.model, manifest.version
                 );
-                let [a, b] = labels;
                 Some(Selected {
-                    partition: if slot == Slot::A { a } else { b },
+                    partition: labels[slot.index()],
                     manifest,
                 })
             }
@@ -252,16 +255,21 @@ fn golden_run(key: &str, slot: Slot, partition: &CStr, candidate: &ModelManifest
     );
     let started = Instant::now();
     let mut digest = [0u8; 32];
-    let ret = {
-        let _uninterrupted = PriorityBoost::new();
-        // Safety: `partition` was verified to hold an intact model image; `digest` is 32 bytes.
-        unsafe { ffi::p4_model_golden(partition.as_ptr(), digest.as_mut_ptr()) }
-    };
+    // Run at the highest priority, so no other task on this core preempts the model (see the
+    // module comment).
+    // Safety: NULL addresses the calling task.
+    let previous = unsafe { ffi::uxTaskPriorityGet(core::ptr::null_mut()) };
+    // Safety: as above; the priority is within the configured range.
+    unsafe { ffi::vTaskPrioritySet(core::ptr::null_mut(), ffi::configMAX_PRIORITIES - 1) };
+    // Safety: `partition` was verified to hold an intact model image; `digest` is 32 bytes.
+    let ret = unsafe { ffi::p4_model_golden(partition.as_ptr(), digest.as_mut_ptr()) };
+    // Safety: NULL addresses the calling task; restores the priority it had before.
+    unsafe { ffi::vTaskPrioritySet(core::ptr::null_mut(), previous) };
     if ret != 0 {
         error!("[Models] {key}: golden run failed: {ret}; image rejected");
         return false;
     }
-    let computed = encode_hex(&digest);
+    let computed = hex::encode(&digest);
     let elapsed = started.elapsed().as_millis();
     match candidate.golden() {
         Some(expected) if expected == digest => {
@@ -272,7 +280,7 @@ fn golden_run(key: &str, slot: Slot, partition: &CStr, candidate: &ModelManifest
             error!(
                 "[Models] {key}: golden mismatch: computed {computed}, manifest {}; \
                  image rejected",
-                encode_hex(&expected)
+                hex::encode(&expected)
             );
             false
         }
@@ -283,28 +291,5 @@ fn golden_run(key: &str, slot: Slot, partition: &CStr, candidate: &ModelManifest
             );
             false
         }
-    }
-}
-
-/// Runs the calling task at the highest priority until dropped, so no other task on its core
-/// can preempt it.
-struct PriorityBoost {
-    previous: ffi::UBaseType_t,
-}
-
-impl PriorityBoost {
-    fn new() -> Self {
-        // Safety: NULL addresses the calling task.
-        let previous = unsafe { ffi::uxTaskPriorityGet(core::ptr::null_mut()) };
-        // Safety: as above; the priority is within the configured range.
-        unsafe { ffi::vTaskPrioritySet(core::ptr::null_mut(), ffi::configMAX_PRIORITIES - 1) };
-        Self { previous }
-    }
-}
-
-impl Drop for PriorityBoost {
-    fn drop(&mut self) {
-        // Safety: NULL addresses the calling task; restores the priority it had before.
-        unsafe { ffi::vTaskPrioritySet(core::ptr::null_mut(), self.previous) };
     }
 }

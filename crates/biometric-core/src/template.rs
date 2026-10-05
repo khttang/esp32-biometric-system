@@ -1,4 +1,4 @@
-//! Template format v2: how enrolled members and their templates are stored on the device.
+//! How enrolled members and their templates are stored on the device (record format 2).
 //!
 //! A member and each of its templates are separate records, so a member can have several
 //! templates (one per modality and model release) or, after a model change, none.
@@ -29,23 +29,27 @@
 //!     12     …  member id, model version (UTF-8), then the embedding as little-endian f32
 //! ```
 //!
-//! A template names its member, so a record is meaningful on its own (and can later be sent to
-//! a server as it is). A record is exactly as long as its header says: truncated records and
-//! trailing bytes are both rejected. The format carries no checksum of its own; the firmware
-//! stores records as NVS blobs, which are CRC-protected.
+//! A template names its member, so a record is meaningful on its own. A record is exactly as
+//! long as its header says: truncated records and trailing bytes are both rejected. The format
+//! carries no checksum of its own; the firmware stores records as NVS blobs, which are
+//! CRC-protected.
 //!
-//! Format v1 ([`crate::template_v1`]) kept one face embedding inside the member record;
-//! [`migrate_v1`] converts such a record.
+//! The model version is part of a template record because an embedding only means something
+//! to the model that produced it (see [`crate::matching`]). Format 1, one record per member
+//! with a single face embedding inside it, is no longer read.
 
-use crate::enrollment::migrated_member_id;
-use crate::matching::{GroupMember, Modality, Template};
-use crate::template_v1::{field_len, role_from_byte, role_to_byte, stored_len, text, V1Record};
-pub use crate::template_v1::{TemplateError, MAX_ID_LEN, MAX_MODEL_VERSION_LEN, MAX_NAME_LEN};
+use core::fmt;
 
-pub const MEMBER_MAGIC: [u8; 4] = *b"FMBR";
-pub const TEMPLATE_MAGIC: [u8; 4] = *b"FTPL";
-/// Record layout version written by this firmware.
-pub const TEMPLATE_FORMAT: u8 = 2;
+use crate::matching::{is_normalised, GroupMember, Modality, Role, Template};
+
+const MEMBER_MAGIC: [u8; 4] = *b"FMBR";
+const TEMPLATE_MAGIC: [u8; 4] = *b"FTPL";
+/// Record layout version written and understood by this firmware.
+const TEMPLATE_FORMAT: u8 = 2;
+
+const MAX_ID_LEN: usize = 64;
+pub(crate) const MAX_NAME_LEN: usize = 64;
+const MAX_MODEL_VERSION_LEN: usize = 64;
 
 /// Templates a member can hold on the device: enough for a face template for the model in use
 /// plus one for a model being introduced. Bounded by the size of the template partition.
@@ -60,6 +64,126 @@ pub const MAX_MEMBER_LEN: usize = MEMBER_HEADER_LEN + MAX_ID_LEN + MAX_NAME_LEN;
 /// Largest template record for an embedding of `dim` values.
 pub const fn max_template_len(dim: usize) -> usize {
     TEMPLATE_HEADER_LEN + MAX_ID_LEN + MAX_MODEL_VERSION_LEN + dim * size_of::<f32>()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemplateError {
+    /// Shorter than its header.
+    Truncated {
+        len: usize,
+        header: usize,
+    },
+    BadMagic,
+    UnsupportedFormat(u8),
+    UnknownRole(u8),
+    UnknownModality(u8),
+    /// A text field is empty or longer than its limit.
+    FieldLength {
+        field: &'static str,
+        len: usize,
+        max: usize,
+    },
+    /// The embedding is empty or has more values than the header can describe.
+    EmbeddingDimension(usize),
+    /// The record's length disagrees with its header.
+    LengthMismatch {
+        expected: usize,
+        found: usize,
+    },
+    InvalidUtf8(&'static str),
+    /// The embedding contains NaN or infinity.
+    NonFiniteEmbedding,
+    /// The embedding is not L2-normalised, so its similarity scores would mean nothing.
+    NotNormalised,
+}
+
+impl fmt::Display for TemplateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Truncated { len, header } => {
+                write!(
+                    f,
+                    "record of {len} bytes is shorter than a {header}-byte header"
+                )
+            }
+            Self::BadMagic => write!(f, "not a member or template record (bad magic)"),
+            Self::UnsupportedFormat(v) => {
+                write!(f, "unsupported record format {v}")
+            }
+            Self::UnknownRole(r) => write!(f, "unknown role {r}"),
+            Self::UnknownModality(m) => write!(f, "unknown modality {m}"),
+            Self::FieldLength { field, len, max } => {
+                write!(f, "{field} of {len} bytes is outside 1..={max} bytes")
+            }
+            Self::EmbeddingDimension(dim) => {
+                write!(f, "embedding dimension {dim} is outside 1..={}", u16::MAX)
+            }
+            Self::LengthMismatch { expected, found } => {
+                write!(
+                    f,
+                    "record is {found} bytes, its header describes {expected}"
+                )
+            }
+            Self::InvalidUtf8(field) => write!(f, "{field} is not valid UTF-8"),
+            Self::NonFiniteEmbedding => write!(f, "embedding contains NaN or infinity"),
+            Self::NotNormalised => write!(f, "embedding is not a unit vector"),
+        }
+    }
+}
+
+impl std::error::Error for TemplateError {}
+
+fn field_len(field: &'static str, value: &str, max: usize) -> Result<u8, TemplateError> {
+    u8::try_from(value.len())
+        .ok()
+        .filter(|&len| len > 0 && usize::from(len) <= max)
+        .ok_or(TemplateError::FieldLength {
+            field,
+            len: value.len(),
+            max,
+        })
+}
+
+fn stored_len(field: &'static str, len: u8, max: usize) -> Result<usize, TemplateError> {
+    let len = usize::from(len);
+    if len == 0 || len > max {
+        return Err(TemplateError::FieldLength { field, len, max });
+    }
+    Ok(len)
+}
+
+fn text(field: &'static str, bytes: &[u8]) -> Result<String, TemplateError> {
+    core::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| TemplateError::InvalidUtf8(field))
+}
+
+fn role_to_byte(role: Role) -> u8 {
+    match role {
+        Role::Admin => 0,
+        Role::User => 1,
+        Role::Guest => 2,
+    }
+}
+
+fn role_from_byte(byte: u8) -> Result<Role, TemplateError> {
+    match byte {
+        0 => Ok(Role::Admin),
+        1 => Ok(Role::User),
+        2 => Ok(Role::Guest),
+        other => Err(TemplateError::UnknownRole(other)),
+    }
+}
+
+/// What every stored embedding must be: finite and L2-normalised.
+fn check_embedding(embedding: &[f32]) -> Result<(), TemplateError> {
+    if embedding.iter().any(|v| !v.is_finite()) {
+        return Err(TemplateError::NonFiniteEmbedding);
+    }
+    if !is_normalised(embedding) {
+        return Err(TemplateError::NotNormalised);
+    }
+    Ok(())
 }
 
 fn modality_to_byte(modality: Modality) -> u8 {
@@ -79,7 +203,10 @@ fn modality_from_byte(byte: u8) -> Result<Modality, TemplateError> {
 
 fn check_header(record: &[u8], magic: [u8; 4], header_len: usize) -> Result<(), TemplateError> {
     if record.len() < header_len {
-        return Err(TemplateError::Truncated { len: record.len() });
+        return Err(TemplateError::Truncated {
+            len: record.len(),
+            header: header_len,
+        });
     }
     if record[..4] != magic {
         return Err(TemplateError::BadMagic);
@@ -142,9 +269,7 @@ pub fn encode_template(member_id: &str, template: &Template) -> Result<Vec<u8>, 
         .ok()
         .filter(|&d| d > 0)
         .ok_or(TemplateError::EmbeddingDimension(dim))?;
-    if template.embedding.iter().any(|v| !v.is_finite()) {
-        return Err(TemplateError::NonFiniteEmbedding);
-    }
+    check_embedding(&template.embedding)?;
     let mut record = Vec::with_capacity(
         TEMPLATE_HEADER_LEN
             + member_id.len()
@@ -192,9 +317,7 @@ pub fn decode_template(record: &[u8]) -> Result<(String, Template), TemplateErro
         .iter()
         .map(|&bytes| f32::from_le_bytes(bytes))
         .collect();
-    if embedding.iter().any(|v| !v.is_finite()) {
-        return Err(TemplateError::NonFiniteEmbedding);
-    }
+    check_embedding(&embedding)?;
     let template = Template {
         modality,
         model_version: text("model version", version)?,
@@ -203,26 +326,9 @@ pub fn decode_template(record: &[u8]) -> Result<(String, Template), TemplateErro
     Ok((text("member id", id)?, template))
 }
 
-/// The member a format v1 record becomes on the device `device_id`: the same person with the
-/// record's embedding as a face template, under an id that is unique across devices.
-pub fn migrate_v1(record: V1Record, device_id: &str) -> GroupMember {
-    GroupMember {
-        id: migrated_member_id(&record.id, device_id),
-        name: record.name,
-        role: record.role,
-        templates: vec![Template {
-            modality: Modality::Face,
-            model_version: record.model_version,
-            embedding: record.embedding,
-        }],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matching::Role;
-    use crate::template_v1;
 
     const DEVICE: &str = "80f1b2d2da2e";
 
@@ -316,27 +422,6 @@ mod tests {
     }
 
     #[test]
-    fn a_v1_record_is_not_a_v2_template_and_vice_versa() {
-        let v1 = template_v1::encode(&V1Record {
-            id: "local-0001".into(),
-            name: "Ada".into(),
-            role: Role::User,
-            model_version: "m".into(),
-            embedding: vec![1.0],
-        })
-        .unwrap();
-        assert_eq!(
-            decode_template(&v1),
-            Err(TemplateError::UnsupportedFormat(1))
-        );
-        let v2 = encode_template("m", &template()).unwrap();
-        assert_eq!(
-            template_v1::decode(&v2),
-            Err(TemplateError::UnsupportedFormat(2))
-        );
-    }
-
-    #[test]
     fn truncated_and_padded_records_are_rejected() {
         for record in [
             encode_member(&member()).unwrap(),
@@ -350,9 +435,10 @@ mod tests {
                     decode_template(bytes).map(|_| ())
                 }
             };
+            let header = if is_member { 8 } else { 12 };
             assert_eq!(
                 decode(&record[..3]),
-                Err(TemplateError::Truncated { len: 3 })
+                Err(TemplateError::Truncated { len: 3, header })
             );
             assert!(matches!(
                 decode(&record[..record.len() - 1]),
@@ -436,6 +522,31 @@ mod tests {
     }
 
     #[test]
+    fn embeddings_that_are_not_unit_vectors_are_rejected_both_ways() {
+        let mut t = template();
+        t.embedding = vec![2.0, 0.0];
+        assert_eq!(encode_template("m", &t), Err(TemplateError::NotNormalised));
+        t.embedding = vec![0.0, 0.0];
+        assert_eq!(encode_template("m", &t), Err(TemplateError::NotNormalised));
+
+        // A stored record whose first value was changed from 0.6 to 3.0.
+        let mut record = encode_template("m", &template()).unwrap();
+        let first = record.len() - 4 * 4;
+        record[first..first + 4].copy_from_slice(&3.0f32.to_le_bytes());
+        assert_eq!(decode_template(&record), Err(TemplateError::NotNormalised));
+    }
+
+    #[test]
+    fn a_format_1_record_is_rejected() {
+        let mut record = encode_template("m", &template()).unwrap();
+        record[4] = 1;
+        assert_eq!(
+            decode_template(&record),
+            Err(TemplateError::UnsupportedFormat(1))
+        );
+    }
+
+    #[test]
     fn invalid_utf8_and_unknown_role_are_rejected() {
         let mut record = encode_member(&member()).unwrap();
         record[8] = 0xFF;
@@ -460,34 +571,5 @@ mod tests {
         record[8] = 0xAA;
         record[9] = 0x55;
         assert_eq!(decode_template(&record), Ok(("m".into(), template())));
-    }
-
-    #[test]
-    fn a_v1_record_migrates_to_a_member_with_one_face_template() {
-        let v1 = V1Record {
-            id: "local-0007".into(),
-            name: "Ada".into(),
-            role: Role::User,
-            model_version: "human_face_recognition 0.3.2".into(),
-            embedding: vec![0.6, 0.8],
-        };
-        // Through the stored bytes, as the firmware does it.
-        let stored = template_v1::encode(&v1).unwrap();
-        let migrated = migrate_v1(template_v1::decode(&stored).unwrap(), DEVICE);
-        assert_eq!(migrated.id, "80f1b2d2da2e-0007");
-        assert_eq!((migrated.name.as_str(), migrated.role), ("Ada", Role::User));
-        assert_eq!(
-            migrated.templates,
-            [Template {
-                modality: Modality::Face,
-                model_version: "human_face_recognition 0.3.2".into(),
-                embedding: vec![0.6, 0.8],
-            }]
-        );
-        // And what was migrated can be stored in the new format.
-        let member_record = encode_member(&migrated).unwrap();
-        let template_record = encode_template(&migrated.id, &migrated.templates[0]).unwrap();
-        assert_eq!(decode_member(&member_record).unwrap().id, migrated.id);
-        assert_eq!(decode_template(&template_record).unwrap().0, migrated.id);
     }
 }

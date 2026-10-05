@@ -4,6 +4,9 @@
 //! decided by the state machine in `biometrics.rs`, which calls these from the main thread.
 
 use std::ffi::{CStr, CString};
+use std::sync::Arc;
+
+use biometric_core::matching::GroupMember;
 
 use crate::ffi;
 
@@ -57,21 +60,24 @@ pub fn set_admin_mode(enabled: bool) {
     unsafe { ffi::p4_ui_set_admin_mode(enabled, LOCK_WAIT_FOREVER) };
 }
 
-/// Replaces the member list shown in the admin view; "Delete" reports an index into `names`.
-pub fn set_members<'a>(names: impl IntoIterator<Item = &'a str>) {
+/// Replaces the member list shown in the admin view; "Delete" reports an index into `members`.
+pub fn set_members(members: &[Arc<GroupMember>]) {
     let mut list = String::new();
-    let mut count = 0usize;
-    for name in names {
-        if count > 0 {
+    for (index, member) in members.iter().enumerate() {
+        if index > 0 {
             list.push('\n');
         }
         // One line per member: a line break inside a name would shift every later index.
-        list.extend(name.chars().map(|c| if c.is_control() { ' ' } else { c }));
-        count += 1;
+        list.extend(
+            member
+                .name
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c }),
+        );
     }
     let list = to_c_text(&list);
     // Safety: `list` is a valid C string for the duration of the call; LVGL copies it.
-    unsafe { ffi::p4_ui_set_members(list.as_ptr(), count, LOCK_WAIT_FOREVER) };
+    unsafe { ffi::p4_ui_set_members(list.as_ptr(), members.len(), LOCK_WAIT_FOREVER) };
 }
 
 /// `text` as a C string, cut at the first NUL (which our own strings never contain).
