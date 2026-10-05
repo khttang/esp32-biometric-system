@@ -224,11 +224,18 @@ impl ModelStore {
     }
 
     fn load(&self, key: &str) -> Activation {
-        let mut buf = [0u8; activation::ENCODED_LEN];
+        // Room for a record of another format version, so that one is read and reported as
+        // such rather than failing the read.
+        let mut buf = [0u8; 2 * activation::ENCODED_LEN];
         match self.nvs.get_blob(key, &mut buf) {
             Ok(None) => Activation::default(),
             Ok(Some(record)) => Activation::decode(record).unwrap_or_else(|e| {
-                warn!("[Models] {key}: activation record ignored: {e}");
+                // It can never become readable, so it is erased: otherwise it would stay,
+                // and be reported, until the state next changes.
+                warn!("[Models] {key}: activation record erased: {e}");
+                if let Err(e) = self.nvs.remove(key) {
+                    warn!("[Models] {key}: erasing the activation record failed: {e}");
+                }
                 Activation::default()
             }),
             Err(e) => {
