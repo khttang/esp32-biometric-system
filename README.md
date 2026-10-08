@@ -76,9 +76,10 @@ As of 2026-10-07. Milestone details are in [docs/ROADMAP.md](docs/ROADMAP.md).
 and holds a spoken conversation through a remote voice agent over Wi-Fi, with face models that
 can be updated in the field without reflashing the firmware.
 
-**Current state.** The device detects, enrolls and recognises faces on its own and plays a chime
-on a match. Models are signed and live in A/B flash slots. It has no network connection in use
-and no speech.
+**Current state.** The device detects, enrolls and recognises faces on its own. When it
+recognises an enrolled person it plays a chime and shows "Welcome, [name]" on the LCD for
+three seconds. Models are signed and live in A/B flash slots. It has no network connection in
+use and no speech.
 
 ### Current State
 
