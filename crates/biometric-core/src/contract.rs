@@ -2,10 +2,21 @@
 //!
 //! The firmware uses Espressif's pretrained ESP-DL models:
 //!
-//! | Stage | Model | Input | Output |
+//! | Stage | Model | Image handed to ESP-DL | Output |
 //! |---|---|---|---|
-//! | Detection | `human_face_detect` MSR+MNP (`*_s8_v1`) | packed RGB888 image of any size (resized internally) | boxes, scores, 5 landmarks |
+//! | Detection | `human_face_detect` MSR+MNP (`*_s8_v1`) | packed 8-bit image of any size, bytes B, G, R (resized internally) | boxes, scores, 5 landmarks |
 //! | Embedding | `human_face_recognition` MFN (`human_face_feat_mfn_s8_v1`) | same image + landmarks (aligned internally to 112×112) | L2-normalised `f32` vector |
+//!
+//! The tensors the models themselves read, as logged by the firmware at load (all `int8`,
+//! batch × height × width × channels, BGR; a stored `q` stands for `q × 2^exponent`):
+//!
+//! | Model | Input tensor | Mean / std | Exponent |
+//! |---|---|---|---|
+//! | MSR | 1 × 120 × 160 × 3 | 0 / 1 | 1 |
+//! | MNP | 1 × 48 × 48 × 3 | 0 / 1 | 1 |
+//! | MFN | 1 × 112 × 112 × 3 | 127.5 / 127.5 | −6 |
+//!
+//! The mean and std are set in `face_inference.cpp`; the rest comes from the model file.
 //!
 //! The firmware checks [`EMBEDDING_DIM`] against the loaded model at startup and disables
 //! recognition on a mismatch rather than comparing incompatible vectors.

@@ -22,7 +22,9 @@
 
 #include <cstring>
 #include <list>
+#include <map>
 #include <new>
+#include <string>
 #include <vector>
 
 #include "dl_detect_base.hpp"
@@ -49,11 +51,24 @@ constexpr float MSR_NMS_THR = 0.5f;
 constexpr float MNP_SCORE_THR = 0.5f;
 constexpr float MNP_NMS_THR = 0.5f;
 
+// Logs the tensors a model reads or writes: what the model itself requires, as opposed to the
+// image the preprocessor is given. Called once per model at load.
+void log_tensors(const char *partition, const char *direction, std::map<std::string, dl::TensorBase *> &tensors)
+{
+    for (auto &[name, tensor] : tensors) {
+        ESP_LOGI(TAG, "%s %s \"%s\": shape %s, %s, exponent %d", partition, direction, name.c_str(),
+                 dl::vector_to_string(tensor->shape).c_str(), tensor->get_dtype_string(),
+                 static_cast<int>(tensor->exponent));
+    }
+}
+
 dl::Model *load_model(const char *partition)
 {
     // A single model per partition; parameters are copied to RAM (param_copy defaults to true).
     dl::Model *model = new (std::nothrow) dl::Model(partition, fbs::MODEL_LOCATION_IN_FLASH_PARTITION);
     if (model) {
+        log_tensors(partition, "input", model->get_inputs());
+        log_tensors(partition, "output", model->get_outputs());
         model->minimize();
     }
     return model;

@@ -251,10 +251,40 @@ Defined in `crates/biometric-core/src/contract.rs` and checked at startup:
 |---|---|
 | Detector | `human_face_detect_msr_s8_v1` + `human_face_detect_mnp_s8_v1` (from `human_face_detect` 0.4.2) |
 | Embedder | `human_face_feat_mfn_s8_v1` (from `human_face_recognition` 0.3.2) |
-| Model ids | `MSR_MODEL_ID`, `MNP_MODEL_ID`, `FEATURE_MODEL_ID`; each partition's manifest must name the expected id |
+| Model ids | `MSR_MODEL`, `MNP_MODEL`, `FEATURE_MODEL`; each partition's manifest must name the expected id |
 | Detector input | 640×480 PPA RGB888 (BGR888 to ESP-DL), full field of view |
 | Landmarks | 5 per face; required for alignment |
 | Embedding | 512 × `f32`, L2-normalised. A model reporting another length disables recognition (detection keeps running). |
+
+There are two inputs to tell apart: the image the firmware hands to ESP-DL, and the tensor each
+model reads. ESP-DL's preprocessor converts the first into the second (resize or crop, channel
+order, normalisation, quantisation).
+
+**Image handed to ESP-DL.** 8-bit BGR888 of any size; the firmware always passes the 640×480
+detector image. ESP-DL also defines RGB565, YUV, grey and HSV source types, but only the
+RGB888 ↔ RGB888 conversion is compiled in (`sdkconfig.defaults`, about 1.1 MB of code saved), so
+RGB888 and BGR888 are the only source formats this build can use.
+
+**Tensors the models read and write**, logged by the firmware when each model loads (`p4_face`
+lines) and read from the board on 2026-10-08. All are `int8`, laid out batch × height × width ×
+channels, with BGR channel order; a stored value `q` stands for `q × 2^exponent`.
+
+| Model | Input tensor | Normalisation (mean / std) | Input exponent | Output tensors (exponent) |
+|---|---|---|---|---|
+| MSR (proposals) | 1 × 120 × 160 × 3 | 0 / 1 | 1 | Two grids, 13 × 18 and 7 × 9: boxes × 8 (−8), landmarks × 20 (−7), scores × 2 (−4) |
+| MNP (refinement) | 1 × 48 × 48 × 3 | 0 / 1 | 1 | box × 4 (−8), landmarks × 10 (−7), scores × 2 (−4) |
+| MFN (embedding) | 1 × 112 × 112 × 3 | 127.5 / 127.5 | −6 | embedding × 512 (−5), converted to `f32` and L2-normalised by ESP-DL |
+
+- **MSR sees a quarter-scale image.** The 640×480 detector image is reduced four times to
+  160×120, keeping its 4:3 shape. MSR's smallest anchor is 16 pixels there, which is 64 pixels in
+  the detector image, about a tenth of its width. Faces much smaller than that are below what the
+  model was built to propose. This follows from the anchor sizes; the working distance was not
+  measured.
+- **MNP and MFN work from the full 640×480 image**, not from MSR's reduced copy: each candidate
+  is cropped from it and resized to 48×48, and each face is aligned from it to 112×112.
+- **Not checked at start-up.** Only the embedding length is compared with the contract. The
+  input tensors are logged but not verified; ESP-DL itself asserts on a wrong data type or
+  channel count.
 
 The models come from Espressif's `human_face_detect` / `human_face_recognition` releases, but
 those components are not part of the firmware build. `face_inference.cpp` builds the models with
@@ -630,6 +660,7 @@ implemented.
 | Inference stack | Bytes of the 32 KB stack never used, after the deepest call path has run | `pipeline.rs`, once |
 | Microphone | Peak and RMS level | `audio_worker.rs`, every 10 s |
 | Model activation | Duration and result of each golden run | `models.rs`, when a new image is tried |
+| Model tensors | Name, shape, data type and exponent of every input and output tensor ([Model Contract](#model-contract)) | `face_inference.cpp`, when a model loads |
 
 ```text
 [Pipeline] camera 9.9 fps over 10s | preview PPA avg 79.2 ms max 105.7 ms | detector PPA n=49 avg 18.7 ms max 19.2 ms | present avg 0.1 ms max 0.1 ms, 0 of 99 skipped (LVGL busy)
