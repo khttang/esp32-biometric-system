@@ -2,15 +2,19 @@
 # Fetch, package and flash the face models into their flash partitions.
 #
 #   tools/face-models.sh fetch          # download Espressif's pinned model releases, verify, extract
-#   tools/face-models.sh pack  [a|b]    # build partition images (model + manifest) with model-packer
-#   tools/face-models.sh flash [a|b]    # write the images with espflash (set ESPFLASH_PORT to choose a port)
-#   tools/face-models.sh all   [a|b]    # fetch + pack + flash
+#   tools/face-models.sh pack  a|b      # build partition images (model + manifest) with model-packer
+#   tools/face-models.sh flash a|b      # write the images with espflash (set ESPFLASH_PORT to choose a port)
+#   tools/face-models.sh all   a|b      # fetch + pack + flash
 #   tools/face-models.sh keygen         # create the signing key; prints its public key
 #
-# Models are not part of the firmware build. Each has two flash slots (a, the default, and b)
-# and a manifest (model id, version, size, SHA-256, golden) that the firmware verifies before
-# loading it. To update a model on a running device, write the new image to the slot that is
-# not in use: the firmware gives it a golden run at the next boot and switches only if it passes.
+# Models are not part of the firmware build. Each has two flash slots (a and b) and a manifest
+# (model id, version, size, SHA-256, golden) that the firmware verifies before loading it.
+#
+# Which slot: on a new or erased board, use a. To update a model on a board that already runs
+# one, use the slot that is NOT in use: the boot log says `[Models] msr: using slot A` (and the
+# same for mnp and feat). The firmware gives an image in the other slot a golden run at the next
+# boot and switches only if it passes. An image written over the slot in use is loaded without
+# that test and leaves nothing to fall back to, which is why there is no default slot.
 #
 # Set NO_GOLDEN=1 to pack without goldens, e.g. to have the device compute and log them.
 #
@@ -43,8 +47,12 @@ IMAGES=(
 )
 
 slot_arg() {
-  case "${1:-a}" in
-    a|b) echo "${1:-a}" ;;
+  case "${1:-}" in
+    a|b) echo "$1" ;;
+    "")
+      echo "Which slot? Give a or b: a on a new or erased board, otherwise the slot the boot log" >&2
+      echo "does not name in \`[Models] ...: using slot A|B\`." >&2
+      exit 2 ;;
     *) echo "slot must be a or b, not '$1'" >&2; exit 2 ;;
   esac
 }
@@ -128,7 +136,7 @@ case "${1:-}" in
   fetch) fetch ;;
   pack) pack "${2:-}" ;;
   flash) flash "${2:-}" ;;
-  all) fetch && pack "${2:-}" && flash "${2:-}" ;;
+  all) slot_arg "${2:-}" >/dev/null && fetch && pack "${2:-}" && flash "${2:-}" ;;
   keygen) keygen ;;
-  *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

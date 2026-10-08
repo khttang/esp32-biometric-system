@@ -10,13 +10,13 @@ on its own.
 ## Where It Stands (2026-10-07)
 
 - **Target state:** a stand-alone device that recognises an enrolled person, greets them by name
-  and holds a spoken conversation through a remote voice agent over Wi-Fi, with face models that
-  can be updated in the field without reflashing.
+  and holds a spoken conversation through a remote voice agent over Wi-Fi.
 - **Done:** Foundation, M0, M1, M2, M3a, M3b, the on-board accuracy evaluation, M4a and M4b. The
   device detects, enrolls and recognises faces on its own; models are signed and live in A/B
   slots.
 - **Next:** M6, in its five steps, starting with Wi-Fi.
-- **Parked:** M4d and M5, which need the network connection M6a brings.
+- **Parked:** M4d and M5. They need the network connection M6a brings, and experience since
+  M3b showed that models change rarely and are easily updated over USB.
 - **Dropped:** M4c (template sync) and Ethernet. Enrollment stays on the device, and the board
   will use the on-board ESP32-C6 for Wi-Fi.
 

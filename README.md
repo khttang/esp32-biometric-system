@@ -83,13 +83,12 @@ Where the embedded-systems work in this repository is, with the section that doc
 As of 2026-10-07. Milestone details are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 **Target state.** A stand-alone device that recognises an enrolled person, greets them by name
-and holds a spoken conversation through a remote voice agent over Wi-Fi, with face models that
-can be updated in the field without reflashing the firmware.
+and holds a spoken conversation through a remote voice agent over Wi-Fi.
 
 **Current state.** The device detects, enrolls and recognises faces on its own. When it
 recognises an enrolled person it plays a chime and shows "Welcome, [name]" on the LCD for
-three seconds. Models are signed and live in A/B flash slots. It has no network connection in
-use and no speech.
+three seconds. Models are signed, live in A/B flash slots and are replaced over USB without
+rebuilding the firmware. It has no network connection in use and no speech.
 
 ### Current State
 
@@ -128,7 +127,7 @@ In this order. Each step is one pull request ([docs/ROADMAP.md](docs/ROADMAP.md)
 | 3. Spoken greeting | "Welcome, [name]" on a match | Planned |
 | 4. Conversation | A speech-to-speech agent, started by a face match | Planned; provider not chosen |
 | 5. Hardening | Reconnects, session and cost limits, handling of the API key | Planned |
-| Later | Remote model updates with template migration (M4d); telemetry (M5) | Parked until Wi-Fi exists |
+| Later | Remote model updates with template migration (M4d); telemetry (M5) | Parked. Models change rarely and are updated over USB, so remote updates are not needed now |
 
 Open decisions: the voice provider and where its API key lives; the match threshold (0.5 today,
 about 0.4 under consideration after the accuracy run); who may enroll (an admin role exists in the template
@@ -337,7 +336,7 @@ by a key it trusts.
 - **How devices get keys:** the public keys are listed in `firmware/trusted-model-keys.txt` and
   compiled into the firmware. A device trusts exactly the keys of the firmware it runs.
 - **Building for your own devices:** run `keygen`, replace the key in `trusted-model-keys.txt`
-  with yours, then build the firmware and run `tools/face-models.sh all`. Images signed with the
+  with yours, then build the firmware and run `tools/face-models.sh all a`. Images signed with the
   key committed here can only be produced by this project's maintainer.
 - **Rotating a key:** add the new public key, release firmware, re-sign the models with the new
   key, and remove the old key in a later firmware release. Several keys can be trusted at once.
@@ -412,6 +411,22 @@ Not tested on the device: a reset in the middle of a trial (covered by host test
 switch to a genuinely different model (only Espressif's one release of each was available, so the
 "new" images differed in version label and golden only).
 
+**Limits of the update mechanism**, from a review of the code on 2026-10-08:
+
+- **Only the standby slot is protected.** An image written over the slot in use gets no golden
+  run and leaves nothing to fall back to. The script therefore has no default slot.
+- **The golden run feeds the model's input tensor directly.** It does not go through ESP-DL's
+  image pre-processing, so a model with a different input shape could pass it and then fail when
+  the detector or embedder is built. Not tested.
+- **Rollback is for a damaged image, not a poor one.** The device returns to the previous image
+  when the active one fails verification. A model that passes its golden run but recognises
+  badly stays active.
+- **The three models switch independently.** Nothing keeps the detector's two models (MSR and
+  MNP) on the same release.
+- **A new feature-model release leaves the enrolled templates unused** until people are enrolled
+  again, because a template only matches embeddings from the release that made it.
+- **An older signed image is accepted.** There is no minimum version.
+
 **The golden is exact and belongs to a firmware generation.** Outputs are quantised integers, so
 the digest is compared bit for bit. It must come from a device running the same ESP-DL version;
 after an ESP-DL upgrade the goldens of the pinned models have to be re-measured. The golden run
@@ -424,9 +439,14 @@ Updating models:
 tools/face-models.sh fetch      # download Espressif's pinned releases, check their SHA-256, extract
 tools/face-models.sh pack  b    # build models/face_*_b.bin partition images (model-packer)
 tools/face-models.sh flash b    # espflash write-bin each image at its partition offset
-tools/face-models.sh all        # all three steps; the slot defaults to a
+tools/face-models.sh all   a    # all three steps, for a new or erased board
 tools/face-models.sh keygen     # once: create the signing key, print its public key
 ```
+
+The slot is always given; there is no default. On a board that already runs a model, write to
+the slot that is not in use: the boot log says `[Models] msr: using slot A` (likewise for `mnp`
+and `feat`). An image written over the slot in use is loaded without a golden run and leaves
+nothing to fall back to.
 
 To publish a model of your own, get its golden from a device: pack it without `--golden`
 (`NO_GOLDEN=1` with the script), write it to the standby slot, and boot. The log shows
@@ -930,7 +950,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 cd firmware
 cargo build --release          # first build downloads ESP-IDF + tools (needs network, takes a while)
 cargo run --release            # build, flash (espflash, partitions.csv) and open the serial monitor
-../tools/face-models.sh all     # first time, or after a model change: write the face models
+../tools/face-models.sh all a   # first time (new or erased board): write the face models to slot a
 cargo fmt --check && cargo clippy --release -- -D warnings   # same checks as CI
 cargo clippy --release --features eval -- -D warnings          # the evaluation build, also in CI
 ```
@@ -956,7 +976,7 @@ cargo clippy --release --features eval -- -D warnings          # the evaluation 
 - **Models** are written separately from the firmware (see [Model Partitions](#model-partitions)).
   A board without models boots normally: the preview runs and the log says which models are missing.
 - **After changing `partitions.csv`**, erase the chip once: `espflash erase-flash`, then
-  `cargo run --release` and `tools/face-models.sh all`. Stale data from the old layout can
+  `cargo run --release` and `tools/face-models.sh all a`. Stale data from the old layout can
   otherwise be misread. Erasing the chip also erases the enrolled templates.
 
 ---

@@ -10,7 +10,7 @@
 #
 # The board compares its active feature model with a candidate (CANDIDATE, default Espressif's
 # larger MBF model; CANDIDATE=none evaluates the active model alone). Run
-# `tools/face-models.sh all` first: the evaluation uses the models in the regular slots.
+# `tools/face-models.sh all a` first: the evaluation uses the models in the regular slots.
 #
 # Environment: PORT (serial port, default: the only USB serial port found), PEOPLE and
 # PER_PERSON (selection size, default 400 and 4), RESULTS (default models/eval/results).
