@@ -83,13 +83,12 @@ Where the embedded-systems work in this repository is, with the section that doc
 As of 2026-10-07. Milestone details are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 **Target state.** A stand-alone device that recognises an enrolled person, greets them by name
-and holds a spoken conversation through a remote voice agent over Wi-Fi, with face models that
-can be updated in the field without reflashing the firmware.
+and holds a spoken conversation through a remote voice agent over Wi-Fi.
 
 **Current state.** The device detects, enrolls and recognises faces on its own. When it
 recognises an enrolled person it plays a chime and shows "Welcome, [name]" on the LCD for
-three seconds. Models are signed and live in A/B flash slots. It has no network connection in
-use and no speech.
+three seconds. Models are signed, live in A/B flash slots and are replaced over USB without
+rebuilding the firmware. It has no network connection in use and no speech.
 
 ### Current State
 
@@ -128,7 +127,7 @@ In this order. Each step is one pull request ([docs/ROADMAP.md](docs/ROADMAP.md)
 | 3. Spoken greeting | "Welcome, [name]" on a match | Planned |
 | 4. Conversation | A speech-to-speech agent, started by a face match | Planned; provider not chosen |
 | 5. Hardening | Reconnects, session and cost limits, handling of the API key | Planned |
-| Later | Remote model updates with template migration (M4d); telemetry (M5) | Parked until Wi-Fi exists |
+| Later | Remote model updates with template migration (M4d); telemetry (M5) | Parked. Models change rarely and are updated over USB, so remote updates are not needed now |
 
 Open decisions: the voice provider and where its API key lives; the match threshold (0.5 today,
 about 0.4 under consideration after the accuracy run); who may enroll (an admin role exists in the template
@@ -381,6 +380,22 @@ Tested on the device (feature model unless noted):
 Not tested on the device: a reset in the middle of a trial (covered by host tests only), and a
 switch to a genuinely different model (only Espressif's one release of each was available, so the
 "new" images differed in version label and golden only).
+
+**Limits of the update mechanism**, from a review of the code on 2026-10-08:
+
+- **Only the standby slot is protected.** An image written over the slot in use gets no golden
+  run and leaves nothing to fall back to. The script therefore has no default slot.
+- **The golden run feeds the model's input tensor directly.** It does not go through ESP-DL's
+  image pre-processing, so a model with a different input shape could pass it and then fail when
+  the detector or embedder is built. Not tested.
+- **Rollback is for a damaged image, not a poor one.** The device returns to the previous image
+  when the active one fails verification. A model that passes its golden run but recognises
+  badly stays active.
+- **The three models switch independently.** Nothing keeps the detector's two models (MSR and
+  MNP) on the same release.
+- **A new feature-model release leaves the enrolled templates unused** until people are enrolled
+  again, because a template only matches embeddings from the release that made it.
+- **An older signed image is accepted.** There is no minimum version.
 
 **The golden is exact and belongs to a firmware generation.** Outputs are quantised integers, so
 the digest is compared bit for bit. It must come from a device running the same ESP-DL version;
