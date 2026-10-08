@@ -3,6 +3,7 @@ name = "face-eval"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.99"
+license = "MIT"
 description = "Measures face-recognition accuracy on the board: sends dataset images to the eval firmware and reports FAR/FRR"
 
 [dependencies]
