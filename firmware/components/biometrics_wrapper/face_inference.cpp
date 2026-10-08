@@ -12,7 +12,8 @@
 //
 // The model setup below (pre/post-processing parameters, the two-stage MSR -> MNP flow) is
 // adapted from Espressif's human_face_detect 0.4.2 and human_face_recognition 0.3.2 components
-// (MIT licence, https://github.com/espressif/esp-dl/tree/master/models). Those components load
+// (MIT licence, https://github.com/espressif/esp-dl/tree/master/models; Espressif's copyright and
+// licence notice is in THIRD-PARTY-NOTICES.md at the repository root). Those components load
 // from fixed partition labels that only an ESP-IDF partition table can provide, which the
 // esp-idf-sys build does not use; constructing the models here lets us choose the labels.
 //
