@@ -7,6 +7,19 @@ updated in the field without reflashing firmware**, the way production edge-AI p
 Each milestone is delivered as **one self-contained pull request**, so it can be read and reviewed
 on its own.
 
+## Where It Stands (2026-10-07)
+
+- **Target state:** a stand-alone device that recognises an enrolled person, greets them by name
+  and holds a spoken conversation through a remote voice agent over Wi-Fi, with face models that
+  can be updated in the field without reflashing.
+- **Done:** Foundation, M0, M1, M2, M3a, M3b, the on-board accuracy evaluation, M4a and M4b. The
+  device detects, enrolls and recognises faces on its own; models are signed and live in A/B
+  slots.
+- **Next:** M6, in its five steps, starting with Wi-Fi.
+- **Parked:** M4d and M5, which need the network connection M6a brings.
+- **Dropped:** M4c (template sync) and Ethernet. Enrollment stays on the device, and the board
+  will use the on-board ESP32-C6 for Wi-Fi.
+
 ---
 
 ## Ground Rules for Every Milestone PR
@@ -66,7 +79,7 @@ Five principles drive the design below:
 
 ## Milestones
 
-Status: ✅ done · 🚧 in progress · ⬜ planned
+Status: ✅ done · 🚧 in progress · ⬜ planned · ⏸ parked · ✖ dropped
 
 ### ✅ Foundation (PR #6, #7)
 
@@ -265,8 +278,9 @@ match threshold and to compare feature models before M4 fixes slot sizes.
 
 ### M4: Operating a Fleet
 
-Four PRs, in this order. The device stays the place where people are enrolled; a server keeps
-the durable copy of the templates and distributes them and new models.
+Planned as four PRs. M4a and M4b are done. M4c was dropped: the device stays the only place
+where people are enrolled and where their templates live. M4d is parked until the device has a
+network connection (M6a).
 
 #### ✅ M4a: Signed Models and the Trust Model
 
@@ -318,7 +332,10 @@ A hash shows a model image is intact; a signature shows who published it.
   conversion, enrollment or deletion (the recovery paths are by construction, not provoked).
 - Two templates per member fit the 256 KB partition; voice templates will need a larger one.
 
-#### ⬜ M4c: Template Sync
+#### ✖ M4c: Template Sync (dropped)
+
+Dropped on 2026-10-04: templates stay on the device that enrolled them, so there is no server
+copy to keep in step. The design is kept here for reference.
 
 - The device uploads what it enrolled and downloads what other devices enrolled, over TLS with
   a pinned server certificate and a per-device credential.
@@ -331,7 +348,9 @@ A hash shows a model image is intact; a signature shows who published it.
 **Validation:** host tests for the sync logic; end-to-end against the local server, including an
 interrupted sync and two devices' worth of changes.
 
-#### ⬜ M4d: Remote Model Updates and Template Migration
+#### ⏸ M4d: Remote Model Updates and Template Migration (parked)
+
+Needs a network connection (M6a). Not started.
 
 - Download a signed model image to the standby slot, resumable after an interruption, then the
   M3b activation flow. Reject an image older than the one in use.
@@ -350,9 +369,10 @@ enrolled one.
 Measured ahead of this work on the board: a second copy of the feature model costs 2.1 MB of
 PSRAM (11.3 MB remain) and one extra run is 176 ms; the camera rate was unaffected.
 
-### ⬜ M5: Telemetry & Model Monitoring
+### ⏸ M5: Telemetry & Model Monitoring (parked)
 
-Know whether the model is working in the field.
+Know whether the model is working in the field. Needs a network connection (M6a) and a place to
+report to; not started.
 
 - Report inference latency, match-score distributions, and enroll/match/reject counts.
 - No biometric data in telemetry.
@@ -362,9 +382,66 @@ Know whether the model is working in the field.
 - Host tests for metric aggregation.
 - On-board reporting to the device-management server.
 
+### ⬜ M6: Voice Agent over Wi-Fi
+
+A face match starts a spoken exchange: first a greeting, then a conversation with a remote
+speech-to-speech agent. Five PRs, in this order.
+
+#### ⬜ M6a: Wi-Fi through the ESP32-C6
+
+The P4 has no radio; the board's ESP32-C6 provides Wi-Fi over SDIO.
+
+- `esp_wifi_remote` + `esp_hosted` on the P4 (SDIO: CLK 18, CMD 19, D0–D3 14–17, reset 54).
+- Credentials entered on the touch panel and kept in NVS; never in the repository.
+- Reconnect after a drop; connection status on the screen.
+- Remove the Ethernet bring-up and its pins.
+- `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`: with TLS buffers in internal RAM the link stalled.
+
+Measured in a spike (not merged): joined a WPA2 network in 4 s, HTTPS request about 0.6 s, 2 MB
+download at 1.9 Mbit/s, no disconnect in 6 rounds; about 75 KB of internal RAM free with Wi-Fi
+up; firmware 4.11 MB of the 5.24 MB slot.
+
+**Validation:** on the board, join, lose and regain the network; a TLS request; camera and
+inference rates with Wi-Fi up compared with the figures in the README.
+
+**Known limits going in:** internal RAM is tight; the credentials are stored unencrypted, like
+the templates; the inactivity timer puts the device into deep sleep after 180 s.
+
+#### ⬜ M6b: Audio Path
+
+- A consumer for the microphone queue (today it is captured and only its level is logged).
+- Playback of audio that arrives as a stream, without blocking the state machine (today's match
+  chime is synthesised and played from the main thread).
+
+**Validation:** host tests for the buffering logic in `biometric-core`; on the board, a
+recorded-and-played-back loop.
+
+#### ⬜ M6c: Spoken Greeting
+
+"Welcome, [name]" on a match, with a remote voice. One request, one reply, no conversation yet.
+
+**Validation:** on the board, time from match to first sound; behaviour without a network.
+
+#### ⬜ M6d: Conversation
+
+A speech-to-speech session started by a face match and ended by silence, a time limit or the
+person leaving the camera's view.
+
+**Validation:** on the board, a full exchange; camera and inference rates during a session.
+
+#### ⬜ M6e: Hardening
+
+Reconnects in the middle of a session, hard limits on session length and cost, and the handling
+of the API key.
+
+**Open decisions for M6:**
+- The provider: a speech-to-speech API, or a cheaper chain of speech-to-text, a small text model
+  and text-to-speech.
+- Where the API key lives: on the device with a spending cap, or behind a relay server.
+
 ### Out of Scope (for now)
 
-- On-device voice recognition: `tools/enroll_user.py` computes speaker embeddings on the host only.
+- Recognising people by voice.
+- Template sync between devices (M4c) and Ethernet.
 - ESP-IDF 6.x: wait for mature `esp-idf-sys` support. 6.0 removes the legacy I2C driver, moves Ethernet
   PHY drivers out of IDF, and changes the DSI 2D-DMA API.
-- The occasional white/cyan display flashes: suspected cable or power; tracked as an issue.
