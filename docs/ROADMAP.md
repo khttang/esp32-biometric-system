@@ -15,8 +15,6 @@ on its own.
 - **Done:** Foundation, M0, M1, M2, M3a, M3b, the on-board accuracy evaluation, M4a and M4b. The
   device detects, enrolls and recognises faces on its own; models are signed and live in A/B
   slots.
-- **In review:** the code-review fixes (PR #23), the explicit LVGL try-lock (PR #24) and two
-  sensor buffers with the measurements (PR #25).
 - **Next:** M6, in its five steps, starting with Wi-Fi.
 - **Parked:** M4d and M5, which need the network connection M6a brings.
 - **Dropped:** M4c (template sync) and Ethernet. Enrollment stays on the device, and the board

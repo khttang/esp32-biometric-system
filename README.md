@@ -116,7 +116,6 @@ Known issues:
 - **Core 1 is not exclusively the vision pipeline.** The touch poller is pinned to it at a priority above the inference thread, and the audio-capture and inactivity threads are unpinned, so they can run there too ([Thread Model](#thread-model)).
 - The inference thread waits up to 10 ms for the LVGL lock to draw the face boxes; only the camera thread never waits for it.
 - Unused today: the 1 MB `storage` partition, the `p4_perform_ota_update` function (nothing calls it) and the Ethernet driver.
-- Enrollment, deletion through the touch panel and a golden run have not been re-tested on the builds of the open pull requests (#23–#25); the pipeline, detection and matching were.
 
 ### Plan to the Target State
 
