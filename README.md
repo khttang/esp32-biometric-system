@@ -55,6 +55,16 @@ Where the embedded-systems work in this repository is, with the section that doc
   aligned to the 128-byte cache line, as its DMA output requires. Buffer ownership and lifetimes
   are expressed in Rust types (`firmware/src/ppa.rs`, `camera.rs`).
 
+**Instrumentation and measurement**
+- Each pipeline thread accumulates its own timings and prints one summary line every 10 seconds,
+  with no allocation and nothing shared between threads
+  ([Built-in Instrumentation](#built-in-instrumentation)).
+- Design choices are made from those lines and recorded with the numbers: the detector image
+  source (95 ms → 19 ms), two sensor buffers instead of three, the LVGL try-lock (1 preview
+  update skipped in about 480).
+- Recognition accuracy is measured on the board itself, by sending a public dataset through the
+  same models over the serial port ([Measuring Accuracy on the Board](#measuring-accuracy-on-the-board)).
+
 **Register-level and hardware bring-up**
 - RISC-V assembly in the interrupt entry and exit paths reads and writes the CPU's
   hardware-loop and vector-extension control registers (CSRs). It runs from IRAM and is attached
@@ -607,6 +617,35 @@ interrupted capture resumes where it stopped.
 - The smallest false accept rate that can be measured is one over the number of impostor pairs.
 - The `eval` feature is for the bench: it accepts images from anyone on the serial port. Never
   flash it on a deployed device.
+
+### Built-in Instrumentation
+
+The firmware reports on itself over the serial log; no debugger or external probe is attached.
+This is local logging. Reporting from devices in the field is a later milestone (M5) and is not
+implemented.
+
+| What | Reported | Where |
+|---|---|---|
+| Camera loop | Frames per second; preview and detector PPA time (average, longest); canvas-swap time; preview updates skipped because LVGL was busy | `pipeline.rs`, every 10 s |
+| Inference loop | Inferences per second; detection and embedding time (average, longest); frames with a face; lowest, average and highest similarity to the closest template, next to the threshold | `pipeline.rs`, every 10 s |
+| Inference stack | Bytes of the 32 KB stack never used, after the deepest call path has run | `pipeline.rs`, once |
+| Microphone | Peak and RMS level | `audio_worker.rs`, every 10 s |
+| Model activation | Duration and result of each golden run | `models.rs`, when a new image is tried |
+
+```text
+[Pipeline] camera 9.9 fps over 10s | preview PPA avg 79.2 ms max 105.7 ms | detector PPA n=49 avg 18.7 ms max 19.2 ms | present avg 0.1 ms max 0.1 ms, 0 of 99 skipped (LVGL busy)
+[Pipeline] inference 4.7/s over 10s | detect avg 35.0 ms max 42.9 ms | embed n=11 avg 168.5 ms max 173.5 ms | frames with faces 11 | closest template n=11 min 0.42 avg 0.49 max 0.64 (threshold 0.5)
+```
+
+- **Cheap enough to leave on.** A sample is a counter, a sum and a maximum, kept in a local
+  variable of the thread that measures it (`LatencyStats`, `ScoreStats` and `AudioLevel` in
+  `crates/biometric-core/src/stats.rs`, with host unit tests). Nothing is allocated or locked per
+  frame.
+- **Used for tuning.** The similarity figures are what a threshold change is judged by, and the
+  timing figures are how every entry in the tables below was obtained.
+- **Used for debugging.** The skipped-update count showed how often the camera thread meets a
+  busy LVGL lock, and comparing model output bit for bit across runs is what exposed the
+  hardware-loop erratum.
 
 ### Measured Performance (ESP32-P4 rev 1.3, 360 MHz)
 
