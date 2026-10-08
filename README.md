@@ -745,4 +745,6 @@ cargo clippy --release --features eval -- -D warnings          # the evaluation 
 
 ## License
 
-Internal proprietary firmware developed for the ESP32-P4 Biometric Hardware Agent system.
+MIT; see [LICENSE](LICENSE). Notices for adapted third-party code are in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Model weights and the evaluation dataset are
+downloaded by the scripts in `tools/` and are not part of this repository.
