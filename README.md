@@ -211,7 +211,7 @@ by a key it trusts.
 - **How devices get keys:** the public keys are listed in `firmware/trusted-model-keys.txt` and
   compiled into the firmware. A device trusts exactly the keys of the firmware it runs.
 - **Building for your own devices:** run `keygen`, replace the key in `trusted-model-keys.txt`
-  with yours, then build the firmware and run `tools/face-models.sh all`. Images signed with the
+  with yours, then build the firmware and run `tools/face-models.sh all a`. Images signed with the
   key committed here can only be produced by this project's maintainer.
 - **Rotating a key:** add the new public key, release firmware, re-sign the models with the new
   key, and remove the old key in a later firmware release. Several keys can be trusted at once.
@@ -298,9 +298,14 @@ Updating models:
 tools/face-models.sh fetch      # download Espressif's pinned releases, check their SHA-256, extract
 tools/face-models.sh pack  b    # build models/face_*_b.bin partition images (model-packer)
 tools/face-models.sh flash b    # espflash write-bin each image at its partition offset
-tools/face-models.sh all        # all three steps; the slot defaults to a
+tools/face-models.sh all   a    # all three steps, for a new or erased board
 tools/face-models.sh keygen     # once: create the signing key, print its public key
 ```
+
+The slot is always given; there is no default. On a board that already runs a model, write to
+the slot that is not in use: the boot log says `[Models] msr: using slot A` (likewise for `mnp`
+and `feat`). An image written over the slot in use is loaded without a golden run and leaves
+nothing to fall back to.
 
 To publish a model of your own, get its golden from a device: pack it without `--golden`
 (`NO_GOLDEN=1` with the script), write it to the standby slot, and boot. The log shows
@@ -712,7 +717,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 cd firmware
 cargo build --release          # first build downloads ESP-IDF + tools (needs network, takes a while)
 cargo run --release            # build, flash (espflash, partitions.csv) and open the serial monitor
-../tools/face-models.sh all     # first time, or after a model change: write the face models
+../tools/face-models.sh all a   # first time (new or erased board): write the face models to slot a
 cargo fmt --check && cargo clippy --release -- -D warnings   # same checks as CI
 cargo clippy --release --features eval -- -D warnings          # the evaluation build, also in CI
 ```
@@ -738,7 +743,7 @@ cargo clippy --release --features eval -- -D warnings          # the evaluation 
 - **Models** are written separately from the firmware (see [Model Partitions](#model-partitions)).
   A board without models boots normally: the preview runs and the log says which models are missing.
 - **After changing `partitions.csv`**, erase the chip once: `espflash erase-flash`, then
-  `cargo run --release` and `tools/face-models.sh all`. Stale data from the old layout can
+  `cargo run --release` and `tools/face-models.sh all a`. Stale data from the old layout can
   otherwise be misread. Erasing the chip also erases the enrolled templates.
 
 ---
