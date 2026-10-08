@@ -19,19 +19,20 @@
 //! the detector downscale when someone will consume it.
 
 use std::ffi::CStr;
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::mem;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
 use biometric_core::contract::{
     DETECTOR_FORMAT, DETECTOR_HEIGHT, DETECTOR_WIDTH, EMBEDDING_DIM, FEATURE_MODEL, MNP_MODEL,
     MSR_MODEL,
 };
 use biometric_core::enrollment::Enrollment;
-use biometric_core::geometry::{fit_rect, map_rect};
+use biometric_core::geometry::{fit_rect, image_len, map_rect, ImageRef, PixelFormat, Rect};
 use biometric_core::matching::{closest, GroupMember, Modality, MATCH_THRESHOLD};
 use biometric_core::stats::{LatencyStats, ScoreStats};
 use esp_idf_svc::hal::cpu::Core;
@@ -42,14 +43,14 @@ use log::{error, info, warn};
 use crate::camera::Camera;
 use crate::ffi;
 use crate::models::ModelStore;
-use crate::ppa::{image_len, DmaBuf, ImageRef, PixelFormat, Ppa, Rect, Target};
+use crate::ppa::{DmaBuf, Ppa, Target};
 
-// Sensor stream; must match VideoConfig::SENSOR_* in biometrics_wrapper.cpp
-const SENSOR_W: u32 = 1280;
-const SENSOR_H: u32 = 960;
-// Camera canvas (the image area only, centred by the UI); must match VideoConfig::VIEWPORT_*
-const VIEW_W: u32 = 640;
-const VIEW_H: u32 = 480;
+// Sensor stream and camera canvas (the image area only, centred by the UI). Defined once, in
+// biometrics_wrapper.h, for both sides.
+const SENSOR_W: u32 = ffi::P4_SENSOR_WIDTH;
+const SENSOR_H: u32 = ffi::P4_SENSOR_HEIGHT;
+const VIEW_W: u32 = ffi::P4_VIEWPORT_WIDTH;
+const VIEW_H: u32 = ffi::P4_VIEWPORT_HEIGHT;
 
 /// Max time the camera thread waits for LVGL before skipping one preview update.
 const PRESENT_LOCK_TIMEOUT_MS: u32 = 5;
@@ -120,7 +121,7 @@ pub fn spawn(members: Arc<Roster>, nvs: EspDefaultNvsPartition) -> Result<Vision
     let detector_buf = DmaBuf::new(image_len(DETECTOR_WIDTH, DETECTOR_HEIGHT, DETECTOR_FORMAT))
         .context("failed to allocate detector buffer")?;
     request_tx
-        .send(detector_buf)
+        .try_send(detector_buf)
         .map_err(|_| anyhow!("request channel closed"))?; // first request
 
     spawn_on_core1(c"cam_pipeline", 8 * 1024, 6, move || {
@@ -154,17 +155,6 @@ where
     Ok(())
 }
 
-/// Points the preview canvas back at C's own buffer when the camera thread exits,
-/// so LVGL never renders from a freed preview buffer.
-struct PreviewGuard;
-
-impl Drop for PreviewGuard {
-    fn drop(&mut self) {
-        // Safety: NULL restores the C-owned canvas buffer; 0 = wait for the LVGL lock.
-        unsafe { ffi::p4_ui_present_camera(core::ptr::null(), 0) };
-    }
-}
-
 fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSender<DmaBuf>) {
     let mut ppa = match Ppa::new() {
         Ok(ppa) => ppa,
@@ -174,11 +164,10 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
     let (Some(a), Some(b)) = (DmaBuf::new(view_len), DmaBuf::new(view_len)) else {
         return error!("[Pipeline] failed to allocate preview buffers");
     };
-    // LVGL renders from the presented buffer while we fill the other one.
+    // LVGL renders from the presented buffer while we fill the other one. This thread never
+    // exits once the loop below starts, so the buffers live as long as LVGL may read them.
     let mut previews = [a, b];
     let mut back = 0;
-    // Declared after `previews` so it drops first.
-    let _guard = PreviewGuard;
 
     // Whole sensor frame, unstretched, scaled into the 4:3 canvas: 1280×960 → 640×480. The UI
     // centres the canvas in the left column; the bars are the black screen background.
@@ -190,17 +179,24 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
     let mut detector_ppa = LatencyStats::default();
     let mut frames_in_window = 0u32;
     let mut window_start = Instant::now();
+    let mut capture_failures = 0u32;
 
     info!("[Pipeline] camera thread running on core 1");
     loop {
         let frame = match camera.next_frame() {
             Ok(frame) => frame,
-            Err(e) => {
-                warn!("[Pipeline] {e}");
+            Err(code) => {
+                // The first failure in a row and then every hundredth: a dead stream fails a
+                // hundred times a second.
+                if capture_failures.is_multiple_of(100) {
+                    warn!("[Pipeline] camera capture failed: {code}");
+                }
+                capture_failures = capture_failures.wrapping_add(1);
                 thread::sleep(Duration::from_millis(10));
                 continue;
             }
         };
+        capture_failures = 0;
         frames_in_window += 1;
         let image = frame.image();
 
@@ -233,23 +229,28 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
                 height: VIEW_H,
                 format: PixelFormat::Rgb565,
             };
-            let detector = Target::full(
-                &mut detector_buf,
-                DETECTOR_WIDTH,
-                DETECTOR_HEIGHT,
-                DETECTOR_FORMAT,
-            );
+            let detector = Target {
+                buf: &mut detector_buf,
+                width: DETECTOR_WIDTH,
+                height: DETECTOR_HEIGHT,
+                rect: Rect::full(DETECTOR_WIDTH, DETECTOR_HEIGHT),
+                format: DETECTOR_FORMAT,
+            };
             let ppa_started = Instant::now();
             let result = ppa.scale_crop(preview_image, view_rect, detector);
             detector_ppa.record(ppa_started.elapsed());
             match result {
-                Ok(()) => {
-                    if frames.send(detector_buf).is_err() {
+                Ok(()) => match frames.try_send(detector_buf) {
+                    Ok(()) => {}
+                    // Cannot happen while a single detector buffer circulates; if it ever
+                    // does, offer the image again on the next frame instead of waiting.
+                    Err(TrySendError::Full(detector_buf)) => pending_request = Some(detector_buf),
+                    Err(TrySendError::Disconnected(_)) => {
                         // Keep the preview running even if inference is unavailable.
                         warn!("[Pipeline] inference thread gone; preview continues without it");
                         inference_running = false;
                     }
-                }
+                },
                 Err(e) => {
                     warn!("[Pipeline] detector PPA failed: {e}");
                     pending_request = Some(detector_buf); // retry on the next frame
@@ -273,8 +274,8 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
             log_camera_stats(
                 frames_in_window,
                 window_start.elapsed(),
-                preview_ppa.take(),
-                detector_ppa.take(),
+                mem::take(&mut preview_ppa),
+                mem::take(&mut detector_ppa),
             );
             frames_in_window = 0;
             window_start = Instant::now();
@@ -372,7 +373,9 @@ fn inference_loop(
     let mut detect_stats = LatencyStats::default();
     let mut embed_stats = LatencyStats::default();
     let mut score_stats = ScoreStats::default();
-    let mut enrollment: Option<Enrollment<EMBEDDING_DIM>> = None;
+    let mut enrollment: Option<Enrollment> = None;
+    // A finished template the event queue had no room for; offered again on every frame.
+    let mut pending_capture: Option<InferenceEvent> = None;
     let mut frames_with_faces = 0u32;
     let mut last_stats_log = Instant::now();
     let mut stack_reported = false;
@@ -383,6 +386,8 @@ fn inference_loop(
         let image = detector_buf.as_slice();
 
         while let Ok(command) = commands.try_recv() {
+            // Either command ends the enrollment a pending template belongs to.
+            pending_capture = None;
             enrollment = match command {
                 Command::StartEnroll if model_version.is_some() => Some(Enrollment::new()),
                 Command::StartEnroll => {
@@ -397,8 +402,8 @@ fn inference_loop(
 
         let face_count = match detect(image, &mut faces) {
             Ok(n) => n,
-            Err(e) => {
-                warn!("[Pipeline] {e}");
+            Err(code) => {
+                warn!("[Pipeline] p4_face_detect failed: {code}");
                 0
             }
         };
@@ -423,8 +428,8 @@ fn inference_loop(
                 let embed_started = Instant::now();
                 let result = embed(image, face, &mut embedding);
                 embed_stats.record(embed_started.elapsed());
-                if let Err(e) = result {
-                    warn!("[Pipeline] {e}");
+                if let Err(code) = result {
+                    warn!("[Pipeline] p4_face_embed failed: {code}");
                     continue;
                 }
                 if !stack_reported {
@@ -433,13 +438,13 @@ fn inference_loop(
                 }
                 if let Some(session) = &mut enrollment {
                     if let Some(event) = enroll_sample(session, &embedding, version) {
-                        let finished = matches!(event, InferenceEvent::EnrollCaptured { .. });
-                        // The main thread is waiting for these, so the queue has room.
-                        if events.send(event).is_err() {
-                            return warn!("[Pipeline] main thread gone; inference exiting");
-                        }
-                        if finished {
+                        if matches!(event, InferenceEvent::EnrollCaptured { .. }) {
+                            // Must not be lost: sent below, and again later if the queue is full.
                             enrollment = None;
+                            pending_capture = Some(event);
+                        } else {
+                            // Progress is only shown; a dropped update does no harm.
+                            let _ = events.try_send(event);
                         }
                     }
                     continue;
@@ -458,11 +463,21 @@ fn inference_loop(
             }
         }
 
+        if let Some(event) = pending_capture.take() {
+            match events.try_send(event) {
+                Ok(()) => {}
+                Err(TrySendError::Full(event)) => pending_capture = Some(event),
+                Err(TrySendError::Disconnected(_)) => {
+                    return warn!("[Pipeline] main thread gone; inference exiting");
+                }
+            }
+        }
+
         if last_stats_log.elapsed() >= STATS_LOG_INTERVAL {
             log_stats(
-                detect_stats.take(),
-                embed_stats.take(),
-                score_stats.take(),
+                mem::take(&mut detect_stats),
+                mem::take(&mut embed_stats),
+                mem::take(&mut score_stats),
                 frames_with_faces,
                 last_stats_log.elapsed(),
             );
@@ -474,8 +489,13 @@ fn inference_loop(
         if let Some(remaining) = MIN_INFERENCE_INTERVAL.checked_sub(started.elapsed()) {
             thread::sleep(remaining);
         }
-        if requests.send(detector_buf).is_err() {
-            break;
+        match requests.try_send(detector_buf) {
+            Ok(()) => {}
+            Err(TrySendError::Disconnected(_)) => break,
+            Err(TrySendError::Full(_)) => {
+                // Only one detector buffer exists, so the queue of one cannot be occupied.
+                return error!("[Pipeline] request queue full; inference thread exiting");
+            }
         }
     }
     warn!("[Pipeline] camera thread gone; inference thread exiting");
@@ -483,7 +503,7 @@ fn inference_loop(
 
 /// Feeds one live embedding to a running enrollment; returns the event to report, if any.
 fn enroll_sample(
-    session: &mut Enrollment<EMBEDDING_DIM>,
+    session: &mut Enrollment,
     embedding: &[f32; EMBEDDING_DIM],
     model_version: &Arc<str>,
 ) -> Option<InferenceEvent> {
@@ -517,8 +537,9 @@ fn log_stale_templates(members: &[Arc<GroupMember>], model_version: &str) {
     }
 }
 
-/// Runs the face detector on the RGB888 detector image; returns the number of faces written.
-fn detect(image: &[u8], faces: &mut [ffi::p4_face_t; MAX_FACES]) -> Result<usize> {
+/// Runs the face detector on the RGB888 detector image; returns the number of faces written,
+/// or the C error code.
+fn detect(image: &[u8], faces: &mut [ffi::p4_face_t; MAX_FACES]) -> Result<usize, i32> {
     debug_assert!(image.len() >= image_len(DETECTOR_WIDTH, DETECTOR_HEIGHT, DETECTOR_FORMAT));
     let mut count = 0usize;
     // Safety: `image` holds a full detector frame; `faces` has MAX_FACES slots.
@@ -532,12 +553,14 @@ fn detect(image: &[u8], faces: &mut [ffi::p4_face_t; MAX_FACES]) -> Result<usize
             &mut count,
         )
     };
-    ensure!(ret == 0, "p4_face_detect failed: {ret}");
+    if ret != 0 {
+        return Err(ret);
+    }
     Ok(count.min(faces.len()))
 }
 
-/// Aligns `face` and writes its L2-normalised embedding.
-fn embed(image: &[u8], face: &ffi::p4_face_t, out: &mut [f32; EMBEDDING_DIM]) -> Result<()> {
+/// Aligns `face` and writes its L2-normalised embedding; the error is the C error code.
+fn embed(image: &[u8], face: &ffi::p4_face_t, out: &mut [f32; EMBEDDING_DIM]) -> Result<(), i32> {
     // Safety: `image` holds a full detector frame; `out` has EMBEDDING_DIM floats, which was
     // checked against the loaded model at startup.
     let ret = unsafe {
@@ -550,7 +573,9 @@ fn embed(image: &[u8], face: &ffi::p4_face_t, out: &mut [f32; EMBEDDING_DIM]) ->
             out.len(),
         )
     };
-    ensure!(ret == 0, "p4_face_embed failed: {ret}");
+    if ret != 0 {
+        return Err(ret);
+    }
     Ok(())
 }
 

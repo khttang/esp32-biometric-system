@@ -47,10 +47,6 @@ esp-idf-svc = { version = "0.53.0", features = ["alloc", "std", "critical-sectio
 arc-swap = "1.9.2"
 biometric-core = { path = "../crates/biometric-core" }
 
-# --- Serialization for Biometric Templates & Config ---
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-
 # -----------------------------------------------------------------------------
 # ESP-IDF System & Component Manager Metadata
 # -----------------------------------------------------------------------------

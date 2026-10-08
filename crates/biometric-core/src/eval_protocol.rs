@@ -22,11 +22,12 @@
 
 use core::fmt::Write as _;
 
-use crate::contract::{DETECTOR_HEIGHT, DETECTOR_WIDTH};
+use crate::contract::{DETECTOR_FORMAT, DETECTOR_HEIGHT, DETECTOR_WIDTH};
+use crate::geometry::image_len;
 
 pub const REQUEST_MAGIC: [u8; 4] = *b"EVQ1";
 pub const REQUEST_HEADER_LEN: usize = 16;
-pub const RESPONSE_PREFIX: &str = "EVR ";
+const RESPONSE_PREFIX: &str = "EVR ";
 /// Printed by the board at the console's boot baud rate ([`CONSOLE_BAUD`]) once the models are
 /// loaded, followed by ` baud=<rate> models=<n>`; both sides then switch to that rate.
 pub const READY_PREFIX: &str = "EVAL READY";
@@ -36,7 +37,6 @@ pub const MODEL_PREFIX: &str = "EVAL MODEL";
 pub const CONSOLE_BAUD: u32 = 115_200;
 /// Baud rate of the image transfer.
 pub const TRANSFER_BAUD: u32 = 921_600;
-pub const BYTES_PER_PIXEL: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolError {
@@ -91,7 +91,7 @@ impl Request {
         if w == 0 || h == 0 || w > DETECTOR_WIDTH || h > DETECTOR_HEIGHT {
             return Err(ProtocolError::BadDimensions);
         }
-        Ok(w as usize * h as usize * BYTES_PER_PIXEL)
+        Ok(image_len(w, h, DETECTOR_FORMAT))
     }
 
     pub fn encode(&self) -> Result<[u8; REQUEST_HEADER_LEN], ProtocolError> {

@@ -21,6 +21,8 @@ impl Speaker {
         Self::generate_sine_wave(880.0, 0.15, &mut chime_pcm); // A5
         Self::generate_sine_wave(1760.0, 0.25, &mut chime_pcm); // A6
 
+        // Safety: `chime_pcm` is valid for `chime_pcm.len()` samples for the duration of the
+        // call; the C side only reads it.
         let ret = unsafe {
             ffi::write_i2s_tx_c(
                 self.i2s_port,
@@ -43,7 +45,7 @@ impl Speaker {
 
         for i in 0..total_samples {
             let t = i as f32 / AUDIO_SAMPLE_RATE as f32;
-            let envelope = 1.0 - (i as f32 / total_samples as f32); // Exponential decay
+            let envelope = 1.0 - (i as f32 / total_samples as f32); // Linear fade-out
             let val = (amplitude * envelope * (2.0 * PI * freq_hz * t).sin()) as i16;
             output.push(val); // Mono PCM sample
         }

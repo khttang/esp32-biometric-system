@@ -6,7 +6,8 @@
 
 use core::fmt;
 
-use crate::matching::{cosine_similarity, GroupMember, Modality, MATCH_THRESHOLD};
+use crate::contract::EMBEDDING_DIM;
+use crate::matching::{dot, is_normalised, GroupMember, Modality};
 use crate::template::MAX_NAME_LEN;
 
 /// Embeddings averaged into one template.
@@ -15,8 +16,10 @@ pub const ENROLL_SAMPLES: u8 = 5;
 /// Members the device stores; bounds flash use and the per-frame matching cost.
 pub const MAX_MEMBERS: usize = 32;
 
-/// Tolerance on a sample's squared length; the feature model emits L2-normalised vectors.
-const UNIT_NORM_TOLERANCE: f32 = 0.05;
+/// Cosine similarity a sample must reach to the mean of the samples collected before it.
+/// Separate from [`crate::matching::MATCH_THRESHOLD`]: that one decides who a live face is,
+/// this one whether the samples of an enrollment show the same face.
+const CONSISTENCY_THRESHOLD: f32 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SampleError {
@@ -35,7 +38,8 @@ impl fmt::Display for SampleError {
             Self::NotNormalised => write!(f, "sample is not a finite unit vector"),
             Self::Inconsistent { similarity } => write!(
                 f,
-                "sample similarity {similarity:.2} to earlier samples is below {MATCH_THRESHOLD}"
+                "sample similarity {similarity:.2} to earlier samples is below \
+                 {CONSISTENCY_THRESHOLD}"
             ),
         }
     }
@@ -46,49 +50,36 @@ impl std::error::Error for SampleError {}
 /// Accumulates the samples of one enrollment. Holds no heap memory, so the inference thread
 /// can keep one on its stack.
 #[derive(Debug, Clone)]
-pub struct Enrollment<const N: usize> {
-    sum: [f32; N],
+pub struct Enrollment {
+    sum: [f32; EMBEDDING_DIM],
     collected: u8,
 }
 
-impl<const N: usize> Default for Enrollment<N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<const N: usize> Enrollment<N> {
+impl Enrollment {
     pub const fn new() -> Self {
         Self {
-            sum: [0.0; N],
+            sum: [0.0; EMBEDDING_DIM],
             collected: 0,
         }
     }
 
-    /// Samples accepted so far.
-    pub fn collected(&self) -> u8 {
-        self.collected
-    }
-
-    pub fn is_complete(&self) -> bool {
+    fn is_complete(&self) -> bool {
         self.collected >= ENROLL_SAMPLES
     }
 
     /// Adds one live embedding; returns the number of samples collected so far. A rejected
     /// sample leaves the session unchanged.
-    pub fn add(&mut self, sample: &[f32; N]) -> Result<u8, SampleError> {
+    pub fn add(&mut self, sample: &[f32; EMBEDDING_DIM]) -> Result<u8, SampleError> {
         if self.is_complete() {
             return Err(SampleError::Complete);
         }
-        let norm_sq = cosine_similarity(sample, sample);
-        if !norm_sq.is_finite() || (norm_sq - 1.0).abs() > UNIT_NORM_TOLERANCE {
+        if !is_normalised(sample) {
             return Err(SampleError::NotNormalised);
         }
         if self.collected > 0 {
             // `sample` is a unit vector, so dividing by the sum's length gives the cosine.
-            let similarity = cosine_similarity(sample, &self.sum) / norm(&self.sum);
-            // Written so that a NaN similarity is rejected too.
-            if !matches!(similarity.partial_cmp(&MATCH_THRESHOLD), Some(o) if o.is_ge()) {
+            let similarity = dot(sample, &self.sum) / norm(&self.sum);
+            if similarity.is_nan() || similarity < CONSISTENCY_THRESHOLD {
                 return Err(SampleError::Inconsistent { similarity });
             }
         }
@@ -110,41 +101,24 @@ impl<const N: usize> Enrollment<N> {
 }
 
 fn norm(v: &[f32]) -> f32 {
-    cosine_similarity(v, v).sqrt()
+    dot(v, v).sqrt()
 }
 
 /// Identifier of the `sequence`-th member enrolled on the device `device_id`, e.g.
-/// `80f1b2d2da2e-0007`. Unique across devices as long as device ids are (see
-/// [`device_id`]), so members enrolled on different devices can be merged by a server.
+/// `80f1b2d2da2e-0007`. The device id is the factory MAC address as lower-case hex, so ids
+/// from different devices never collide.
 pub fn member_id(device_id: &str, sequence: u32) -> String {
     format!("{device_id}-{sequence:04}")
 }
 
-/// A device's identifier in member ids: its factory MAC address as lower-case hex.
-pub fn device_id(mac: &[u8; 6]) -> String {
-    mac.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// The id a member enrolled under template format v1 (`local-0007`) gets on this device.
-/// Ids of any other shape are kept.
-pub fn migrated_member_id(old: &str, device_id: &str) -> String {
-    match old.strip_prefix("local-") {
-        Some(sequence) => format!("{device_id}-{sequence}"),
-        None => old.to_owned(),
-    }
-}
-
-/// Name stored for a member: the entered text without surrounding or control whitespace, cut
-/// to what a template can hold, or `Member <sequence>` if nothing usable was entered.
-pub fn member_name(entered: &str, sequence: u32) -> String {
+/// A name as it is stored: without surrounding or control whitespace, and cut to what a member
+/// record can hold. Empty if nothing usable was entered.
+fn clean_name(entered: &str) -> String {
     let cleaned: String = entered
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let cleaned = cleaned.trim();
-    if cleaned.is_empty() {
-        return format!("Member {sequence}");
-    }
     let mut end = cleaned.len().min(MAX_NAME_LEN);
     while !cleaned.is_char_boundary(end) {
         end -= 1;
@@ -152,23 +126,34 @@ pub fn member_name(entered: &str, sequence: u32) -> String {
     cleaned[..end].trim_end().to_owned()
 }
 
-/// The member a new face template for `model_version` should be added to, instead of
-/// creating a new member: the one whose name is `entered` (ignoring surrounding whitespace)
-/// and who has no face template for that model release yet.
+/// Name stored for a member: the entered text cleaned as it is for every stored name, or
+/// `Member <sequence>` if nothing usable was entered.
+pub fn member_name(entered: &str, sequence: u32) -> String {
+    let name = clean_name(entered);
+    if name.is_empty() {
+        return format!("Member {sequence}");
+    }
+    name
+}
+
+/// Position in `members` of the member a new face template for `model_version` should be
+/// added to, instead of creating a new member: the one whose name is `entered` (cleaned the
+/// way names are stored) and who has no face template for that model release yet.
 ///
 /// This is how a member is enrolled again after a model change: their old template cannot
 /// identify them to the new model, so the admin names them. A member who already has a
 /// template for the model is never chosen, so a name cannot be used to overwrite someone.
-pub fn reenrollment_target<M: AsRef<GroupMember>>(
-    members: &[M],
+/// Names need not be unique; of several members with the same name, the first is chosen.
+pub fn reenrollment_target<'a>(
+    members: impl IntoIterator<Item = &'a GroupMember>,
     entered: &str,
     model_version: &str,
 ) -> Option<usize> {
-    let entered = entered.trim();
+    let entered = clean_name(entered);
     if entered.is_empty() {
         return None;
     }
-    members.iter().map(AsRef::as_ref).position(|member| {
+    members.into_iter().position(|member| {
         member.name == entered && member.template(Modality::Face, model_version).is_none()
     })
 }
@@ -210,12 +195,19 @@ pub fn first_free_slot(used: impl IntoIterator<Item = u8>, capacity: usize) -> O
 mod tests {
     use super::*;
 
-    fn unit(v: [f32; 3]) -> [f32; 3] {
-        let n = norm(&v);
-        v.map(|x| x / n)
+    /// `v` as the first three values of an embedding; the rest is zero.
+    fn wide(v: [f32; 3]) -> [f32; EMBEDDING_DIM] {
+        let mut embedding = [0.0; EMBEDDING_DIM];
+        embedding[..3].copy_from_slice(&v);
+        embedding
     }
 
-    fn complete(samples: &[[f32; 3]]) -> Enrollment<3> {
+    fn unit(v: [f32; 3]) -> [f32; EMBEDDING_DIM] {
+        let n = norm(&v);
+        wide(v.map(|x| x / n))
+    }
+
+    fn complete(samples: &[[f32; EMBEDDING_DIM]]) -> Enrollment {
         let mut session = Enrollment::new();
         for sample in samples {
             session.add(sample).unwrap();
@@ -226,15 +218,13 @@ mod tests {
     #[test]
     fn counts_samples_until_complete() {
         let sample = unit([1.0, 0.2, 0.0]);
-        let mut session = Enrollment::<3>::new();
+        let mut session = Enrollment::new();
         for expected in 1..=ENROLL_SAMPLES {
-            assert!(!session.is_complete());
             assert_eq!(session.template(), None);
             assert_eq!(session.add(&sample), Ok(expected));
         }
-        assert!(session.is_complete());
+        assert!(session.template().is_some());
         assert_eq!(session.add(&sample), Err(SampleError::Complete));
-        assert_eq!(session.collected(), ENROLL_SAMPLES);
     }
 
     #[test]
@@ -247,19 +237,18 @@ mod tests {
         assert!((norm(&template) - 1.0).abs() < 1e-6);
         assert!((template[0] - 1.0).abs() < 1e-6);
         assert!(template[1].abs() < 1e-6);
-        assert_eq!(template[2], 0.0);
+        assert!(template[2..].iter().all(|&v| v == 0.0));
     }
 
     #[test]
     fn rejects_a_different_face_and_keeps_the_session() {
-        let mut session = Enrollment::<3>::new();
+        let mut session = Enrollment::new();
         session.add(&unit([1.0, 0.0, 0.0])).unwrap();
         let other = unit([0.0, 1.0, 0.0]);
         assert_eq!(
             session.add(&other),
             Err(SampleError::Inconsistent { similarity: 0.0 })
         );
-        assert_eq!(session.collected(), 1);
         assert_eq!(session.add(&unit([1.0, 0.1, 0.0])), Ok(2));
     }
 
@@ -269,9 +258,9 @@ mod tests {
         // 0.64) but not of the mean of everything collected so far.
         let at = |degrees: f32| {
             let r = degrees.to_radians();
-            [r.cos(), r.sin(), 0.0]
+            wide([r.cos(), r.sin(), 0.0])
         };
-        let mut session = Enrollment::<3>::new();
+        let mut session = Enrollment::new();
         session.add(&at(0.0)).unwrap();
         session.add(&at(50.0)).unwrap();
         assert!(matches!(
@@ -282,30 +271,22 @@ mod tests {
 
     #[test]
     fn rejects_samples_that_are_not_unit_vectors() {
-        let mut session = Enrollment::<3>::new();
+        let mut session = Enrollment::new();
         for bad in [
             [0.0, 0.0, 0.0],
             [2.0, 0.0, 0.0],
             [f32::NAN, 0.0, 0.0],
             [f32::INFINITY, 0.0, 0.0],
         ] {
-            assert_eq!(session.add(&bad), Err(SampleError::NotNormalised));
+            assert_eq!(session.add(&wide(bad)), Err(SampleError::NotNormalised));
         }
-        assert_eq!(session.collected(), 0);
+        assert_eq!(session.add(&unit([1.0, 0.0, 0.0])), Ok(1));
     }
 
     #[test]
-    fn local_ids_are_zero_padded_and_grow() {
-        let device = device_id(&[0x80, 0xf1, 0xb2, 0xd2, 0xda, 0x2e]);
-        assert_eq!(device, "80f1b2d2da2e");
-        assert_eq!(member_id(&device, 7), "80f1b2d2da2e-0007");
-        assert_eq!(member_id(&device, 123_456), "80f1b2d2da2e-123456");
-        // A migrated id is the one the same sequence number would get today.
-        assert_eq!(
-            migrated_member_id("local-0007", &device),
-            member_id(&device, 7)
-        );
-        assert_eq!(migrated_member_id("Ada_Lovelace", &device), "Ada_Lovelace");
+    fn member_ids_are_zero_padded_and_grow() {
+        assert_eq!(member_id("80f1b2d2da2e", 7), "80f1b2d2da2e-0007");
+        assert_eq!(member_id("80f1b2d2da2e", 123_456), "80f1b2d2da2e-123456");
     }
 
     #[test]
@@ -380,7 +361,26 @@ mod tests {
         assert_eq!(reenrollment_target(&members, "   ", "v1"), None);
         assert_eq!(reenrollment_target(&members, "ada", "v1"), None);
         assert_eq!(reenrollment_target(&members, "Eve", "v1"), None);
-        assert_eq!(reenrollment_target::<GroupMember>(&[], "Ada", "v1"), None);
+        assert_eq!(reenrollment_target(&[], "Ada", "v1"), None);
+    }
+
+    #[test]
+    fn the_entered_name_is_compared_the_way_names_are_stored() {
+        // Stored names are cut to MAX_NAME_LEN and have no control characters.
+        let long = "n".repeat(MAX_NAME_LEN + 10);
+        let members = [person(&member_name(&long, 1), &[]), person("a b", &[])];
+        assert_eq!(reenrollment_target(&members, &long, "v1"), Some(0));
+        assert_eq!(reenrollment_target(&members, "a\tb", "v1"), Some(1));
+    }
+
+    #[test]
+    fn of_members_with_the_same_name_the_first_without_a_template_is_chosen() {
+        let members = [
+            person("Ada", &["v2"]),
+            person("Ada", &[]),
+            person("Ada", &[]),
+        ];
+        assert_eq!(reenrollment_target(&members, "Ada", "v2"), Some(1));
     }
 
     #[test]

@@ -10,15 +10,16 @@ extern "C" {
 #endif
 
 // -----------------------------------------------------------------------------
+// Picture sizes shared with Rust (pipeline.rs reads them through the bindings)
+// -----------------------------------------------------------------------------
+#define P4_SENSOR_WIDTH 1280   // OV5647 stream delivered by the ISP
+#define P4_SENSOR_HEIGHT 960
+#define P4_VIEWPORT_WIDTH 640  // camera canvas on the display: the 4:3 image area
+#define P4_VIEWPORT_HEIGHT 480
+
+// -----------------------------------------------------------------------------
 // Shared Hardware Structures (Must match Rust #[repr(C)] layouts)
 // -----------------------------------------------------------------------------
-typedef struct {
-    uint16_t display_width;
-    uint16_t display_height;
-    uint16_t camera_width;
-    uint16_t camera_height;
-} p4_hardware_config_t;
-
 typedef struct {
     uint8_t *data;
     size_t data_len;
@@ -28,7 +29,7 @@ typedef struct {
 } p4_camera_frame_t;
 
 // System Initialization APIs
-int32_t p4_hardware_init_all(const p4_hardware_config_t *config);
+int32_t p4_hardware_init_all(void);
 int32_t init_display_system(void);
 int32_t init_audio_system(void);
 int32_t init_p4_ethernet(void);

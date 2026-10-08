@@ -101,8 +101,8 @@ namespace BoardPins {
 // -----------------------------------------------------------------------------
 namespace VideoConfig {
     // OV5647 Native Sensor Stream Dimensions (DO NOT CHANGE FROM 960)
-    constexpr uint16_t SENSOR_WIDTH   = 1280;
-    constexpr uint16_t SENSOR_HEIGHT  = 960;
+    constexpr uint16_t SENSOR_WIDTH   = P4_SENSOR_WIDTH;
+    constexpr uint16_t SENSOR_HEIGHT  = P4_SENSOR_HEIGHT;
 
     // Display Geometry (1280x720 Landscape)
     constexpr uint16_t DISPLAY_WIDTH  = 1280;
@@ -112,8 +112,8 @@ namespace VideoConfig {
     // Camera canvas: exactly the 4:3 image area, centred vertically in the 640x720 left column
     // (black screen background above/below). Keeping the canvas to the image means LVGL only
     // re-renders/rotates image pixels when a new frame is presented.
-    constexpr uint16_t VIEWPORT_WIDTH  = 640;
-    constexpr uint16_t VIEWPORT_HEIGHT = 480;
+    constexpr uint16_t VIEWPORT_WIDTH  = P4_VIEWPORT_WIDTH;
+    constexpr uint16_t VIEWPORT_HEIGHT = P4_VIEWPORT_HEIGHT;
     constexpr uint16_t PANEL_WIDTH    = 640; // Right control panel width
     constexpr uint16_t PANEL_HEIGHT   = 720; // Right control panel height
 }
@@ -723,6 +723,7 @@ int32_t p4_camera_init_v4l2(uint16_t width, uint16_t height) {
 
         s_cam_buffers[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, s_video_fd, buf.m.offset);
         if (s_cam_buffers[i].start == MAP_FAILED) return -1;
+        s_cam_buffers[i].length = buf.length;
         if (ioctl(s_video_fd, VIDIOC_QBUF, &buf) < 0) return -1;
     }
 
@@ -752,7 +753,8 @@ int32_t p4_camera_capture_frame(p4_camera_frame_t *frame) {
     }
 
     frame->data = (uint8_t *)s_cam_buffers[buf.index].start;
-    frame->data_len = buf.bytesused;
+    // Never report more than was mapped: Rust builds a slice of this length.
+    frame->data_len = buf.bytesused < s_cam_buffers[buf.index].length ? buf.bytesused : s_cam_buffers[buf.index].length;
     frame->width = VideoConfig::SENSOR_WIDTH;   // Dynamically reads 1280
     frame->height = VideoConfig::SENSOR_HEIGHT; // Reads 720 or 960 from VideoConfig
     frame->buffer_index = buf.index;
@@ -777,11 +779,10 @@ int32_t p4_camera_release_frame(const p4_camera_frame_t *frame) {
     return 0;
 }
 
-int32_t p4_hardware_init_all(const p4_hardware_config_t *config) {
+int32_t p4_hardware_init_all(void) {
     ESP_LOGI(TAG_HW, "Starting Unified Hardware Bring-up...");
 
     if (s_hardware_initialized) return ESP_OK;
-    if (!config) return -1;
 
     esp_err_t ret = init_audio_system();
     if (ret != ESP_OK) return ret;

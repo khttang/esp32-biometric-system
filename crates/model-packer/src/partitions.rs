@@ -139,7 +139,9 @@ storage,  data, spiffs,  0xC60000, 3712K
         use biometric_core::contract::{FEATURE_MODEL, MNP_MODEL, MSR_MODEL};
         // Model partitions are memory-mapped by ESP-DL, which needs 64 KiB alignment.
         for model in [MSR_MODEL, MNP_MODEL, FEATURE_MODEL] {
-            let [a, b] = model.partitions.map(|label| find(csv, label).unwrap());
+            let [a, b] = model
+                .partitions
+                .map(|label| find(csv, label.to_str().unwrap()).unwrap());
             assert_eq!(a.size, b.size, "{} slots differ in size", model.key);
             for p in [a, b] {
                 assert_eq!(

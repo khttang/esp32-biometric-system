@@ -214,7 +214,8 @@ Enroll and recognise people locally, with no server.
 - `biometric-core::activation`: a pure state machine (active slot, verdict on the standby image,
   trial marker) with host tests for activation, rejection, rollback, interrupted trials and the
   NVS record.
-- Manifest format 2 adds `golden_sha256`; format 1 is still read. `model-packer --golden`.
+- Manifest format 2 adds `golden_sha256`. `model-packer --golden`. (Format 1 was read until the
+  code review of 2026-10; it is now rejected, since no signed format 1 image exists.)
 - The golden run feeds the model a fixed pseudo-random input and hashes its output tensors, so
   it works for any model without model-specific test data. The expected digest ships in the
   manifest and is obtained from a device (the firmware logs it for an image without one).
@@ -301,9 +302,10 @@ A hash shows a model image is intact; a signature shows who published it.
   - member ids are `<factory MAC>-<n>`, unique across devices.
 - Enrolling again after a model change: typing an existing member's name adds the template to
   that member, if they have none for the loaded release.
-- Format v1 records are converted at start-up. On the board, three enrolled members were
+- Format v1 records were converted at start-up. On the board, three enrolled members were
   converted, their embedding bytes were unchanged in a flash dump, and a second boot loaded them
-  without converting again.
+  without converting again. The conversion was removed in the code review of 2026-10; a v1
+  record still in flash is now ignored.
 - Storage: the member record is the commit point across the writes of an enrollment or
   deletion; template blobs without a member are removed at start-up.
 

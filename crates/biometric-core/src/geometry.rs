@@ -9,7 +9,7 @@ pub enum PixelFormat {
 }
 
 impl PixelFormat {
-    pub const fn bytes_per_pixel(self) -> usize {
+    const fn bytes_per_pixel(self) -> usize {
         match self {
             Self::Rgb565 => 2,
             Self::Rgb888 => 3,
@@ -55,42 +55,6 @@ impl Rect {
 
     pub const fn full(w: u32, h: u32) -> Self {
         Self { x: 0, y: 0, w, h }
-    }
-
-    /// Intersection with a `width`×`height` image; `None` if nothing is left.
-    pub fn clamp_to(self, width: u32, height: u32) -> Option<Self> {
-        let x = self.x.min(width);
-        let y = self.y.min(height);
-        let w = self.w.min(width - x);
-        let h = self.h.min(height - y);
-        (w > 0 && h > 0).then_some(Self { x, y, w, h })
-    }
-}
-
-/// Largest centered crop of a `src_w`×`src_h` image with the aspect ratio of `dst_w`×`dst_h`.
-///
-/// Used to fill the preview without stretching: e.g. 1280×960 → 640×720 keeps the full
-/// height and crops the width to 853.
-pub fn centered_aspect_crop(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Rect {
-    // Compare aspect ratios without floats: src_w/src_h vs dst_w/dst_h.
-    if u64::from(src_w) * u64::from(dst_h) >= u64::from(dst_w) * u64::from(src_h) {
-        // Source is wider: keep full height, crop width.
-        let w = (u64::from(src_h) * u64::from(dst_w) / u64::from(dst_h)) as u32;
-        Rect {
-            x: (src_w - w) / 2,
-            y: 0,
-            w,
-            h: src_h,
-        }
-    } else {
-        // Source is taller: keep full width, crop height.
-        let h = (u64::from(src_w) * u64::from(dst_h) / u64::from(dst_w)) as u32;
-        Rect {
-            x: 0,
-            y: (src_h - h) / 2,
-            w: src_w,
-            h,
-        }
     }
 }
 
@@ -168,43 +132,6 @@ mod tests {
         assert_eq!(image_len(640, 720, PixelFormat::Rgb565), 921_600);
         assert_eq!(image_len(640, 480, PixelFormat::Rgb888), 921_600);
         assert_eq!(image_len(112, 112, PixelFormat::Rgb888), 37_632);
-    }
-
-    #[test]
-    fn crop_4_3_frame_to_taller_viewport() {
-        // A 1280×960 frame cropped (not letterboxed) to fill a 640×720 area.
-        let crop = centered_aspect_crop(1280, 960, 640, 720);
-        assert_eq!(
-            crop,
-            Rect {
-                x: 213,
-                y: 0,
-                w: 853,
-                h: 960
-            }
-        );
-    }
-
-    #[test]
-    fn centered_crop_on_taller_source_crops_height() {
-        let crop = centered_aspect_crop(720, 1280, 640, 480);
-        assert_eq!(
-            crop,
-            Rect {
-                x: 0,
-                y: 370,
-                w: 720,
-                h: 540
-            }
-        );
-    }
-
-    #[test]
-    fn centered_crop_with_same_aspect_is_identity() {
-        assert_eq!(
-            centered_aspect_crop(1280, 960, 640, 480),
-            Rect::full(1280, 960)
-        );
     }
 
     #[test]
@@ -350,49 +277,6 @@ mod tests {
             }
         );
         assert_eq!(map_rect(Rect::full(640, 480), 640, 480, to), to);
-    }
-
-    #[test]
-    fn clamp_trims_box_hanging_off_the_edge() {
-        let r = Rect {
-            x: 600,
-            y: 450,
-            w: 100,
-            h: 100,
-        };
-        assert_eq!(
-            r.clamp_to(640, 480),
-            Some(Rect {
-                x: 600,
-                y: 450,
-                w: 40,
-                h: 30
-            })
-        );
-    }
-
-    #[test]
-    fn clamp_rejects_box_fully_outside() {
-        assert_eq!(
-            Rect {
-                x: 700,
-                y: 10,
-                w: 20,
-                h: 20
-            }
-            .clamp_to(640, 480),
-            None
-        );
-        assert_eq!(
-            Rect {
-                x: 10,
-                y: 10,
-                w: 0,
-                h: 20
-            }
-            .clamp_to(640, 480),
-            None
-        );
     }
 
     #[test]

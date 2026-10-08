@@ -42,7 +42,7 @@ fn main() -> Result<()> {
     info!("[Boot] Marked running firmware application as valid.");
 
     // 3. Instantiate SystemResources container (InactivityTimer is initialized automatically inside)
-    let mut resources = match SystemResources::builder()?.build() {
+    let mut resources = match SystemResources::new() {
         Ok(res) => {
             crate::power::reset_boot_crash_counter();
             info!("[Boot] SystemResources container allocated.");
@@ -58,10 +58,9 @@ fn main() -> Result<()> {
     info!("[Boot] SystemResources initialized, Hardware drivers & worker threads initialized. Launching state machine loop...");
     loop {
         let admin_pressed = resources.is_admin_pressed();
-        let has_network_update = false; // Check OTA/server flags here
 
         // Advance state machine by one tick
-        biometric_system.tick(&mut resources, admin_pressed, has_network_update);
+        biometric_system.tick(&mut resources, admin_pressed);
 
         // Yield CPU 0 and feed FreeRTOS watchdog (~60 FPS)
         FreeRtos::delay_ms(16);
