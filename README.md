@@ -18,6 +18,55 @@ LVGL, the V4L2 camera ioctls, panel bring-up and ESP-DL inference.
 
 ---
 
+## Engineering Highlights
+
+Where the embedded-systems work in this repository is, with the section that documents each.
+
+**Real-time and concurrency**
+- Sensor-paced camera loop and inference loop pinned to one core, the UI and state machine on the
+  other, each with an explicit FreeRTOS priority ([Thread Model](#thread-model)).
+- Stages never wait on each other: ownership of one image buffer moves between the two loops
+  through bounded channels with `try_send` / `try_recv`, and shared state is read lock-free
+  (`ArcSwap`). The camera loop only *tries* the LVGL lock and skips a preview update when it is
+  busy ([Vision Pipeline](#vision-pipeline)).
+- A preemption bug that made neural-network output differ from run to run was traced to a
+  silicon erratum and fixed in the interrupt path; output is now identical in 24 of 24 runs
+  ([Hardware-Loop Erratum Workaround](#esp32-p4-hardware-loop-erratum-workaround)).
+
+**Resource constraints**
+- The pipeline is limited by PSRAM bandwidth, not CPU. Each stage is timed on the board and the
+  design follows the numbers: the detector image is converted from the 640×480 preview (about
+  19 ms) and not re-scaled from the sensor frame (about 95 ms)
+  ([Measured Performance](#measured-performance-esp32-p4-rev-13-360-mhz)).
+- No heap allocation per frame. All seven image buffers, about 7.7 MB, are allocated once at
+  start-up, and a third sensor buffer was removed after measuring it
+  ([Image Buffers](#image-buffers)).
+- Build configuration tuned for inference (code and models executed from PSRAM, 256 KB L2 cache,
+  `-O2`): detection went from 28–120 ms to 19–40 ms and embedding from 466–706 ms to about
+  175 ms. Compiling in only the one pixel conversion in use saves about 1.1 MB of code.
+- 16 MB of flash laid out for A/B model slots that update without reflashing the firmware
+  ([Flash Layout](#flash-layout-firmwarepartitionscsv-16-mb), [Model Partitions](#model-partitions)).
+
+**DMA and zero-copy data paths**
+- Camera frames are borrowed zero-copy from the driver's memory-mapped buffers, which the ISP
+  fills by DMA, and are returned to the driver only when the frame has been fully processed.
+- Scaling and colour conversion run on the Pixel-Processing Accelerator into PSRAM buffers
+  aligned to the 128-byte cache line, as its DMA output requires. Buffer ownership and lifetimes
+  are expressed in Rust types (`firmware/src/ppa.rs`, `camera.rs`).
+
+**Register-level and hardware bring-up**
+- RISC-V assembly in the interrupt entry and exit paths reads and writes the CPU's
+  hardware-loop and vector-extension control registers (CSRs). It runs from IRAM and is attached
+  with the linker's `--wrap`, so ESP-IDF itself is unmodified
+  (`firmware/components/biometrics_wrapper/hwlp_erratum.S`).
+- GT911 touch controller polled through its status, point and clear registers over I2C.
+- MIPI-DSI panel bring-up: lane bit rate, pixel clock and porch timings
+  (`biometrics_wrapper.cpp`).
+- Safe Rust over a thin C API: every `unsafe` block is the size of one FFI call and carries a
+  `// Safety:` comment.
+
+---
+
 ## Project Status
 
 Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP.md).
