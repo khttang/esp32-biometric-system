@@ -98,9 +98,8 @@ and no speech.
 | Remote model updates, telemetry | Not implemented; parked until the device has a network connection |
 
 Known issues:
-- **Camera pipeline runs at about 9–10 fps, not 45.** Scaling the 1280×960 frame for the preview takes about 80–90 ms. The system is PSRAM-bandwidth-bound: the ISP, PPA, display scan-out, LVGL and code all share it (see [Measured Performance](#measured-performance-esp32-p4-rev-13-360-mhz)).
+- **Camera pipeline runs at about 9–10 fps.** Scaling the 1280×960 frame for the preview takes about 80–90 ms. The system is PSRAM-bandwidth-bound: the ISP, PPA, display scan-out, LVGL and code all share it (see [Measured Performance](#measured-performance-esp32-p4-rev-13-360-mhz)).
 - **Embedding takes about 170–180 ms**, against Espressif's published 96 ms for MFN on the P4.
-- Occasional full-screen white/cyan flashes (seen on older builds too; suspected display cable or power).
 - Deep-sleep wake pins don't match the admin button (see [Power](#power--deep-sleep)).
 - **Templates are stored unencrypted** and the admin view is open to anyone at the device (see [Enrollment & Templates](#enrollment--templates)).
 - **Core 1 is not exclusively the vision pipeline.** The touch poller is pinned to it at a priority above the inference thread, and the audio-capture and inactivity threads are unpinned, so they can run there too ([Thread Model](#thread-model)).

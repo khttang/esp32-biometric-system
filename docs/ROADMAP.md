@@ -447,4 +447,3 @@ of the API key.
 - Template sync between devices (M4c) and Ethernet.
 - ESP-IDF 6.x: wait for mature `esp-idf-sys` support. 6.0 removes the legacy I2C driver, moves Ethernet
   PHY drivers out of IDF, and changes the DSI 2D-DMA API.
-- The occasional white/cyan display flashes: suspected cable or power; tracked as an issue.
