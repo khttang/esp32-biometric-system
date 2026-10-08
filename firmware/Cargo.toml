@@ -5,6 +5,7 @@ authors = ["ktang <khttang@gmail.com>"]
 edition = "2021"
 resolver = "2"
 rust-version = "1.99"
+license = "MIT"
 
 [[bin]]
 name = "firmware"
