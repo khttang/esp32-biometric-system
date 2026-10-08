@@ -114,7 +114,6 @@ In this order. Each step is one pull request ([docs/ROADMAP.md](docs/ROADMAP.md)
 
 | Step | What it adds | State |
 |---|---|---|
-| Review fixes | Code-review fixes, explicit LVGL try-lock, two sensor buffers (PRs #23, #24, #25) | In review |
 | 1. Wi-Fi | Wi-Fi through the ESP32-C6: credentials entered on the touch panel, reconnect, status on screen; Ethernet removed | Next. The link itself was proven in a spike |
 | 2. Audio path | A consumer for the microphone audio and playback of streamed audio | Planned |
 | 3. Spoken greeting | "Welcome, [name]" on a match | Planned |
