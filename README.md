@@ -10,7 +10,8 @@
 
 Edge-AI biometrics firmware for the Waveshare **ESP32-P4-NANO** (dual-core RISC-V). It streams an
 OV5647 camera through the ISP and Pixel-Processing Accelerator (PPA) to a MIPI-DSI display, runs
-a face-embedding model with ESP-DL, and drives GT911 touch, I2S audio and RMII Ethernet.
+face detection and face-embedding models with ESP-DL, matches faces against templates enrolled on
+the device, and drives GT911 touch and I2S audio.
 
 The application, real-time pipeline and state machine are written in **Rust**
 (`esp-idf-svc` / `esp-idf-hal`). A thin **C++** component handles what Rust can't reach directly:
@@ -69,11 +70,22 @@ Where the embedded-systems work in this repository is, with the section that doc
 
 ## Project Status
 
-Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP.md).
+As of 2026-10-07. Milestone details are in [docs/ROADMAP.md](docs/ROADMAP.md).
+
+**Target state.** A stand-alone device that recognises an enrolled person, greets them by name
+and holds a spoken conversation through a remote voice agent over Wi-Fi, with face models that
+can be updated in the field without reflashing the firmware.
+
+**Current state.** The device detects, enrolls and recognises faces on its own and plays a chime
+on a match. Models are signed and live in A/B flash slots. It has no network connection in use
+and no speech.
+
+### Current State
 
 | Area | State |
 |---|---|
-| Display, touch, camera preview, Ethernet | Working |
+| Display, touch, camera preview | Working |
+| Network | None in use. The Ethernet driver is still started at boot but nothing uses it; it is to be removed when Wi-Fi is added. Wi-Fi through the on-board ESP32-C6 was proven in a spike and is not in this firmware |
 | Audio | On-board codec configured; a chime plays at boot and on a match; the microphone is captured and its level logged. Nothing consumes the microphone audio yet |
 | Vision pipeline (camera → PPA → preview / inference threads) | Working |
 | Face detection | Working: ESP-DL MSR+MNP models, green boxes drawn over the preview |
@@ -81,8 +93,9 @@ Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP
 | Model updates | Each model has two flash slots (A/B) with a signed, verified manifest; the firmware loads only images signed by a trusted key. A new image written to the standby slot is activated only after a golden run passes, and the previous image is kept for rollback; no firmware reflash ([Model Partitions](#model-partitions)) |
 | Enrollment | On-device: the admin view on the touch panel enrolls the face in view and deletes members; templates persist in flash ([Enrollment & Templates](#enrollment--templates)) |
 | Matching | Cosine similarity against enrolled templates of the same model release. Enroll → reboot → recognise → delete works on the board. The threshold (0.5) is Espressif's default; on a public dataset it accepted no impostor pair and rejected 21% of genuine single-image pairs; not yet measured with this camera on non-enrolled people ([Measuring Accuracy on the Board](#measuring-accuracy-on-the-board)) |
-| Template download | Not implemented. The unused HTTP fetch code was removed; templates exist only on the device |
-| Voice recognition | Not implemented |
+| Template sync between devices | Dropped from the plan. Templates exist only on the device that enrolled them |
+| Speech | Not implemented. Planned: a spoken greeting, then a conversation with a remote voice agent. Recognising people by voice is not planned |
+| Remote model updates, telemetry | Not implemented; parked until the device has a network connection |
 
 Known issues:
 - **Camera pipeline runs at about 9–10 fps, not 45.** Scaling the 1280×960 frame for the preview takes about 80–90 ms. The system is PSRAM-bandwidth-bound: the ISP, PPA, display scan-out, LVGL and code all share it (see [Measured Performance](#measured-performance-esp32-p4-rev-13-360-mhz)).
@@ -90,6 +103,28 @@ Known issues:
 - Occasional full-screen white/cyan flashes (seen on older builds too; suspected display cable or power).
 - Deep-sleep wake pins don't match the admin button (see [Power](#power--deep-sleep)).
 - **Templates are stored unencrypted** and the admin view is open to anyone at the device (see [Enrollment & Templates](#enrollment--templates)).
+- **Core 1 is not exclusively the vision pipeline.** The touch poller is pinned to it at a priority above the inference thread, and the audio-capture and inactivity threads are unpinned, so they can run there too ([Thread Model](#thread-model)).
+- The inference thread waits up to 10 ms for the LVGL lock to draw the face boxes; only the camera thread never waits for it.
+- Unused today: the 1 MB `storage` partition, the `p4_perform_ota_update` function (nothing calls it) and the Ethernet driver.
+- Enrollment, deletion through the touch panel and a golden run have not been re-tested on the builds of the open pull requests (#23–#25); the pipeline, detection and matching were.
+
+### Plan to the Target State
+
+In this order. Each step is one pull request ([docs/ROADMAP.md](docs/ROADMAP.md), M6).
+
+| Step | What it adds | State |
+|---|---|---|
+| Review fixes | Code-review fixes, explicit LVGL try-lock, two sensor buffers (PRs #23, #24, #25) | In review |
+| 1. Wi-Fi | Wi-Fi through the ESP32-C6: credentials entered on the touch panel, reconnect, status on screen; Ethernet removed | Next. The link itself was proven in a spike |
+| 2. Audio path | A consumer for the microphone audio and playback of streamed audio | Planned |
+| 3. Spoken greeting | "Welcome, [name]" on a match | Planned |
+| 4. Conversation | A speech-to-speech agent, started by a face match | Planned; provider not chosen |
+| 5. Hardening | Reconnects, session and cost limits, handling of the API key | Planned |
+| Later | Remote model updates with template migration (M4d); telemetry (M5) | Parked until Wi-Fi exists |
+
+Open decisions: the voice provider and where its API key lives; the match threshold (0.5 today,
+about 0.4 under consideration after the accuracy run); who may enroll (an admin role exists in the template
+format but nothing checks it); encryption at rest, which needs an eFuse key burned.
 
 ---
 
@@ -665,7 +700,7 @@ is not merged, and the figures were not re-measured afterwards.
 
 | Question | Result |
 |---|---|
-| Cost of keeping a second feature model loaded (for migrating templates) | A second MFN copy takes 2.1 MB of PSRAM and MBF 4.3 MB, leaving 9.1 MB of PSRAM free. Internal heap use is about 20 KB either way, leaving 147 KB. The camera stayed at about 10 fps |
+| Cost of keeping a second feature model loaded (for migrating templates) | A second MFN copy takes 2.1 MB of PSRAM (11.3 MB remain); MBF takes 4.3 MB (9.1 MB remain). Internal heap use is about 20 KB either way, leaving 147 KB. The camera stayed at about 10 fps |
 | On-device text to speech (PicoTTS) | 1.43 MB of voice data, 1.1 MB of PSRAM, synthesis at about real time |
 | Wi-Fi through the on-board ESP32-C6 (`esp_wifi_remote` 1.6.5 + `esp_hosted` 3.0.9, SDIO at 20 MHz) | Joined a WPA2 network in 4 s; an HTTPS request took about 0.6 s; a 2 MB download ran at 1.9 Mbit/s; 6 of 6 stability rounds without a disconnect |
 | Memory with Wi-Fi up | About 75 KB of internal RAM free, 38 KB at the lowest. TLS buffers must be in PSRAM (`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`); in internal RAM the link stalled |
