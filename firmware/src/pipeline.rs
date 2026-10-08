@@ -52,8 +52,13 @@ const SENSOR_H: u32 = ffi::P4_SENSOR_HEIGHT;
 const VIEW_W: u32 = ffi::P4_VIEWPORT_WIDTH;
 const VIEW_H: u32 = ffi::P4_VIEWPORT_HEIGHT;
 
-/// Max time the camera thread waits for LVGL before skipping one preview update.
-const PRESENT_LOCK_TIMEOUT_MS: u32 = 5;
+/// Lock timeout for the canvas swap. The camera thread must not wait for LVGL, so this has to
+/// stay below one FreeRTOS tick: `lvgl_port_lock` rounds it down to zero ticks, which takes the
+/// lock only if it is free. It cannot be 0, which that API reads as "wait forever". When LVGL
+/// is busy the swap is skipped and the next frame overwrites the same back buffer.
+const PRESENT_TRY_LOCK_MS: u32 = 1;
+const _: () =
+    assert!(PRESENT_TRY_LOCK_MS > 0 && PRESENT_TRY_LOCK_MS * ffi::configTICK_RATE_HZ < 1000);
 /// Max time the inference thread waits for LVGL before skipping one overlay update.
 const OVERLAY_LOCK_TIMEOUT_MS: u32 = 10;
 const EVENT_QUEUE_DEPTH: usize = 8;
@@ -177,6 +182,9 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
     let mut inference_running = true;
     let mut preview_ppa = LatencyStats::default();
     let mut detector_ppa = LatencyStats::default();
+    // Time spent in the canvas swap, which waits for the LVGL lock, and swaps given up on.
+    let mut present = LatencyStats::default();
+    let mut skipped_presents = 0u32;
     let mut frames_in_window = 0u32;
     let mut window_start = Instant::now();
     let mut capture_failures = 0u32;
@@ -260,11 +268,15 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
 
         // 3. Present: swap the canvas to the back buffer; the other one is filled next frame.
         // Safety: the buffer stays alive (and unwritten) until the next swap.
+        let present_started = Instant::now();
         let presented = unsafe {
-            ffi::p4_ui_present_camera(previews[back].as_ptr().cast(), PRESENT_LOCK_TIMEOUT_MS)
+            ffi::p4_ui_present_camera(previews[back].as_ptr().cast(), PRESENT_TRY_LOCK_MS)
         };
+        present.record(present_started.elapsed());
         if presented {
             back ^= 1;
+        } else {
+            skipped_presents += 1;
         }
         // Return the sensor buffer only now: re-queueing it earlier lets the ISP stream the next
         // 2.4 MB frame into PSRAM while the PPA is working, which measurably slowed every stage.
@@ -276,6 +288,8 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
                 window_start.elapsed(),
                 mem::take(&mut preview_ppa),
                 mem::take(&mut detector_ppa),
+                mem::take(&mut present),
+                mem::take(&mut skipped_presents),
             );
             frames_in_window = 0;
             window_start = Instant::now();
@@ -283,11 +297,19 @@ fn camera_loop(mut camera: Camera, requests: Receiver<DmaBuf>, frames: SyncSende
     }
 }
 
-fn log_camera_stats(frames: u32, window: Duration, preview: LatencyStats, detector: LatencyStats) {
+fn log_camera_stats(
+    frames: u32,
+    window: Duration,
+    preview: LatencyStats,
+    detector: LatencyStats,
+    present: LatencyStats,
+    skipped_presents: u32,
+) {
     let ms = |d: Option<Duration>| d.map_or(0.0, |d| d.as_secs_f32() * 1000.0);
     info!(
         "[Pipeline] camera {:.1} fps over {:.0}s | preview PPA avg {:.1} ms max {:.1} ms | \
-         detector PPA n={} avg {:.1} ms max {:.1} ms",
+         detector PPA n={} avg {:.1} ms max {:.1} ms | \
+         present avg {:.1} ms max {:.1} ms, {} of {} skipped (LVGL busy)",
         frames as f32 / window.as_secs_f32(),
         window.as_secs_f32(),
         ms(preview.mean()),
@@ -295,6 +317,10 @@ fn log_camera_stats(frames: u32, window: Duration, preview: LatencyStats, detect
         detector.count(),
         ms(detector.mean()),
         ms(detector.max()),
+        ms(present.mean()),
+        ms(present.max()),
+        skipped_presents,
+        present.count(),
     );
 }
 
