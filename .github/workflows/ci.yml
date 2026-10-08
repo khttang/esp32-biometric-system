@@ -52,6 +52,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v7
+        id: python
         with:
           python-version: "3.12"
 
@@ -64,12 +65,14 @@ jobs:
         run: rustup toolchain install
 
       # ESP-IDF, its Python env and the RISC-V toolchain (~5 GB) are installed by esp-idf-sys
-      # into firmware/.embuild on the first build.
+      # into firmware/.embuild on the first build. The Python env links to the runner's exact
+      # Python (e.g. 3.12.15), so that version is part of the key: when the runner image moves
+      # to a new patch release, a cache made with the old one cannot be reused.
       - name: Cache ESP-IDF (.embuild)
         uses: actions/cache@v6
         with:
           path: firmware/.embuild
-          key: embuild-${{ runner.os }}-${{ hashFiles('firmware/.cargo/config.toml', 'firmware/rust-toolchain.toml') }}
+          key: embuild-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-${{ hashFiles('firmware/.cargo/config.toml', 'firmware/rust-toolchain.toml') }}
 
       # Also caches ~/.cargo/bin, so ldproxy is only built on a cache miss.
       - uses: Swatinem/rust-cache@v2
