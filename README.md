@@ -660,6 +660,7 @@ implemented.
 | Inference stack | Bytes of the 32 KB stack never used, after the deepest call path has run | `pipeline.rs`, once |
 | Microphone | Peak and RMS level | `audio_worker.rs`, every 10 s |
 | Model activation | Duration and result of each golden run | `models.rs`, when a new image is tried |
+| Model tensors | Name, shape, data type and exponent of every input and output tensor ([Model Contract](#model-contract)) | `face_inference.cpp`, when a model loads |
 
 ```text
 [Pipeline] camera 9.9 fps over 10s | preview PPA avg 79.2 ms max 105.7 ms | detector PPA n=49 avg 18.7 ms max 19.2 ms | present avg 0.1 ms max 0.1 ms, 0 of 99 skipped (LVGL busy)
