@@ -30,6 +30,8 @@ Commands are in the README's "Build, Flash & Test" section. Three things to reme
     waiting for its own input.
   - Share state between stages lock-free (atomics, `ArcSwap`). No `Mutex` held across stages.
   - Inside the sensor loops, do not lock a `Mutex` and do not create or clone an `Arc`.
+    One exception: `cam_pipeline` may *try* the LVGL lock for the canvas swap, without
+    waiting (LVGL is not thread-safe). When LVGL is busy it skips that preview update.
 - **Allocation:** no heap allocation per frame in the `cam_pipeline` or `inference` threads.
   Allocate at startup and reuse. Allocation on rare paths (enrollment, boot, migration) is fine.
 - **`unsafe`:** every `unsafe` block has a `// Safety:` comment stating why it is sound. Keep the

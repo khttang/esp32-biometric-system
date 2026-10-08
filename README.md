@@ -10,7 +10,8 @@
 
 Edge-AI biometrics firmware for the Waveshare **ESP32-P4-NANO** (dual-core RISC-V). It streams an
 OV5647 camera through the ISP and Pixel-Processing Accelerator (PPA) to a MIPI-DSI display, runs
-a face-embedding model with ESP-DL, and drives GT911 touch, I2S audio and RMII Ethernet.
+face detection and face-embedding models with ESP-DL, matches faces against templates enrolled on
+the device, and drives GT911 touch and I2S audio.
 
 The application, real-time pipeline and state machine are written in **Rust**
 (`esp-idf-svc` / `esp-idf-hal`). A thin **C++** component handles what Rust can't reach directly:
@@ -18,13 +19,84 @@ LVGL, the V4L2 camera ioctls, panel bring-up and ESP-DL inference.
 
 ---
 
+## Engineering Highlights
+
+Where the embedded-systems work in this repository is, with the section that documents each.
+
+**Real-time and concurrency**
+- Sensor-paced camera loop and inference loop pinned to one core, the UI and state machine on the
+  other, each with an explicit FreeRTOS priority ([Thread Model](#thread-model)).
+- Stages never wait on each other: ownership of one image buffer moves between the two loops
+  through bounded channels with `try_send` / `try_recv`, and shared state is read lock-free
+  (`ArcSwap`). The camera loop only *tries* the LVGL lock and skips a preview update when it is
+  busy ([Vision Pipeline](#vision-pipeline)).
+- A preemption bug that made neural-network output differ from run to run was traced to a
+  silicon erratum and fixed in the interrupt path; output is now identical in 24 of 24 runs
+  ([Hardware-Loop Erratum Workaround](#esp32-p4-hardware-loop-erratum-workaround)).
+
+**Resource constraints**
+- The pipeline is limited by PSRAM bandwidth, not CPU. Each stage is timed on the board and the
+  design follows the numbers: the detector image is converted from the 640×480 preview (about
+  19 ms) and not re-scaled from the sensor frame (about 95 ms)
+  ([Measured Performance](#measured-performance-esp32-p4-rev-13-360-mhz)).
+- No heap allocation per frame. All seven image buffers, about 7.7 MB, are allocated once at
+  start-up, and a third sensor buffer was removed after measuring it
+  ([Image Buffers](#image-buffers)).
+- Build configuration tuned for inference (code and models executed from PSRAM, 256 KB L2 cache,
+  `-O2`): detection went from 28–120 ms to 19–40 ms and embedding from 466–706 ms to about
+  175 ms. Compiling in only the one pixel conversion in use saves about 1.1 MB of code.
+- 16 MB of flash laid out for A/B model slots that update without reflashing the firmware
+  ([Flash Layout](#flash-layout-firmwarepartitionscsv-16-mb), [Model Partitions](#model-partitions)).
+
+**DMA and zero-copy data paths**
+- Camera frames are borrowed zero-copy from the driver's memory-mapped buffers, which the ISP
+  fills by DMA, and are returned to the driver only when the frame has been fully processed.
+- Scaling and colour conversion run on the Pixel-Processing Accelerator into PSRAM buffers
+  aligned to the 128-byte cache line, as its DMA output requires. Buffer ownership and lifetimes
+  are expressed in Rust types (`firmware/src/ppa.rs`, `camera.rs`).
+
+**Instrumentation and measurement**
+- Each pipeline thread accumulates its own timings and prints one summary line every 10 seconds,
+  with no allocation and nothing shared between threads
+  ([Built-in Instrumentation](#built-in-instrumentation)).
+- Design choices are made from those lines and recorded with the numbers: the detector image
+  source (95 ms → 19 ms), two sensor buffers instead of three, the LVGL try-lock (1 preview
+  update skipped in about 480).
+- Recognition accuracy is measured on the board itself, by sending a public dataset through the
+  same models over the serial port ([Measuring Accuracy on the Board](#measuring-accuracy-on-the-board)).
+
+**Register-level and hardware bring-up**
+- RISC-V assembly in the interrupt entry and exit paths reads and writes the CPU's
+  hardware-loop and vector-extension control registers (CSRs). It runs from IRAM and is attached
+  with the linker's `--wrap`, so ESP-IDF itself is unmodified
+  (`firmware/components/biometrics_wrapper/hwlp_erratum.S`).
+- GT911 touch controller polled through its status, point and clear registers over I2C.
+- MIPI-DSI panel bring-up: lane bit rate, pixel clock and porch timings
+  (`biometrics_wrapper.cpp`).
+- Safe Rust over a thin C API: every `unsafe` block is the size of one FFI call and carries a
+  `// Safety:` comment.
+
+---
+
 ## Project Status
 
-Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP.md).
+As of 2026-10-07. Milestone details are in [docs/ROADMAP.md](docs/ROADMAP.md).
+
+**Target state.** A stand-alone device that recognises an enrolled person, greets them by name
+and holds a spoken conversation through a remote voice agent over Wi-Fi, with face models that
+can be updated in the field without reflashing the firmware.
+
+**Current state.** The device detects, enrolls and recognises faces on its own. When it
+recognises an enrolled person it plays a chime and shows "Welcome, [name]" on the LCD for
+three seconds. Models are signed and live in A/B flash slots. It has no network connection in
+use and no speech.
+
+### Current State
 
 | Area | State |
 |---|---|
-| Display, touch, camera preview, Ethernet | Working |
+| Display, touch, camera preview | Working |
+| Network | None in use. The Ethernet driver is still started at boot but nothing uses it; it is to be removed when Wi-Fi is added. Wi-Fi through the on-board ESP32-C6 was proven in a spike and is not in this firmware |
 | Audio | On-board codec configured; a chime plays at boot and on a match; the microphone is captured and its level logged. Nothing consumes the microphone audio yet |
 | Vision pipeline (camera → PPA → preview / inference threads) | Working |
 | Face detection | Working: ESP-DL MSR+MNP models, green boxes drawn over the preview |
@@ -32,15 +104,35 @@ Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP
 | Model updates | Each model has two flash slots (A/B) with a signed, verified manifest; the firmware loads only images signed by a trusted key. A new image written to the standby slot is activated only after a golden run passes, and the previous image is kept for rollback; no firmware reflash ([Model Partitions](#model-partitions)) |
 | Enrollment | On-device: the admin view on the touch panel enrolls the face in view and deletes members; templates persist in flash ([Enrollment & Templates](#enrollment--templates)) |
 | Matching | Cosine similarity against enrolled templates of the same model release. Enroll → reboot → recognise → delete works on the board. The threshold (0.5) is Espressif's default; on a public dataset it accepted no impostor pair and rejected 21% of genuine single-image pairs; not yet measured with this camera on non-enrolled people ([Measuring Accuracy on the Board](#measuring-accuracy-on-the-board)) |
-| Template download | Not implemented. The unused HTTP fetch code was removed; templates exist only on the device |
-| Voice recognition | Not implemented |
+| Template sync between devices | Dropped from the plan. Templates exist only on the device that enrolled them |
+| Speech | Not implemented. Planned: a spoken greeting, then a conversation with a remote voice agent. Recognising people by voice is not planned |
+| Remote model updates, telemetry | Not implemented; parked until the device has a network connection |
 
 Known issues:
-- **Camera pipeline runs at about 9–10 fps, not 45.** Scaling the 1280×960 frame for the preview takes about 95 ms. The system is PSRAM-bandwidth-bound: the ISP, PPA, display scan-out, LVGL and code all share it (see [Measured Performance](#measured-performance-esp32-p4-rev-13-360-mhz)).
-- **Embedding takes about 187 ms**, against Espressif's published 96 ms for MFN on the P4.
-- Occasional full-screen white/cyan flashes (seen on older builds too; suspected display cable or power).
+- **Camera pipeline runs at about 9–10 fps.** Scaling the 1280×960 frame for the preview takes about 80–90 ms. The system is PSRAM-bandwidth-bound: the ISP, PPA, display scan-out, LVGL and code all share it (see [Measured Performance](#measured-performance-esp32-p4-rev-13-360-mhz)).
+- **Embedding takes about 170–180 ms**, against Espressif's published 96 ms for MFN on the P4.
 - Deep-sleep wake pins don't match the admin button (see [Power](#power--deep-sleep)).
 - **Templates are stored unencrypted** and the admin view is open to anyone at the device (see [Enrollment & Templates](#enrollment--templates)).
+- **Core 1 is not exclusively the vision pipeline.** The touch poller is pinned to it at a priority above the inference thread, and the audio-capture and inactivity threads are unpinned, so they can run there too ([Thread Model](#thread-model)).
+- The inference thread waits up to 10 ms for the LVGL lock to draw the face boxes; only the camera thread never waits for it.
+- Unused today: the 1 MB `storage` partition, the `p4_perform_ota_update` function (nothing calls it) and the Ethernet driver.
+
+### Plan to the Target State
+
+In this order. Each step is one pull request ([docs/ROADMAP.md](docs/ROADMAP.md), M6).
+
+| Step | What it adds | State |
+|---|---|---|
+| 1. Wi-Fi | Wi-Fi through the ESP32-C6: credentials entered on the touch panel, reconnect, status on screen; Ethernet removed | Next. The link itself was proven in a spike |
+| 2. Audio path | A consumer for the microphone audio and playback of streamed audio | Planned |
+| 3. Spoken greeting | "Welcome, [name]" on a match | Planned |
+| 4. Conversation | A speech-to-speech agent, started by a face match | Planned; provider not chosen |
+| 5. Hardening | Reconnects, session and cost limits, handling of the API key | Planned |
+| Later | Remote model updates with template migration (M4d); telemetry (M5) | Parked until Wi-Fi exists |
+
+Open decisions: the voice provider and where its API key lives; the match threshold (0.5 today,
+about 0.4 under consideration after the accuracy run); who may enroll (an admin role exists in the template
+format but nothing checks it); encryption at rest, which needs an eFuse key burned.
 
 ---
 
@@ -87,7 +179,7 @@ admin button is configured in Rust (`system.rs`).
 | `main` | 0 | 1 | 8 KB | ESP-IDF (Rust `main`) | Boot, then state machine loop (~20 ms period) |
 | LVGL (`taskLVGL`) | 0 | 4 | 7 KB | `esp_lvgl_port` | Render, sw-rotate 270°, flush to DPI framebuffer; 5 ms timer |
 | `gt911_poller` | 1 | 5 | 3 KB | C++ | Poll GT911 every 15 ms |
-| `cam_pipeline` | 1 | 6 | 8 KB | Rust `pipeline.rs` | Dequeue frame → PPA preview → (on request) detector image from preview → swap canvas; logs fps/PPA stats every 10 s |
+| `cam_pipeline` | 1 | 6 | 8 KB | Rust `pipeline.rs` | Dequeue frame → PPA preview → (on request) detector image from preview → swap canvas (LVGL try-lock, skipped when LVGL is busy); logs fps, PPA and swap stats every 10 s |
 | `inference` | 1 | 3 (highest during a golden run) | 32 KB | Rust `pipeline.rs` | Detect → overlay → embed → match, ≤ 10 Hz (~23 KB of stack never used). At start-up, a golden run of a new model image runs at the highest priority, so `cam_pipeline` and the preview pause for its duration |
 | audio capture | any | 5 | 8 KB | Rust `audio_worker.rs` | Read the microphone into a bounded queue; log its level every 10 s |
 | inactivity watchdog | any | 5 | 4 KB | Rust `power.rs` | Deep sleep after 180 s without input |
@@ -101,8 +193,8 @@ no Kconfig option for this), keeping Core 1 free for the vision pipeline.
 │ main (prio 1)                                           │   │ cam_pipeline (prio 6)                                   │
 │   BiometricSystem::tick() every ~20 ms                  │   │   Camera::next_frame()  (blocking V4L2 DQBUF)           │
 │   ◀── InferenceEvent { FaceSeen | Match(member) } ──────┼───┤   PPA 1280×960 → 640×480 RGB565 preview                 │
-│   touch / admin button → InactivityTimer::reset()       │   │   p4_ui_present_camera(back buffer)  (LVGL lock, 5 ms)  │
-│                                                         │   │   on request: PPA 1280×960 → 640×480 RGB888 ──┐         │
+│   touch / admin button → InactivityTimer::reset()       │   │   p4_ui_present_camera(back buffer)  (LVGL try-lock)    │
+│                                                         │   │   on request: PPA preview → 640×480 RGB888 ───┐         │
 │ LVGL (prio 4)                                           │   │ inference (prio 3)                             ▼         │
 │   render canvas + right panel, rotate 270°, DSI flush   │   │   detect → overlay → align+embed → match ─────┐         │
 │                                                         │   │ gt911_poller (prio 5)                          │         │
@@ -112,9 +204,11 @@ no Kconfig option for this), keeping Core 1 free for the vision pipeline.
 
 ### Vision Pipeline
 
-1. **Capture**: the OV5647 streams RAW10; the ISP converts to RGB565 into three MMAP'd V4L2
+1. **Capture**: the OV5647 streams RAW10; the ISP converts to RGB565 into two MMAP'd V4L2
    buffers (2.4 MB each, PSRAM). `camera.rs` hands out a `Frame` that borrows a buffer zero-copy and
-   re-queues it to the driver when dropped.
+   re-queues it to the driver when dropped. The camera loop holds one buffer while the driver
+   fills the other; a third buffer was measured and dropped (see
+   [Image Buffers](#image-buffers)).
 2. **Preview**: the PPA scales the full frame to 640×480 into one of two preview buffers.
    - The LVGL camera canvas is exactly this 640×480 image, centred in the 640×720 left column on a
      black screen background.
@@ -122,7 +216,9 @@ no Kconfig option for this), keeping Core 1 free for the vision pipeline.
      limits per-frame re-rendering and rotation to image pixels.
    - `p4_ui_present_camera()` swaps the canvas to the new buffer under the LVGL lock; the camera
      thread then fills the other one.
-   - If LVGL is busy for more than 5 ms, that frame's preview update is skipped.
+   - The camera thread does not wait for that lock: if LVGL holds it, that frame's preview
+     update is skipped (about 0.2 % of frames, measured with an idle scene). The camera log
+     line reports the time spent in the swap and the number of skipped swaps.
 3. **Inference hand-off**: the inference thread owns a single 640×480 RGB888 detector buffer. It
    requests a frame by handing the buffer back.
    - The camera fills it from the next frame's **preview**: a 640×480 → 640×480 pixel-format
@@ -526,16 +622,48 @@ interrupted capture resumes where it stopped.
 - The `eval` feature is for the bench: it accepts images from anyone on the serial port. Never
   flash it on a deployed device.
 
+### Built-in Instrumentation
+
+The firmware reports on itself over the serial log; no debugger or external probe is attached.
+This is local logging. Reporting from devices in the field is a later milestone (M5) and is not
+implemented.
+
+| What | Reported | Where |
+|---|---|---|
+| Camera loop | Frames per second; preview and detector PPA time (average, longest); canvas-swap time; preview updates skipped because LVGL was busy | `pipeline.rs`, every 10 s |
+| Inference loop | Inferences per second; detection and embedding time (average, longest); frames with a face; lowest, average and highest similarity to the closest template, next to the threshold | `pipeline.rs`, every 10 s |
+| Inference stack | Bytes of the 32 KB stack never used, after the deepest call path has run | `pipeline.rs`, once |
+| Microphone | Peak and RMS level | `audio_worker.rs`, every 10 s |
+| Model activation | Duration and result of each golden run | `models.rs`, when a new image is tried |
+
+```text
+[Pipeline] camera 9.9 fps over 10s | preview PPA avg 79.2 ms max 105.7 ms | detector PPA n=49 avg 18.7 ms max 19.2 ms | present avg 0.1 ms max 0.1 ms, 0 of 99 skipped (LVGL busy)
+[Pipeline] inference 4.7/s over 10s | detect avg 35.0 ms max 42.9 ms | embed n=11 avg 168.5 ms max 173.5 ms | frames with faces 11 | closest template n=11 min 0.42 avg 0.49 max 0.64 (threshold 0.5)
+```
+
+- **Cheap enough to leave on.** A sample is a counter, a sum and a maximum, kept in a local
+  variable of the thread that measures it (`LatencyStats`, `ScoreStats` and `AudioLevel` in
+  `crates/biometric-core/src/stats.rs`, with host unit tests). Nothing is allocated or locked per
+  frame.
+- **Used for tuning.** The similarity figures are what a threshold change is judged by, and the
+  timing figures are how every entry in the tables below was obtained.
+- **Used for debugging.** The skipped-update count showed how often the camera thread meets a
+  busy LVGL lock, and comparing model output bit for bit across runs is what exposed the
+  hardware-loop erratum.
+
 ### Measured Performance (ESP32-P4 rev 1.3, 360 MHz)
 
 Measured on ESP-IDF 5.4.4 and re-measured on 5.5.5, with the same results within run-to-run noise.
+The camera, embedding, inference-rate and canvas-swap rows are from a 60-second run of the
+current build on 2026-10-07, taken from the 10-second log lines of the pipeline.
 
 | Stage | Time | Notes |
 |---|---|---|
 | Detection (MSR+MNP) | 19–40 ms | Espressif publishes about 17 ms; rises with PSRAM load and face candidates |
-| Embedding (MFN, incl. alignment) | 173–178 ms | Espressif publishes about 96 ms |
-| Camera pipeline | 9.4–9.7 fps | Preview PPA (1280×960 → 640×480) about 95 ms; detector PPA (from preview) about 19 ms |
-| Inference rate | 3.6–4.3 /s | Limited by the camera rate |
+| Embedding (MFN, incl. alignment) | 169–180 ms | Espressif publishes about 96 ms |
+| Camera pipeline | 9.1–10.0 fps | Preview PPA (1280×960 → 640×480) 79–88 ms on average; detector PPA (from preview) about 19 ms; two sensor buffers |
+| Inference rate | 4.7–5.0 /s | Limited by the camera rate |
+| Canvas swap (`p4_ui_present_camera`) | 0.1 ms average, 0.2 ms at most | 1 swap skipped in about 480 because LVGL held its lock |
 | Faces found | up to ~70–80% of frames | One person in front of the camera, indoor light |
 
 **Bottleneck: PSRAM bandwidth.** The ISP (2.4 MB per frame), PPA, display scan-out, LVGL, and code
@@ -560,6 +688,65 @@ pixel conversion is compiled in, which saves about 1.1 MB of code.
 All PPA work, DMA-buffer allocation (128-byte aligned PSRAM) and frame lifetimes are owned by Rust
 (`ppa.rs`, `camera.rs`, `pipeline.rs`). The PPA driver performs cache maintenance on its input and
 output windows itself.
+
+### Image Buffers
+
+Every image-sized buffer is allocated once at start-up, in PSRAM. None is allocated per frame.
+
+| Buffer | Count | Contents | Size each | Written by | Read by |
+|---|---|---|---|---|---|
+| Sensor (V4L2, MMAP) | 2 | 1280×960 RGB565 | 2.4 MB | ISP | PPA (preview scale) |
+| Preview | 2 | 640×480 RGB565 | 614 KB | PPA | LVGL canvas; PPA (detector conversion) |
+| Detector | 1 | 640×480 RGB888 | 922 KB | PPA | ESP-DL detection and embedding |
+| Start-up canvas | 1 | 640×480 RGB565 | 614 KB | cleared to black once | LVGL, until the first camera frame |
+
+Together about 7.7 MB.
+
+- **Preview pair:** LVGL reads the buffer on the canvas whenever it redraws, so the PPA fills the
+  other one and the two are swapped. This is double buffering for the display, not a camera
+  requirement.
+- **Detector buffer:** the inference thread keeps its image for 100 ms or more, while a preview
+  buffer can be overwritten as soon as the next camera frame (when a swap was skipped), so
+  inference needs a copy of its own. Exactly one exists, and it moves
+  between the camera and inference threads through two channels of capacity 1; whichever thread
+  holds it is the only one that touches its pixels.
+- **Alignment:** the preview and detector buffers are aligned to the 128-byte L2 cache line and
+  sized in multiples of it. The PPA writes by DMA and requires this of its output buffer, so the
+  alignment is a correctness requirement and has no speed-up to measure.
+
+**Two sensor buffers instead of three.** The camera loop takes about 100 ms and the sensor
+delivers a frame every 22 ms, so the loop always holds one buffer and the driver fills the rest
+long before the loop returns. Measured on 2026-10-07, one 60-second run each (five 10-second
+windows), same build apart from `CAM_BUF_COUNT`; the scene was not identical (more faces in view
+in the two-buffer run):
+
+| | 3 sensor buffers | 2 sensor buffers (in use) |
+|---|---|---|
+| Camera loop | 10.4–10.5 fps | 9.1–10.0 fps |
+| Preview PPA, average per window | 85.8–87.5 ms | 79.2–88.0 ms |
+| Preview PPA, longest | 122.4 ms | 114.2 ms |
+| Detector PPA, average | 18.4 ms | 18.6–18.7 ms |
+| Inference rate | 4.9–5.3 /s | 4.7–5.0 /s |
+| Canvas swaps skipped | 1 of 524 | 1 of 481 |
+| Driver errors or warnings | none | none |
+| PSRAM for sensor buffers | 7.4 MB | 4.9 MB |
+
+Two buffers save 2.4 MB of PSRAM for about 0.5–1 fps of preview rate. The PPA itself got no
+slower, so the extra time per loop is most likely spent waiting in `next_frame()` for the sensor
+to finish a frame; that wait, and the age of the frame the loop receives, were not measured.
+
+### Exploratory Measurements (not in this firmware)
+
+Taken on local spike branches on 2026-10-03 and 2026-10-04 to inform design decisions. The code
+is not merged, and the figures were not re-measured afterwards.
+
+| Question | Result |
+|---|---|
+| Cost of keeping a second feature model loaded (for migrating templates) | A second MFN copy takes 2.1 MB of PSRAM (11.3 MB remain); MBF takes 4.3 MB (9.1 MB remain). Internal heap use is about 20 KB either way, leaving 147 KB. The camera stayed at about 10 fps |
+| On-device text to speech (PicoTTS) | 1.43 MB of voice data, 1.1 MB of PSRAM, synthesis at about real time |
+| Wi-Fi through the on-board ESP32-C6 (`esp_wifi_remote` 1.6.5 + `esp_hosted` 3.0.9, SDIO at 20 MHz) | Joined a WPA2 network in 4 s; an HTTPS request took about 0.6 s; a 2 MB download ran at 1.9 Mbit/s; 6 of 6 stability rounds without a disconnect |
+| Memory with Wi-Fi up | About 75 KB of internal RAM free, 38 KB at the lowest. TLS buffers must be in PSRAM (`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`); in internal RAM the link stalled |
+| Firmware size with Wi-Fi | 4.11 MB of the 5.24 MB slot (3.61 MB without) |
 
 ### Boot Sequence
 
