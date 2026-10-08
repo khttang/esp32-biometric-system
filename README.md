@@ -36,8 +36,8 @@ Planned work is tracked milestone by milestone in [docs/ROADMAP.md](docs/ROADMAP
 | Voice recognition | Not implemented |
 
 Known issues:
-- **Camera pipeline runs at about 9–10 fps, not 45.** Scaling the 1280×960 frame for the preview takes about 95 ms. The system is PSRAM-bandwidth-bound: the ISP, PPA, display scan-out, LVGL and code all share it (see [Measured Performance](#measured-performance-esp32-p4-rev-13-360-mhz)).
-- **Embedding takes about 187 ms**, against Espressif's published 96 ms for MFN on the P4.
+- **Camera pipeline runs at about 9–10 fps, not 45.** Scaling the 1280×960 frame for the preview takes about 80–90 ms. The system is PSRAM-bandwidth-bound: the ISP, PPA, display scan-out, LVGL and code all share it (see [Measured Performance](#measured-performance-esp32-p4-rev-13-360-mhz)).
+- **Embedding takes about 170–180 ms**, against Espressif's published 96 ms for MFN on the P4.
 - Occasional full-screen white/cyan flashes (seen on older builds too; suspected display cable or power).
 - Deep-sleep wake pins don't match the admin button (see [Power](#power--deep-sleep)).
 - **Templates are stored unencrypted** and the admin view is open to anyone at the device (see [Enrollment & Templates](#enrollment--templates)).
@@ -102,7 +102,7 @@ no Kconfig option for this), keeping Core 1 free for the vision pipeline.
 │   BiometricSystem::tick() every ~20 ms                  │   │   Camera::next_frame()  (blocking V4L2 DQBUF)           │
 │   ◀── InferenceEvent { FaceSeen | Match(member) } ──────┼───┤   PPA 1280×960 → 640×480 RGB565 preview                 │
 │   touch / admin button → InactivityTimer::reset()       │   │   p4_ui_present_camera(back buffer)  (LVGL try-lock)    │
-│                                                         │   │   on request: PPA 1280×960 → 640×480 RGB888 ──┐         │
+│                                                         │   │   on request: PPA preview → 640×480 RGB888 ───┐         │
 │ LVGL (prio 4)                                           │   │ inference (prio 3)                             ▼         │
 │   render canvas + right panel, rotate 270°, DSI flush   │   │   detect → overlay → align+embed → match ─────┐         │
 │                                                         │   │ gt911_poller (prio 5)                          │         │
@@ -112,9 +112,11 @@ no Kconfig option for this), keeping Core 1 free for the vision pipeline.
 
 ### Vision Pipeline
 
-1. **Capture**: the OV5647 streams RAW10; the ISP converts to RGB565 into three MMAP'd V4L2
+1. **Capture**: the OV5647 streams RAW10; the ISP converts to RGB565 into two MMAP'd V4L2
    buffers (2.4 MB each, PSRAM). `camera.rs` hands out a `Frame` that borrows a buffer zero-copy and
-   re-queues it to the driver when dropped.
+   re-queues it to the driver when dropped. The camera loop holds one buffer while the driver
+   fills the other; a third buffer was measured and dropped (see
+   [Image Buffers](#image-buffers)).
 2. **Preview**: the PPA scales the full frame to 640×480 into one of two preview buffers.
    - The LVGL camera canvas is exactly this 640×480 image, centred in the 640×720 left column on a
      black screen background.
@@ -526,13 +528,16 @@ interrupted capture resumes where it stopped.
 ### Measured Performance (ESP32-P4 rev 1.3, 360 MHz)
 
 Measured on ESP-IDF 5.4.4 and re-measured on 5.5.5, with the same results within run-to-run noise.
+The camera, embedding, inference-rate and canvas-swap rows are from a 60-second run of the
+current build on 2026-10-07, taken from the 10-second log lines of the pipeline.
 
 | Stage | Time | Notes |
 |---|---|---|
 | Detection (MSR+MNP) | 19–40 ms | Espressif publishes about 17 ms; rises with PSRAM load and face candidates |
-| Embedding (MFN, incl. alignment) | 173–178 ms | Espressif publishes about 96 ms |
-| Camera pipeline | 9.4–9.7 fps | Preview PPA (1280×960 → 640×480) about 95 ms; detector PPA (from preview) about 19 ms |
-| Inference rate | 3.6–4.3 /s | Limited by the camera rate |
+| Embedding (MFN, incl. alignment) | 169–180 ms | Espressif publishes about 96 ms |
+| Camera pipeline | 9.1–10.0 fps | Preview PPA (1280×960 → 640×480) 79–88 ms on average; detector PPA (from preview) about 19 ms; two sensor buffers |
+| Inference rate | 4.7–5.0 /s | Limited by the camera rate |
+| Canvas swap (`p4_ui_present_camera`) | 0.1 ms average, 0.2 ms at most | 1 swap skipped in about 480 because LVGL held its lock |
 | Faces found | up to ~70–80% of frames | One person in front of the camera, indoor light |
 
 **Bottleneck: PSRAM bandwidth.** The ISP (2.4 MB per frame), PPA, display scan-out, LVGL, and code
@@ -557,6 +562,65 @@ pixel conversion is compiled in, which saves about 1.1 MB of code.
 All PPA work, DMA-buffer allocation (128-byte aligned PSRAM) and frame lifetimes are owned by Rust
 (`ppa.rs`, `camera.rs`, `pipeline.rs`). The PPA driver performs cache maintenance on its input and
 output windows itself.
+
+### Image Buffers
+
+Every image-sized buffer is allocated once at start-up, in PSRAM. None is allocated per frame.
+
+| Buffer | Count | Contents | Size each | Written by | Read by |
+|---|---|---|---|---|---|
+| Sensor (V4L2, MMAP) | 2 | 1280×960 RGB565 | 2.4 MB | ISP | PPA (preview scale) |
+| Preview | 2 | 640×480 RGB565 | 614 KB | PPA | LVGL canvas; PPA (detector conversion) |
+| Detector | 1 | 640×480 RGB888 | 922 KB | PPA | ESP-DL detection and embedding |
+| Start-up canvas | 1 | 640×480 RGB565 | 614 KB | cleared to black once | LVGL, until the first camera frame |
+
+Together about 7.7 MB.
+
+- **Preview pair:** LVGL reads the buffer on the canvas whenever it redraws, so the PPA fills the
+  other one and the two are swapped. This is double buffering for the display, not a camera
+  requirement.
+- **Detector buffer:** the inference thread keeps its image for 100 ms or more, while a preview
+  buffer can be overwritten as soon as the next camera frame (when a swap was skipped), so
+  inference needs a copy of its own. Exactly one exists, and it moves
+  between the camera and inference threads through two channels of capacity 1; whichever thread
+  holds it is the only one that touches its pixels.
+- **Alignment:** the preview and detector buffers are aligned to the 128-byte L2 cache line and
+  sized in multiples of it. The PPA writes by DMA and requires this of its output buffer, so the
+  alignment is a correctness requirement and has no speed-up to measure.
+
+**Two sensor buffers instead of three.** The camera loop takes about 100 ms and the sensor
+delivers a frame every 22 ms, so the loop always holds one buffer and the driver fills the rest
+long before the loop returns. Measured on 2026-10-07, one 60-second run each (five 10-second
+windows), same build apart from `CAM_BUF_COUNT`; the scene was not identical (more faces in view
+in the two-buffer run):
+
+| | 3 sensor buffers | 2 sensor buffers (in use) |
+|---|---|---|
+| Camera loop | 10.4–10.5 fps | 9.1–10.0 fps |
+| Preview PPA, average per window | 85.8–87.5 ms | 79.2–88.0 ms |
+| Preview PPA, longest | 122.4 ms | 114.2 ms |
+| Detector PPA, average | 18.4 ms | 18.6–18.7 ms |
+| Inference rate | 4.9–5.3 /s | 4.7–5.0 /s |
+| Canvas swaps skipped | 1 of 524 | 1 of 481 |
+| Driver errors or warnings | none | none |
+| PSRAM for sensor buffers | 7.4 MB | 4.9 MB |
+
+Two buffers save 2.4 MB of PSRAM for about 0.5–1 fps of preview rate. The PPA itself got no
+slower, so the extra time per loop is most likely spent waiting in `next_frame()` for the sensor
+to finish a frame; that wait, and the age of the frame the loop receives, were not measured.
+
+### Exploratory Measurements (not in this firmware)
+
+Taken on local spike branches on 2026-10-03 and 2026-10-04 to inform design decisions. The code
+is not merged, and the figures were not re-measured afterwards.
+
+| Question | Result |
+|---|---|
+| Cost of keeping a second feature model loaded (for migrating templates) | A second MFN copy takes 2.1 MB of PSRAM and MBF 4.3 MB, leaving 9.1 MB of PSRAM free. Internal heap use is about 20 KB either way, leaving 147 KB. The camera stayed at about 10 fps |
+| On-device text to speech (PicoTTS) | 1.43 MB of voice data, 1.1 MB of PSRAM, synthesis at about real time |
+| Wi-Fi through the on-board ESP32-C6 (`esp_wifi_remote` 1.6.5 + `esp_hosted` 3.0.9, SDIO at 20 MHz) | Joined a WPA2 network in 4 s; an HTTPS request took about 0.6 s; a 2 MB download ran at 1.9 Mbit/s; 6 of 6 stability rounds without a disconnect |
+| Memory with Wi-Fi up | About 75 KB of internal RAM free, 38 KB at the lowest. TLS buffers must be in PSRAM (`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`); in internal RAM the link stalled |
+| Firmware size with Wi-Fi | 4.11 MB of the 5.24 MB slot (3.61 MB without) |
 
 ### Boot Sequence
 

@@ -127,7 +127,7 @@ namespace VideoConfig {
 #define TAG_OTA     "p4_ota"
 #define TAG_I2S     "I2S_WRAPPER"
 
-#define CAM_BUF_COUNT 3
+#define CAM_BUF_COUNT 2
 #define C_LINE_SIZE 128               // ESP32-P4 L2 Cache Line Size (0x80)
 
 // Global Subsystem Handles

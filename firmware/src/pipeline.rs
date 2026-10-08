@@ -64,7 +64,7 @@ const OVERLAY_LOCK_TIMEOUT_MS: u32 = 10;
 const EVENT_QUEUE_DEPTH: usize = 8;
 const COMMAND_QUEUE_DEPTH: usize = 2;
 /// Upper bound on inference rate. Face ID doesn't need camera rate, and each request costs a
-/// full-frame PPA downscale on the camera thread.
+/// PPA conversion of the preview on the camera thread.
 const MIN_INFERENCE_INTERVAL: Duration = Duration::from_millis(100);
 /// Faces handled per frame; matches the number of overlay boxes the UI provides.
 const MAX_FACES: usize = ffi::P4_UI_MAX_FACE_BOXES as usize;
